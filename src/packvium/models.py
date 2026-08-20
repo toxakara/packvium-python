@@ -170,12 +170,14 @@ class RateTable:
         if self.fuel_surcharge_permille < 0:
             raise ValueError("rate_table fuel_surcharge_permille cannot be negative")
 
-    def charge_minor(self, billed_weight_g: int) -> int:
-        """The exact landed cost of one shipment at this billed weight.
+    def charge_minor_or_none(self, billed_weight_g: int) -> int | None:
+        """The exact landed cost of one shipment at this billed weight, or `None` when the
+        tariff does not price it.
 
-        Raises `UnratedWeightError` above the last bracket rather than clamping to the top
-        price. Clamping would quietly under-price every oversize shipment and, worse, make
-        the objective prefer a packing the caller cannot actually ship at that price.
+        The search needs to *compare* an unpriceable candidate rather than abort on one:
+        a container whose tariff runs out at this weight must lose to one that can price
+        the load, which it cannot do if asking the question raises. `charge_minor` is the
+        same walk for callers who want the refusal.
         """
         for bound, price in zip(self.weight_brackets_g, self.prices_minor):
             if billed_weight_g <= bound:
@@ -184,10 +186,22 @@ class RateTable:
                 # and rounding down would let a fractional unit of revenue vanish.
                 surcharge = -(-base * self.fuel_surcharge_permille // 1000)
                 return base + surcharge
-        raise UnratedWeightError(
-            f"billed weight {billed_weight_g} g is above the rate table's last bracket "
-            f"({self.weight_brackets_g[-1]} g); the shipment has no published price"
-        )
+        return None
+
+    def charge_minor(self, billed_weight_g: int) -> int:
+        """The exact landed cost of one shipment at this billed weight.
+
+        Raises `UnratedWeightError` above the last bracket rather than clamping to the top
+        price. Clamping would quietly under-price every oversize shipment and, worse, make
+        the objective prefer a packing the caller cannot actually ship at that price.
+        """
+        charge = self.charge_minor_or_none(billed_weight_g)
+        if charge is None:
+            raise UnratedWeightError(
+                f"billed weight {billed_weight_g} g is above the rate table's last bracket "
+                f"({self.weight_brackets_g[-1]} g); the shipment has no published price"
+            )
+        return charge
 
 
 class UnratedWeightError(ValueError):

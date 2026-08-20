@@ -7,7 +7,9 @@ from ._compat import dataclass
 from .config import PackingConfig
 from .constraints import direct_support_view, load_units, top_loads
 from .geometry import AxisAlignedBox, Dimensions, Point
-from .models import ItemInstance, PackedContainer, PackingRequest, Placement, UnpackedItem
+from .extensions import UnknownObjectiveError, unpriceable_container
+from .models import (ItemInstance, PackedContainer, PackingRequest, Placement, UnpackedItem,
+                     UnratedWeightError)
 from .solvers import (ContainerState, Deadline, SearchStats, TimeLimitReached, default_constraints,
                       find_candidates)
 from .units import Weight
@@ -158,6 +160,33 @@ def rebalance_weight(
     reaches the smallest spread achievable by some other arrangement.
     """
     config = config or PackingConfig()
+    if (
+        config.objective in ("shipping_cost", "lowest_landed_cost")
+        and config.dimensional_weight_divisor is None
+    ):
+        raise UnknownObjectiveError(
+            f"the {config.objective} objective requires "
+            "configuration.dimensional_weight_divisor"
+        )
+    if config.objective == "lowest_landed_cost":
+        unrated = next((c for c in request.containers if c.rate_table is None), None)
+        if unrated is not None:
+            raise UnknownObjectiveError(
+                "the lowest_landed_cost objective requires a rate_table on every "
+                f"container; {unrated.id!r} has none"
+            )
+    # A packing the tariff cannot price is refused here for the same reason
+    # `Packer.pack` refuses one on the way out: rebalancing it would hand back a
+    # shipment with no published price under the caller's own objective (
+    # review). Objective-gated inside the helper, so every other objective -- and a
+    # call without a config -- is untouched.
+    unpriceable = unpriceable_container(tuple(containers), config)
+    if unpriceable is not None:
+        container_id, grams, bound = unpriceable
+        raise UnratedWeightError(
+            f"container {container_id!r} bills at {grams} g, above its rate table's "
+            f"last bracket ({bound} g); the shipment has no published price"
+        )
     validator = IndependentSolutionValidator()
     deadline = Deadline(time_limit_ms)
     working = list(containers)
@@ -200,6 +229,11 @@ def rebalance_weight(
                 except TimeLimitReached:
                     trial = None
                 if trial is None:
+                    continue
+                # A move that prices the destination past its tariff is not an
+                # improvement: the sentinel must never ride out through a rebalanced
+                # packing any more than through a packed one ( review).
+                if unpriceable_container(tuple(trial), config) is not None:
                     continue
                 committed = (trial, source.placements[placement_index].instance.id, source.id, working[dest_index].id)
                 break

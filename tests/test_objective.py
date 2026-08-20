@@ -253,10 +253,15 @@ def test_shipping_cost_prefers_the_smaller_bulky_container():
 
 
 def test_shipping_cost_requires_a_divisor_and_reports_the_objective_used():
-    from packvium.extensions import UnknownObjectiveError
+    from packvium.extensions import ShippingCostSolutionScorer, UnknownObjectiveError
 
     items = [item("a", 40, 40, 40)]
     containers = [container("c", 100, 100, 100)]
+    with pytest.raises(
+        UnknownObjectiveError,
+        match="the shipping_cost objective requires configuration.dimensional_weight_divisor",
+    ):
+        ShippingCostSolutionScorer.from_config(None)
     with pytest.raises(UnknownObjectiveError):
         pack(items, containers, PackingConfig.balanced(objective="shipping_cost"))
 
@@ -359,10 +364,166 @@ def test_a_weight_above_the_last_bracket_has_no_price_and_says_so():
     """Clamping to the top price would under-quote every oversize shipment silently."""
     from packvium.models import RateTable, UnratedWeightError
 
+    with pytest.raises(UnratedWeightError, match="no published price"):
+        RateTable((1,), (100,)).charge_minor(2)
+
+
+def test_unpriceable_container_answers_for_a_container_with_no_tariff_at_all():
+    """`unpriceable_container` is exported, so it cannot assume the packer's admission ran.
+
+    `Packer` never reaches this branch: `LandedCostSolutionScorer` refuses a missing
+    `rate_table` while scoring, before the final guard is consulted. The function is
+    public API all the same, and a caller checking a result it assembled itself must get
+    an answer rather than an `AttributeError` off a `None` table.
+    """
+    from packvium.config import PackingConfig
+    from packvium.extensions import unpriceable_container
+
+    cube = Item.create("cube", Dimensions.mm(10, 10, 10), weight="1g")
+    box = Container.create("box", Dimensions.mm(20, 20, 20))
+    packed = (filled(box, cube.instances(), [(0, 0, 0)]),)
+    config = PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    )
+    # 20 mm cube = 2 cm a side -> 8 cm^3 / 5000 = 1.6 kg... of a gram, rounded up to 2 g,
+    # which beats the item's own 1 g. No table means no bracket to name, hence 0.
+    assert unpriceable_container(packed, config) == ("box", 2, 0)
+
+
+def test_the_scorer_ranks_an_unpriceable_packing_worst_rather_than_raising():
+    """The search has to *compare* an unpriceable candidate, not abort on one.
+
+    Raising here is what made a request with one short tariff and one perfectly good
+    alternative fail outright instead of shipping. Ranking it `UNPRICEABLE_MINOR`
+    is what lets the priceable container win the round; `Packer.pack` is where the
+    refusal belongs, once nothing priceable is left to prefer.
+    """
+    from packvium.extensions import UNPRICEABLE_MINOR
+    from packvium.models import RateTable
+
     light = Item.create("cube", Dimensions.mm(10, 10, 10), weight="1g")
     box = Container.create("box", Dimensions.mm(20, 20, 20), rate_table=RateTable((1,), (100,)))
-    with pytest.raises(UnratedWeightError, match="no published price"):
-        landed(box, light)
+    assert landed(box, light)[1] == UNPRICEABLE_MINOR
+
+
+def test_packing_refuses_when_no_container_on_offer_can_price_the_load():
+    """The sentinel is a search device; reaching a result with it still standing would
+    quote a number the carrier never published."""
+    from packvium.config import PackingConfig
+    from packvium.models import RateTable, UnratedWeightError
+    from packvium.packer import Packer
+
+    light = Item.create("cube", Dimensions.mm(10, 10, 10), weight="1g")
+    box = Container.create("box", Dimensions.mm(20, 20, 20), rate_table=RateTable((1,), (100,)))
+    packer = Packer(PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    ))
+    with pytest.raises(UnratedWeightError, match="'box' bills at .* no published price"):
+        packer.pack([light], [box])
+
+
+def test_an_unpriceable_container_loses_to_a_priceable_one_in_the_greedy_round():
+    """The general per-round choice, not the closed-form path.
+
+    Eight units is past the single-item shape the fast paths take. The round key ranked
+    by billed weight, and `alpha` bills lighter (5400 g of dimensional weight against
+    12800 g) while its tariff stops at 2000 g -- so the objective chose the one shipment
+    the caller cannot buy over one available at 1500. Ranking the round by the money the
+    finished score will charge is what fixes it; Rust, PHP and the JavaScript fallback
+    reach the identical answer.
+    """
+    from packvium.config import PackingConfig
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    box = Item.create("box", Dimensions.mm(100, 100, 100), weight="500g", quantity=8)
+    alpha = Container.create(
+        "alpha_unpriceable", Dimensions.mm(300, 300, 300),
+        rate_table=RateTable((2_000,), (900,)),
+    )
+    beta = Container.create(
+        "beta_priceable", Dimensions.mm(400, 400, 400),
+        rate_table=RateTable((20_000,), (1_500,)),
+    )
+    packer = Packer(PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    ))
+    result = packer.pack([box], [alpha, beta])
+    assert [c.container.id for c in result.containers] == ["beta_priceable"]
+    assert result.score[1] == 1_500
+    assert result.unpacked == ()
+
+
+def test_a_bracket_step_makes_the_cheaper_shipment_the_heavier_one():
+    """Grams and money order candidates alike only while price rises smoothly with
+    weight. Here the heavier container is the cheaper one, which is the whole reason
+    this objective exists next to `shipping_cost`."""
+    from packvium.config import PackingConfig
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    box = Item.create("box", Dimensions.mm(100, 100, 100), weight="500g", quantity=8)
+    dear = Container.create(
+        "light_but_dear", Dimensions.mm(300, 300, 300),
+        rate_table=RateTable((20_000,), (900,)),
+    )
+    cheap = Container.create(
+        "heavy_but_cheap", Dimensions.mm(400, 400, 400),
+        rate_table=RateTable((20_000,), (400,)),
+    )
+    packer = Packer(PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    ))
+    result = packer.pack([box], [dear, cheap])
+    assert [c.container.id for c in result.containers] == ["heavy_but_cheap"]
+    assert result.score[1] == 400
+
+
+def test_a_quantity_compressed_round_still_prices_the_true_payload():
+    """ compact states carry no per-item `Placement`s, so a round key that sums
+    `state.placements` prices a quantity-compressed trial as tare alone. Eight 2000 g
+    cubes bill 16000 g -- past alpha's last bracket -- but alpha's dimensional 5400 g
+    is not, so a tare-only key committed alpha and refused a request that beta ships
+    at 1500. The key reads the lattice-aware `payload_ticks`/`placement_count`; the
+    fast profile with coordinates waived is the configuration that takes this path.
+    """
+    from packvium.config import PackingConfig, SolverProfile
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    box = Item.create("box", Dimensions.mm(100, 100, 100), weight="2000g", quantity=8)
+    alpha = Container.create(
+        "alpha_unpriceable", Dimensions.mm(300, 300, 300),
+        rate_table=RateTable((10_000,), (800,)),
+    )
+    beta = Container.create(
+        "beta_priceable", Dimensions.mm(400, 400, 400),
+        rate_table=RateTable((20_000,), (1_500,)),
+    )
+    packer = Packer(PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+        profile=SolverProfile.FAST,
+        require_placement_coordinates=False,
+    ))
+    result = packer.pack([box], [alpha, beta])
+    assert [c.container.id for c in result.containers] == ["beta_priceable"]
+    assert result.score[1] == 1_500
+    assert result.unpacked == ()
 
 
 # --------------------------------------------------------- maximum value
@@ -539,3 +700,114 @@ def test_open_dimension_height_matches_the_exact_solver_on_a_small_instance():
     # achievable height is exactly one cube's height, 100mm (1_600_000 ticks).
     assert exact_height == 1_600_000
     assert heuristic_height == exact_height
+
+
+def test_exact_small_does_not_prune_a_heavier_promotional_rate_band():
+    """A tariff may dip: two 100 g parcels cost 100, while a 100 g + 800 g pair
+    costs 10. Exact search must retain the heavier equal-count branch rather than use
+    volume/weight monotonicity the public rate-table contract does not promise."""
+    from packvium.models import RateTable
+
+    parcels = [
+        Item.create("a-light", Dimensions.mm(100, 100, 100), weight="100g"),
+        Item.create("b-light", Dimensions.mm(100, 100, 100), weight="100g"),
+        Item.create("z-heavy", Dimensions.mm(100, 100, 100), weight="800g"),
+    ]
+    bin_type = Container.create(
+        "bin",
+        Dimensions.mm(200, 100, 100),
+        rate_table=RateTable((200, 900), (100, 10)),
+        quantity=1,
+    )
+    result = pack(parcels, [bin_type], PackingConfig.exact_small(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=10_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+        max_containers=1,
+    ))
+    assert result.score[:2] == (1, 10)
+    assert "z-heavy#1" in {
+        placement.instance.id
+        for packed_container in result.containers
+        for placement in packed_container.placements
+    }
+
+
+def test_a_missing_rate_table_is_refused_at_admission_even_when_unused():
+    """A missing tariff is a static property of the request: rating some containers and
+    not others would rank a priced packing against an unpriced one as though the
+    unpriced were free. Rust and the JavaScript fallback already refused up front;
+    Python enforced this only if the search happened to touch the untabled container,
+    so the same request answered or aborted depending on search internals (
+    review)."""
+    from packvium.config import PackingConfig
+    from packvium.extensions import UnknownObjectiveError
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    tiny = Item.create("tiny", Dimensions.mm(10, 10, 10), weight="1g")
+    tabled = Container.create(
+        "tabled", Dimensions.mm(100, 100, 100), rate_table=RateTable((1_000,), (100,)),
+    )
+    untabled = Container.create("untabled", Dimensions.mm(500, 500, 500))
+    packer = Packer(PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    ))
+    with pytest.raises(UnknownObjectiveError, match="requires a rate_table on every container; 'untabled'"):
+        packer.pack([tiny], [tabled, untabled])
+
+
+def test_a_missing_divisor_is_refused_at_admission_naming_the_right_objective():
+    """The late scorer check inherits shipping_cost's sentence, so a landed-cost
+    request used to run the whole search and then die blaming the wrong objective."""
+    from packvium.config import PackingConfig
+    from packvium.extensions import UnknownObjectiveError
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    tiny = Item.create("tiny", Dimensions.mm(10, 10, 10), weight="1g")
+    tabled = Container.create(
+        "tabled", Dimensions.mm(100, 100, 100), rate_table=RateTable((1_000,), (100,)),
+    )
+    with pytest.raises(
+        UnknownObjectiveError,
+        match="the lowest_landed_cost objective requires configuration.dimensional_weight_divisor",
+    ):
+        Packer(PackingConfig(objective="lowest_landed_cost")).pack([tiny], [tabled])
+
+
+def test_alternatives_never_quote_the_sentinel():
+    """The refusal guarded only the winner; `alternatives` (top_k defaults to 3) could
+    carry a feasible-status packing of an unpriceable container with the sentinel as
+    its landed cost -- the exact number this objective exists to never invent. Runner-
+    ups the tariff cannot price are dropped before the slice ( review)."""
+    from packvium.config import PackingConfig, SolverProfile
+    from packvium.extensions import UNPRICEABLE_MINOR, unpriceable_container
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    box = Item.create("box", Dimensions.mm(100, 100, 100), weight="500g", quantity=8)
+    alpha = Container.create(
+        "alpha_unpriceable", Dimensions.mm(300, 300, 300),
+        rate_table=RateTable((2_000,), (900,)),
+    )
+    beta = Container.create(
+        "beta_priceable", Dimensions.mm(400, 400, 400),
+        rate_table=RateTable((20_000,), (1_500,)),
+    )
+    config = PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+        profile=SolverProfile.QUALITY,
+    )
+    result = Packer(config).pack([box], [alpha, beta])
+    assert result.score[1] == 1_500
+    for alternative in result.alternatives:
+        assert alternative.score[1] != UNPRICEABLE_MINOR
+        assert unpriceable_container(alternative.containers, config) is None

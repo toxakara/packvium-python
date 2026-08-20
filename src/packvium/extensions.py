@@ -141,6 +141,12 @@ class LandedCostSolutionScorer(ShippingCostSolutionScorer):
     Every container must carry a `rate_table`. Rating some containers and not others would
     silently rank a priced packing against an unpriced one as though the unpriced were
     free, so a missing table is a rejection.
+
+    A billed weight past the last bracket is different: it is a property of how the search
+    happened to fill the box, not of the request, so it loses a candidate rather than
+    aborting a run that has a perfectly shippable alternative. Scoring it `UNPRICEABLE_MINOR`
+    is what makes the priceable alternative win; `pack` refuses if that sentinel is still
+    standing when an answer is about to be returned.
     """
 
     def score_containers(
@@ -161,8 +167,50 @@ class LandedCostSolutionScorer(ShippingCostSolutionScorer):
             dimensions = c.container.outer_dimensions or c.container.inner_dimensions
             dim_weight = dimensional_weight(dimensions, self.divisor, self.length_unit, self.weight_unit)
             billed_ticks = max(c.gross_weight.ticks, dim_weight.ticks)
-            landed += table.charge_minor(_grams(billed_ticks))
+            charge = table.charge_minor_or_none(_grams(billed_ticks))
+            if charge is None:
+                landed = UNPRICEABLE_MINOR
+                break
+            landed += charge
         return (unpacked_count, landed, container_count, unused, height)
+
+
+#: Ranks a packing the tariff cannot price behind every priceable one during search.
+#: It is a search device, never an answer -- `pack` refuses before a solution carrying it
+#: can be returned -- so its exact magnitude only has to dominate any real total. The value
+#: is Rust's `i128::MAX as i64` so the three engines that need a sentinel share one.
+UNPRICEABLE_MINOR = 2**63 - 1
+
+
+def unpriceable_container(
+    containers: Sequence["PackedContainer"], config: "PackingConfig"
+) -> "tuple[str, int, int] | None":
+    """The first container in a finished answer its own rate table cannot price, as
+    `(container id, billed grams, last bracket)`.
+
+    Ranking an unpriceable candidate worst is what lets a priceable alternative win the
+    round. This is the guard that stops the sentinel from surfacing: returning a packing
+    the tariff cannot price would quote a number the carrier never published.
+    """
+    from .geometry import dimensional_weight
+
+    if config.objective != "lowest_landed_cost" or config.dimensional_weight_divisor is None:
+        return None
+    for c in containers:
+        table = c.container.rate_table
+        dimensions = c.container.outer_dimensions or c.container.inner_dimensions
+        dim_weight = dimensional_weight(
+            dimensions,
+            config.dimensional_weight_divisor,
+            config.dimensional_weight_length_unit,
+            config.dimensional_weight_weight_unit,
+        )
+        grams = _grams(max(c.gross_weight.ticks, dim_weight.ticks))
+        if table is None:
+            return (c.container.id, grams, 0)
+        if table.charge_minor_or_none(grams) is None:
+            return (c.container.id, grams, table.weight_brackets_g[-1])
+    return None
 
 
 def _grams(weight_ticks: int) -> int:
