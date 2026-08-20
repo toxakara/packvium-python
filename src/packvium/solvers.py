@@ -11,6 +11,9 @@ from typing import Callable, Iterable, Protocol, Sequence
 from .axle_load import axle_balanced_origins
 from .config import PackingConfig
 from .effort import EffortBudget
+# `_grams` rather than a local ceil-div: the round-up from ticks to whole grams is the
+# published billing rule, and a second copy of it could drift a bracket.
+from .extensions import UNPRICEABLE_MINOR, _grams
 from .constraints import (AxleLoadConstraint, CompatibilityConstraint, ConstraintContext,
                           ContainerEligibilityConstraint, FloorConstraint, LoadUnit, PlacementConstraint,
                           RIDES_THE_WHOLE_ROUTE, RouteOrderConstraint, SupportConstraint,
@@ -1396,22 +1399,49 @@ class ExactSmallSolver:
         best = ContainerState(container, sequence)
         best_volume = 0
 
+        def state_rank(state: ContainerState, state_volume: int) -> tuple[int, ...]:
+            """The exact solver's incumbent order for this one container.
+
+            Landed cost precedes unused volume in the public objective. A promotional
+            bracket may make a heavier equal-count subset cheaper, so the historical
+            count/volume rank was wrong for this objective ( second review).
+            """
+            count = len(state.placements)
+            if config.objective != "lowest_landed_cost":
+                return (-count, -state_volume)
+            dimensions = container.outer_dimensions or container.inner_dimensions
+            dim_weight = dimensional_weight(
+                dimensions,
+                config.dimensional_weight_divisor,
+                config.dimensional_weight_length_unit,
+                config.dimensional_weight_weight_unit,
+            )
+            billed_ticks = max(container.tare_weight.ticks + state.payload_ticks, dim_weight.ticks)
+            table = container.rate_table
+            charge = None if table is None else table.charge_minor_or_none(_grams(billed_ticks))
+            return (-count, UNPRICEABLE_MINOR if charge is None else charge, -state_volume)
+
+        best_rank = state_rank(best, best_volume)
+
         def dfs(index: int, state: ContainerState, reachable: int, state_volume: int) -> None:
-            nonlocal best, best_volume
+            nonlocal best, best_volume, best_rank
             if deadline.expired:
                 return
             stats.search_nodes_expanded += 1
             state_count = len(state.placements)
             best_count = len(best.placements)
-            if _is_better_state_values(state_count, state_volume, best_count, best_volume):
+            candidate_rank = state_rank(state, state_volume)
+            if candidate_rank < best_rank:
                 best = state
                 best_volume = state_volume
+                best_rank = candidate_rank
             if index >= len(batches): return
             potential_count = state_count + reachable
             best_count = len(best.placements)
             if potential_count < best_count:
                 return
-            if (potential_count == best_count
+            if (config.objective != "lowest_landed_cost"
+                    and potential_count == best_count
                     and state_volume + suffix_volumes[index] <= best_volume):
                 return
             batch = batches[index]
@@ -2249,7 +2279,7 @@ class SolverOrchestrator:
                         break
                     continue
                 if (
-                    config.objective == "shipping_cost"
+                    config.objective in ("shipping_cost", "lowest_landed_cost")
                     and config.dimensional_weight_divisor is not None
                 ):
                     dimensions = container.outer_dimensions or container.inner_dimensions
@@ -2259,15 +2289,36 @@ class SolverOrchestrator:
                         config.dimensional_weight_length_unit,
                         config.dimensional_weight_weight_unit,
                     ).ticks
-                    gross = container.tare_weight.ticks + sum(
-                        placement.instance.weight.ticks
-                        for placement in one.state.placements
-                    )
-                    score = (
-                        -len(one.state.placements),
-                        max(gross, dim_weight),
-                        container.id,
-                    )
+                    # `payload_ticks` and `placement_count` are lattice-aware: the
+                    #  compact path carries no per-item placements, so summing
+                    # `state.placements` here priced a quantity-compressed trial as
+                    # tare alone and let an unpriceable container win the round.
+                    gross = container.tare_weight.ticks + one.state.payload_ticks
+                    billed = max(gross, dim_weight)
+                    placed = one.state.placement_count
+                    if config.objective == "shipping_cost":
+                        score = (-placed, billed, container.id)
+                    else:
+                        # Landed cost ranks the round by the money the finished score will
+                        # charge, not by the grams it is derived from. This loop commits
+                        # the trial verbatim, so its billed weight is already final and the
+                        # tariff can be read now; a bracket step or a minimum charge makes
+                        # the cheaper shipment the heavier one, and a trial the tariff
+                        # cannot price is unshippable rather than merely dear, so it sorts
+                        # behind every priceable alternative. Keys after the charge
+                        # mirror Rust's, so the two engines pick the same container.
+                        charge = (
+                            container.rate_table.charge_minor_or_none(_grams(billed))
+                            if container.rate_table is not None
+                            else None
+                        )
+                        containers_needed = -(-len(round_items) // max(placed, 1))
+                        score = (
+                            UNPRICEABLE_MINOR if charge is None else charge,
+                            containers_needed,
+                            -placed,
+                            container.id,
+                        )
                 else:
                     score = self.container_selector.score(container, one)
                 if best_score is None or score < best_score:

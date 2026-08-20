@@ -234,3 +234,104 @@ def test_rebalance_never_widens_the_payload_spread(seed):
     # what separates the starting layout from the finishing one, in either direction.
     if outcome.moves:
         assert before != after
+
+
+def test_a_rebalance_move_never_prices_a_container_past_its_bracket():
+    """The only spread-improving move -- one brick into the lighter box -- would bill it
+    at 2000 g, past its 1500 g card. Under lowest_landed_cost that is not an
+    improvement: the sentinel must never ride out through a rebalanced packing any more
+    than through a packed one ( review)."""
+    from packvium import Container, Dimensions, Item
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    bricks = Item.create("brick", Dimensions.mm(100, 100, 100), weight="1000g", quantity=4)
+    wide = Container.create(
+        "wide", Dimensions.mm(300, 100, 100), rate_table=RateTable((4_000,), (500,)),
+    )
+    narrow = Container.create(
+        "narrow", Dimensions.mm(400, 100, 100), rate_table=RateTable((1_500,), (300,)),
+    )
+    config = PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    )
+    result = Packer(config).pack([bricks], [wide, narrow])
+    assert [c.container.id for c in result.containers] == ["wide", "narrow"]
+    request = PackingRequest((bricks,), (wide, narrow))
+    rebalanced = rebalance_weight(request, result.containers, result.unpacked, config)
+    assert rebalanced.moves == ()
+    assert [c.container.id for c in rebalanced.containers] == ["wide", "narrow"]
+    # The veto is objective-gated: the identical packing under a plain config makes the
+    # spread-improving move, so this is not a general rebalance regression.
+    moved = rebalance_weight(request, result.containers, result.unpacked, PackingConfig())
+    assert len(moved.moves) == 1
+
+
+def test_rebalance_refuses_an_unpriceable_input():
+    """A caller handing rebalance a packing whose container already bills past its
+    bracket gets the same refusal `Packer.pack` gives on the way out, not a rebalanced
+    version of a shipment with no published price ( review)."""
+    from packvium import Container, Dimensions, Item
+    from packvium.models import RateTable, UnratedWeightError
+    from packvium.packer import Packer
+
+    bricks = Item.create("brick", Dimensions.mm(100, 100, 100), weight="1000g", quantity=4)
+    wide = Container.create(
+        "wide", Dimensions.mm(300, 100, 100), rate_table=RateTable((4_000,), (500,)),
+    )
+    narrow = Container.create(
+        "narrow", Dimensions.mm(400, 100, 100), rate_table=RateTable((1_500,), (300,)),
+    )
+    config = PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=5_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    )
+    result = Packer(config).pack([bricks], [wide, narrow])
+    # Shrink the wide card after the fact so the input itself is unpriceable.
+    stingy = Container.create(
+        "wide", Dimensions.mm(300, 100, 100), rate_table=RateTable((1_000,), (500,)),
+    )
+    reshaped = tuple(
+        PackedContainer(stingy if c.container.id == "wide" else c.container, c.sequence, c.placements)
+        for c in result.containers
+    )
+    request = PackingRequest((bricks,), (stingy, narrow))
+    with pytest.raises(UnratedWeightError, match="no published price"):
+        rebalance_weight(request, reshaped, result.unpacked, config)
+
+
+def test_rebalance_applies_the_same_landed_cost_admission_as_pack():
+    """The public rebalance entry point must not accept a request the pack entry point
+    rejects: pricing requires a divisor and a rate card on every available container,
+    including a container the current packing did not happen to use ( review)."""
+    from packvium import Container, Dimensions, Item
+    from packvium.extensions import UnknownObjectiveError
+    from packvium.models import RateTable
+    from packvium.packer import Packer
+
+    parcel = Item.create("parcel", Dimensions.mm(100, 100, 100), weight="500g")
+    rated = Container.create(
+        "rated", Dimensions.mm(200, 200, 200), rate_table=RateTable((2_000,), (500,)),
+    )
+    valid = PackingConfig(
+        objective="lowest_landed_cost",
+        dimensional_weight_divisor=8_000,
+        dimensional_weight_length_unit="cm",
+        dimensional_weight_weight_unit="kg",
+    )
+    result = Packer(valid).pack([parcel], [rated])
+
+    missing_divisor = PackingConfig(objective="lowest_landed_cost")
+    request = PackingRequest((parcel,), (rated,))
+    with pytest.raises(UnknownObjectiveError, match="dimensional_weight_divisor"):
+        rebalance_weight(request, result.containers, result.unpacked, missing_divisor)
+
+    untabled = Container.create("untabled", Dimensions.mm(300, 300, 300))
+    request_with_unused_container = PackingRequest((parcel,), (rated, untabled))
+    with pytest.raises(UnknownObjectiveError, match="rate_table on every container; 'untabled'"):
+        rebalance_weight(request_with_unused_container, result.containers, result.unpacked, valid)

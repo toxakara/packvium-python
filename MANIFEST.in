@@ -1,0 +1,17 @@
+# What the source distribution carries beyond the importable package.
+#
+# setuptools builds an sdist from the declared packages plus a short list of standard
+# metadata files, and silently drops everything else -- which left `pip download
+# packvium` giving you the library and nothing to read. Every sibling port already ships
+# both: the Rust crate carries its examples to crates.io, and the PHP and npm packages
+# carry theirs. There is no reason Python should be the one ecosystem where you have to
+# find the repository to see a worked example.
+graft examples
+graft tests
+
+# `graft` is recursive and takes everything it finds, including whatever bytecode the
+# last local test run left behind. Compiled caches are host- and interpreter-specific
+# and have no business in a published artifact.
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

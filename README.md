@@ -3,7 +3,7 @@
 Deterministic 3D cartonization and rectangular bin packing. Pure Python, **no runtime
 dependencies**, exact integer geometry.
 
-> **Version 0.1.0 — early release.** The public API is not frozen; pin an exact version.
+> **Version 0.1.1 — early release.** The public API is not frozen; pin an exact version.
 > Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
 
 ```bash
@@ -38,6 +38,22 @@ There is also a CLI that reads a JSON request on standard input:
 echo '{"items":[{"id":"box","quantity":8,"dimensions":{"length":"50","width":"50","height":"50"}}],
        "containers":[{"id":"carton","inner_dimensions":{"length":"100","width":"100","height":"100"}}]}' \
   | python -m packvium
+```
+
+## Examples
+
+Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
+and execute without a project around it.
+
+| File | What it shows |
+| --- | --- |
+| [`basic.py`](examples/basic.py) | The smallest useful call: items in, placements out. |
+| [`constraints.py`](examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused. |
+| [`nested.py`](examples/nested.py) | Units into cartons, cartons onto a pallet, in one call. |
+| [`commerce.py`](examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+
+```bash
+python3 examples/constraints.py
 ```
 
 ## What it does

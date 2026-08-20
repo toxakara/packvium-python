@@ -4,8 +4,9 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from .config import PackingConfig
-from .extensions import ExtensionRegistry, SolutionScorer, resolve_objective_scorer
-from .models import Container, Item, PackingRequest
+from .extensions import (ExtensionRegistry, SolutionScorer, UnknownObjectiveError,
+                         resolve_objective_scorer, unpriceable_container)
+from .models import Container, Item, PackingRequest, UnratedWeightError
 from .result import AlgorithmReport, PackingResult, PackingStatus
 from .result import aggregate_termination
 from .solvers import Deadline, SolverOrchestrator
@@ -33,6 +34,30 @@ class Packer:
 
     def pack(self, items, containers) -> PackingResult:
         request = PackingRequest(tuple(items), tuple(containers))
+        # Both weight objectives price the same billed weight, so both need the divisor
+        # up front -- a wrong guess would silently misprice every shipment. And rating
+        # some containers while others carry no tariff would rank a priced packing
+        # against an unpriced one as though the unpriced were free: a missing rate table
+        # is a static property of the request, unlike a billed weight past the last
+        # bracket, which depends on how the search filled the box and loses a candidate
+        # instead. Rust and the JavaScript fallback refuse both at admission with these
+        # same sentences ( review); the scorer's late checks stay as the backstop
+        # for callers who bypass `Packer.pack`.
+        if (
+            self.config.objective in ("shipping_cost", "lowest_landed_cost")
+            and self.config.dimensional_weight_divisor is None
+        ):
+            raise UnknownObjectiveError(
+                f"the {self.config.objective} objective requires "
+                f"configuration.dimensional_weight_divisor"
+            )
+        if self.config.objective == "lowest_landed_cost":
+            unrated = next((c for c in request.containers if c.rate_table is None), None)
+            if unrated is not None:
+                raise UnknownObjectiveError(
+                    f"the lowest_landed_cost objective requires a rate_table on every "
+                    f"container; {unrated.id!r} has none"
+                )
         deadline = (
             Deadline(self.config.time_limit_ms, clock=self.clock)
             if self.clock is not None
@@ -131,6 +156,19 @@ class Packer:
         valid_ranked = [result for result in ranked if result.status is not PackingStatus.INVALID_RESULT]
         selected = valid_ranked or ranked
         best = selected[0]
+        # The search ranks an unpriceable packing worst so that any priceable alternative
+        # beats it; reaching here with one still winning means no alternative existed.
+        # Returning it would quote a number the carrier never published, so the run is
+        # refused -- the same refusal the other three engines give, in the same words. The
+        # refusal is deliberately here and not in the scorer: raising while *comparing*
+        # candidates would abort runs that have a perfectly shippable answer.
+        unpriceable = unpriceable_container(best.containers, self.config)
+        if unpriceable is not None:
+            container_id, grams, bound = unpriceable
+            raise UnratedWeightError(
+                f"container {container_id!r} bills at {grams} g, above its rate table's "
+                f"last bracket ({bound} g); the shipment has no published price"
+            )
         return PackingResult(
             best.status,
             best.containers,
@@ -138,7 +176,14 @@ class Packer:
             best.algorithm,
             best.score,
             best.warnings,
-            tuple(selected[1:self.config.top_k]),
+            # The sentinel is a search device, never an answer -- alternatives included.
+            # A runner-up the tariff cannot price is dropped before the slice, so up to
+            # top_k-1 usable packings survive when priceable runners exist beyond an
+            # unpriceable one ( review).
+            tuple(
+                runner for runner in selected[1:]
+                if unpriceable_container(runner.containers, self.config) is None
+            )[: max(0, self.config.top_k - 1)],
             best.feasibility,
             best.termination,
             best.optimality,
