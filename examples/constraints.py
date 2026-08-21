@@ -19,6 +19,7 @@ from packvium import (
     Length,
     Packer,
     PackingConfig,
+    Rotation,
     explain_unpacked_item,
 )
 
@@ -116,3 +117,88 @@ if result.unpacked:
         print(f"  {unpacked.instance.item.id:12s} {explain_unpacked_item(unpacked)}")
 else:
     print("\neverything fitted -- widen the crate or add items to see a refusal explained")
+
+
+
+
+# ------------------------------------------------------------- one rule at a time
+#
+# The four rules below are each shown twice: the same items, the same container, once
+# without the rule and once with it. A constraint you cannot watch change the answer is
+# one the reader has to take on faith, and the pair makes the rule -- rather than the
+# geometry -- provably the reason.
+#
+# Note what "the rule bit" looks like. Only sometimes is it a refusal; more often the
+# solver satisfies the rule by opening another container, which costs money and is the
+# answer you actually wanted to see coming. So both numbers are printed.
+
+def compare(rule: str, without: list[Item], with_rule: list[Item], containers: list[Container]) -> None:
+    print(f"\n{rule}")
+    for label, variant in (("without the rule", without), ("with the rule   ", with_rule)):
+        outcome = Packer(PackingConfig.balanced()).pack(variant, containers)
+        placements = sum(len(container.placements) for container in outcome.containers)
+        print(
+            f"  {label}: {len(outcome.containers)} container(s), "
+            f"{placements} placed, {len(outcome.unpacked)} refused"
+        )
+        for unpacked in outcome.unpacked:
+            print(f"      {explain_unpacked_item(unpacked)}")
+
+
+shelf = [Container.create("shelf", Dimensions.mm("800", "400", "500"), max_payload="40 kg")]
+
+# `allowed_rotations` narrows the six orientations to the ones you permit, and
+# `Rotation.upright()` is the pair that keeps the item's own height vertical -- what you
+# want for anything with a printed face or an open top. The pole is 700 mm tall and the
+# shelf is 500 mm deep, so it fits only by being laid down, which is what this forbids.
+pole = Dimensions.mm("90", "90", "700")
+compare(
+    "allowed_rotations -- a pole that only fits lying down, forbidden from lying down",
+    [Item.create("pole", pole, "1 kg")],
+    [Item.create("pole", pole, "1 kg", allowed_rotations=Rotation.upright())],
+    shelf,
+)
+
+# `max_stacked_items` caps how many units may sit above one item -- a pallet-pattern
+# rule ("three high, no more"), not a weight limit. The column below is one tin wide, so
+# height is the only way to fit more, and the second container is the price of the cap.
+column = [Container.create("column", Dimensions.mm("160", "160", "600"), max_payload="40 kg")]
+tin = Dimensions.mm("150", "150", "120")
+compare(
+    "max_stacked_items -- five tins fit in one column; three-high needs two columns",
+    [Item.create("tin", tin, "800 g", quantity=5)],
+    [Item.create("tin", tin, "800 g", quantity=5, max_stacked_items=3)],
+    column,
+)
+
+# `minimum_support_ratio` is how much of an item's base must rest on something solid.
+# The plinth stands on the floor and covers a quarter of the ledge, and the ledge is too
+# shallow for the slab to stand on edge -- so the only place the slab fits is perched on
+# the plinth, on a quarter of its base. At 0.9 that is refused and a second ledge opens.
+ledge = [Container.create("ledge", Dimensions.mm("400", "400", "350"), max_payload="40 kg")]
+plinth = Item.create("plinth", Dimensions.mm("200", "200", "300"), "5 kg", must_be_on_floor=True)
+slab = Dimensions.mm("400", "400", "60")
+compare(
+    "minimum_support_ratio -- a slab perched on a quarter of its base",
+    [plinth, Item.create("slab", slab, "9 kg")],
+    [plinth, Item.create("slab", slab, "9 kg", minimum_support_ratio=0.9)],
+    ledge,
+)
+
+# `group` is atomic: every member ships in one container or none of them does. The third
+# part is deliberately too long for the shelf, so it takes the other two down with it
+# rather than shipping two thirds of an assembly nobody can use.
+parts = [
+    Dimensions.mm("200", "200", "100"),
+    Dimensions.mm("200", "200", "100"),
+    Dimensions.mm("900", "100", "100"),
+]
+compare(
+    "group -- one member cannot be placed, so none of them is",
+    [Item.create(f"kit-{n}", d, "2 kg") for n, d in enumerate(parts, start=1)],
+    [Item.create(f"kit-{n}", d, "2 kg", group="assembly") for n, d in enumerate(parts, start=1)],
+    shelf,
+)
+
+# Every reason code above is a fact about the request, not a solver failure -- which is
+# why `explain_unpacked_item` can turn it into a sentence a customer is allowed to read.

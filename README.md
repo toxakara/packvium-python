@@ -3,8 +3,8 @@
 Deterministic 3D cartonization and rectangular bin packing. Pure Python, **no runtime
 dependencies**, exact integer geometry.
 
-> **Version 0.1.1 — early release.** The public API is not frozen; pin an exact version.
-> Read [docs/GUARANTEES.md](docs/GUARANTEES.md) before relying on a result.
+> **Version 0.1.2 — early release.** The public API is not frozen; pin an exact version.
+> Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
 
 ```bash
 pip install packvium
@@ -42,18 +42,28 @@ echo '{"items":[{"id":"box","quantity":8,"dimensions":{"length":"50","width":"50
 
 ## Examples
 
-Runnable, in [`examples/`](examples). Each one is a single file you can read top to bottom
-and execute without a project around it.
+Runnable, in [`examples/`](https://github.com/toxakara/packvium-python/tree/main/examples). Each one is a single file you can read top to bottom
+and execute without a project around it. Every one of them is executed by the test suite
+on each release, so none of them can quietly stop working.
+
+New here? Read `basic.py`, then `objectives.py` — between them they cover what most
+callers need. `units.py` and `serialization.py` explain the two design choices that
+surprise people. `extensions.py` is last on purpose: reach for it only after the fields
+in `constraints.py` have failed you.
 
 | File | What it shows |
 | --- | --- |
-| [`basic.py`](examples/basic.py) | The smallest useful call: items in, placements out. |
-| [`constraints.py`](examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused. |
-| [`nested.py`](examples/nested.py) | Units into cartons, cartons onto a pallet, in one call. |
-| [`commerce.py`](examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+| [`basic.py`](https://github.com/toxakara/packvium-python/blob/main/examples/basic.py) | The smallest useful call: items in, placements out — and the three details in it that are easy to miss. |
+| [`objectives.py`](https://github.com/toxakara/packvium-python/blob/main/examples/objectives.py) | All six objectives on scenes where they genuinely disagree, including the rate card that makes the heavier shipment the cheaper one. |
+| [`constraints.py`](https://github.com/toxakara/packvium-python/blob/main/examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused. |
+| [`units.py`](https://github.com/toxakara/packvium-python/blob/main/examples/units.py) | Why there are no floats anywhere: fractional inches, exact ticks, and the one-tick difference between a fit and a refusal. |
+| [`serialization.py`](https://github.com/toxakara/packvium-python/blob/main/examples/serialization.py) | The same request as JSON, the result in full, and exactly which mistakes are refused and which are silently ignored. |
+| [`nested.py`](https://github.com/toxakara/packvium-python/blob/main/examples/nested.py) | Units into cartons, cartons onto a pallet, in one call. |
+| [`commerce.py`](https://github.com/toxakara/packvium-python/blob/main/examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+| [`extensions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/extensions.py) | A rule the schema has no field for — and an honest account of what you give up by writing one. |
 
 ```bash
-python3 examples/constraints.py
+PYTHONPATH=src python3 examples/objectives.py
 ```
 
 ## What it does
@@ -77,25 +87,35 @@ python3 examples/constraints.py
 
 | Document | Covers |
 | --- | --- |
-| [docs/GUARANTEES.md](docs/GUARANTEES.md) | What is promised and what is not. Start here. |
-| [docs/PUBLIC-API.md](docs/PUBLIC-API.md) | Inputs, outputs and status semantics. |
-| [docs/UNITS-AND-NUMERICS.md](docs/UNITS-AND-NUMERICS.md) | Units, accepted input forms, rounding policy. |
+| [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) | What is promised and what is not. Start here. |
+| [docs/PUBLIC-API.md](https://github.com/toxakara/packvium-python/blob/main/docs/PUBLIC-API.md) | Inputs, outputs and status semantics. |
+| [docs/UNITS-AND-NUMERICS.md](https://github.com/toxakara/packvium-python/blob/main/docs/UNITS-AND-NUMERICS.md) | Units, accepted input forms, rounding policy. |
 
 ## Requirements
 
-Python 3.10 or newer. No dependencies.
+Python 3.9 or newer. No dependencies.
 
-## Other ports exist
+## The Packvium family
 
-The same request and result contract is implemented independently in PHP and Rust, and
-all three are held to producing identical placements on a shared fixture set. If your
-stack spans languages, you can compute a packing on any of them and get the same answer.
+One request and result contract, implemented independently in four engines (Rust,
+Python, PHP, JavaScript) and held to identical placements on a shared fixture set.
+Pick the package for your stack; mixing them in one system is safe.
+
+| Package | Install | Source |
+| --- | --- | --- |
+| Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
+| PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "0.1"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
+| Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
+| PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
+| Python native selector — `packvium-native` | from source until the native wheels ship | [packvium-python-adapter](https://github.com/toxakara/packvium-python-adapter) |
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports go through the process in
-[SECURITY.md](SECURITY.md), not public issues.
+See [CONTRIBUTING.md](https://github.com/toxakara/packvium-python/blob/main/CONTRIBUTING.md). Security reports go through the process in
+[SECURITY.md](https://github.com/toxakara/packvium-python/blob/main/SECURITY.md), not public issues.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/toxakara/packvium-python/blob/main/LICENSE).

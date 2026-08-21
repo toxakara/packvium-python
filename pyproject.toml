@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "packvium"
-version = "0.1.1"
+version = "0.1.2"
 description = "Deterministic, extensible 3D cartonization and rectangular bin-packing library"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,6 +24,13 @@ classifiers = [
   "Operating System :: OS Independent",
   "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/toxakara/packvium-python"
+Source = "https://github.com/toxakara/packvium-python"
+Documentation = "https://github.com/toxakara/packvium-python/tree/main/docs"
+Changelog = "https://github.com/toxakara/packvium-python/blob/main/CHANGELOG.md"
+Issues = "https://github.com/toxakara/packvium-python/issues"
 
 [project.scripts]
 packvium = "packvium.__main__:main"

@@ -54,7 +54,10 @@ levels = [
                 cost_minor=180,
             ),
         ),
-        config=PackingConfig.balanced(),
+        # An example must not change answer merely because it is executed under a
+        # profiler or coverage tool. One deterministic start is sufficient to teach
+        # nested packing, and the generous wall-clock value remains only a safety fuse.
+        config=PackingConfig.fast(time_limit_ms=60_000),
     ),
     # Level 2: put those cartons on a pallet. The deck is the inner dimension and the
     # usable stack height is the rest.
