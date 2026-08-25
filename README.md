@@ -3,7 +3,7 @@
 Deterministic 3D cartonization and rectangular bin packing. Pure Python, **no runtime
 dependencies**, exact integer geometry.
 
-> **Version 0.1.2 — early release.** The public API is not frozen; pin an exact version.
+> **Version 0.1.3 — early release.** The public API is not frozen; pin an exact version.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
 
 ```bash
@@ -100,6 +100,9 @@ Python 3.9 or newer. No dependencies.
 One request and result contract, implemented independently in four engines (Rust,
 Python, PHP, JavaScript) and held to identical placements on a shared fixture set.
 Pick the package for your stack; mixing them in one system is safe.
+
+Documentation, the constraint reference and the benchmarks are at
+[packvium.com](https://packvium.com).
 
 | Package | Install | Source |
 | --- | --- | --- |
