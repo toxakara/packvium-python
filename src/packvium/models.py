@@ -6,7 +6,8 @@ from ._compat import dataclass
 from typing import Any, Iterable, Mapping
 
 from .centre_of_mass import centre_of_mass_offset_ppm
-from .geometry import AxisAlignedBox, Dimensions, Point, Rotation
+from . import compression, hull
+from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
 from .lattice_summary import LatticeSummary
 from .nesting import used_volume as nesting_used_volume
 from .units import Length, Weight
@@ -44,6 +45,16 @@ class Axle:
     max_load: Weight | None = None
 
 
+#: The largest `stop_index` every engine can carry identically (/KI defect found
+#: under ). Route order is decided by comparing stop indices, and JavaScript holds
+#: numbers as doubles: `JSON.parse` already collapses 2**53 + 1 to 2**53 before any
+#: constraint sees it, so two consecutive stops above this bound become one number there
+#: and one engine silently disagrees with the other three. Since the value cannot cross
+#: the wire identically, it is refused rather than accepted and mis-ordered -- the same
+#: choice `InvalidDirectionError` makes for a direction outside its six.
+MAX_EXACT_STOP_INDEX = 2 ** 53 - 1
+
+
 @dataclass(frozen=True, slots=True)
 class Item:
     id: str
@@ -77,6 +88,16 @@ class Item:
     # existed. Only order between items matters, not any absolute stop identity, so
     # this stays a bare non-negative integer rather than a richer stop object.
     stop_index: int | None = None
+    # How much of `dimensions` this item actually occupies. The default is the
+    # contract as it stood before this epic -- the item is its box -- and the three fields
+    # below are the data the two narrower shapes need. Each belongs to exactly one shape;
+    # setting one against the wrong shape is refused rather than ignored, because a
+    # `compression_ratio` silently dropped on a `convex_hull` reads as an item that was
+    # packed to its declared limits when it never was.
+    shape_type: "ShapeType" = ShapeType.RIGID_CUBOID
+    hull_vertices: tuple[tuple[int, int, int], ...] | None = None
+    compression_ratio_ppm: int | None = None
+    max_compression_pressure_kpa: int | None = None
     # Exact, unit-less economic worth for the `maximum_value` objective,
     # which ranks by the total value of unpacked items rather than treating every
     # item as equally worth leaving behind. `None` (the default) never affects
@@ -90,14 +111,15 @@ class Item:
         if not 0 <= self.minimum_support_ratio <= 1: raise ValueError("minimum_support_ratio must be between 0 and 1")
         if self.max_stacked_items is not None and self.max_stacked_items < 1:
             raise ValueError("max_stacked_items must be at least 1")
-        if self.stop_index is not None and self.stop_index < 0:
-            raise ValueError("stop_index must be non-negative")
+        if self.stop_index is not None and not 0 <= self.stop_index <= MAX_EXACT_STOP_INDEX:
+            raise ValueError("stop_index must be a non-negative safe integer")
         if self.value is not None and self.value < 0:
             raise ValueError("value must be non-negative")
         if self.nesting_height is not None and not 0 <= self.nesting_height.ticks < self.dimensions.height.ticks:
             raise ValueError("nesting_height must be at least zero and strictly less than the item's own height")
         if self.ground_contact_rule is not None and self.ground_contact_rule not in GROUND_CONTACT_RULES:
             raise ValueError(f"ground_contact_rule must be one of {sorted(GROUND_CONTACT_RULES)}")
+        self._validate_shape()
         rotations = tuple(r for r in self.allowed_rotations if not self.keep_upright or r in Rotation.upright())
         if not rotations: raise ValueError("at least one rotation must be allowed")
         object.__setattr__(self, "allowed_rotations", rotations)
@@ -109,6 +131,67 @@ class Item:
         object.__setattr__(self, "weight", Weight.parse(self.weight))
         if self.max_top_load is not None:
             object.__setattr__(self, "max_top_load", Weight.parse(self.max_top_load))
+
+    def _validate_shape(self) -> None:
+        """Admit an item's shape, or refuse it with the reason.
+
+        Kept out of `__post_init__` because it is the only rule here that spans four fields
+        at once: which of them are required, which are forbidden, and what the survivors
+        have to be consistent with.
+        """
+        object.__setattr__(self, "shape_type", ShapeType(self.shape_type))
+        for name, value in self._fields_foreign_to_shape():
+            if value is not None:
+                raise ValueError(f"{name} is not part of a {self.shape_type.value} item")
+        if self.nesting_height is not None and self.shape_type is not ShapeType.RIGID_CUBOID:
+            # Both rewrite occupied height. Picking an order silently would give four
+            # engines four contracts; the interaction gets its own task before it is allowed.
+            raise ValueError(
+                f"nesting_height with shape_type {self.shape_type.value} is not supported yet"
+            )
+        if self.shape_type is ShapeType.CONVEX_HULL:
+            self._validate_hull()
+        elif self.shape_type is ShapeType.COMPRESSIBLE:
+            self._validate_compression()
+
+    def _fields_foreign_to_shape(self) -> tuple[tuple[str, Any], ...]:
+        compression = (
+            ("compression_ratio_ppm", self.compression_ratio_ppm),
+            ("max_compression_pressure_kpa", self.max_compression_pressure_kpa),
+        )
+        vertices = (("hull_vertices", self.hull_vertices),)
+        if self.shape_type is ShapeType.CONVEX_HULL:
+            return compression
+        if self.shape_type is ShapeType.COMPRESSIBLE:
+            return vertices
+        return vertices + compression
+
+    def _validate_hull(self) -> None:
+        if self.hull_vertices is None:
+            raise ValueError("a convex_hull item requires hull_vertices")
+        object.__setattr__(self, "hull_vertices", hull.validate(self.hull_vertices))
+        lower, upper = hull.bounding_extent(self.hull_vertices)
+        extent = tuple(high - low for high, low in zip(upper, lower))
+        declared = (self.dimensions.length.ticks, self.dimensions.width.ticks,
+                    self.dimensions.height.ticks)
+        if any(span > limit for span, limit in zip(extent, declared)):
+            # `dimensions` stays the broad phase and the candidate-generation envelope, so a
+            # hull poking out of it would be tested for collision against space the solver
+            # never reserved.
+            raise ValueError(
+                f"hull_vertices span {extent} does not fit inside dimensions {declared}"
+            )
+
+    def _validate_compression(self) -> None:
+        if self.compression_ratio_ppm is None or self.max_compression_pressure_kpa is None:
+            raise ValueError(
+                "a compressible item requires both compression_ratio and "
+                "max_compression_pressure_kpa"
+            )
+        if not 0 <= self.compression_ratio_ppm <= compression.PPM:
+            raise ValueError("compression_ratio must be between zero and one")
+        if self.max_compression_pressure_kpa < 0:
+            raise ValueError("max_compression_pressure_kpa cannot be negative")
 
     @classmethod
     def create(cls, id: str, dimensions: Dimensions, weight=0, **kwargs) -> "Item":
@@ -257,6 +340,41 @@ class Container:
         return cls(id=id, inner_dimensions=inner_dimensions, tare_weight=Weight.parse(tare_weight), max_payload=None if max_payload is None else Weight.parse(max_payload), **kwargs)
 
 
+def is_stack_sensitive(item: "Item") -> bool:
+    """Whether what rests on this item can change a verdict.
+
+    The three original reasons are about the item refusing load. The fourth is about the
+    item *yielding* to it: a compressible item needs the cumulative mass above it computed
+    before its occupied height -- or its crush limit -- means anything, and that mass only
+    exists once the support graph is built.
+    """
+    return (not item.stackable
+            or item.max_top_load is not None
+            or item.max_stacked_items is not None
+            or item.max_compression_pressure_kpa is not None)
+
+
+def hull_collision_is_exact(item: "Item", envelope_matches_physical: bool) -> bool:
+    """Whether this item's collisions may be decided by its hull rather than by its box.
+
+    Three conditions, and each falls back to the box for its own reason:
+
+    * not a `convex_hull` -- there is no hull to be exact about;
+    * a clearance has inflated the envelope past the physical box -- a margin around a hull
+      is not a hull, and refining here would hand back space the caller asked to keep empty;
+    * the item is on a route -- `packing_sequence` reasons about reachability with box sweeps
+      only, and a solver that packed hulls tighter than the sequence replay can verify would
+      produce arrangements it then reported as unloadable. Better one conservative answer in
+      both places than two that disagree. Lifting this needs a hull-aware sweep, which is a
+      task of its own rather than a line here.
+
+    Every fallback over-reserves space, which is the only safe direction.
+    """
+    return (item.shape_type is ShapeType.CONVEX_HULL
+            and envelope_matches_physical
+            and item.stop_index is None)
+
+
 @dataclass(frozen=True, slots=True)
 class Placement:
     instance: ItemInstance
@@ -272,6 +390,64 @@ class Placement:
     def box(self) -> AxisAlignedBox: return AxisAlignedBox(self.position, self.dimensions)
     @property
     def envelope_box(self) -> AxisAlignedBox: return AxisAlignedBox(self.envelope_origin, self.envelope_dimensions)
+
+    @property
+    def hull_shape(self) -> "hull.HullShape | None":
+        """This placement's rotated hull, or `None` when its box is the honest answer.
+
+        `None` for every `rigid_cuboid`, and also whenever a clearance has inflated the
+        envelope past the physical box: a clearance is a margin around whatever the item is,
+        and the margin around a hull is not a hull. Falling back to the envelope over-reserves
+        space, which is the only safe direction to be wrong in.
+        """
+        item = self.instance.item
+        if not hull_collision_is_exact(item, self.envelope_dimensions == self.dimensions):
+            return None
+        return hull.shape_for(item.hull_vertices, self.rotation.value)
+
+
+def placements_collide(left: Placement, right: Placement) -> bool:
+    """Do two placed items actually overlap?
+
+    The axis-aligned envelope test is the broad phase and stays mandatory; this only refines
+    its answer when a hull is one of the two solids, so a request of ordinary boxes reaches
+    the same verdict by the same route it always did. One definition, so the solver, the
+    sequence check and the final validation cannot disagree about what "collides" means.
+    """
+    left_box, right_box = left.envelope_box, right.envelope_box
+    if not left_box.intersects(right_box):
+        return False
+    left_shape, right_shape = left.hull_shape, right.hull_shape
+    if left_shape is None and right_shape is None:
+        return True
+    return hull.collide(
+        left_shape if left_shape is not None else _box_shape(left_box),
+        (left_box.origin.x, left_box.origin.y, left_box.origin.z),
+        right_shape if right_shape is not None else _box_shape(right_box),
+        (right_box.origin.x, right_box.origin.y, right_box.origin.z),
+    )
+
+
+def placement_hits_box(placement: Placement, box: AxisAlignedBox) -> bool:
+    """Whether a placed item overlaps a plain box -- an obstacle, or any other fixed solid.
+
+    Same two-phase rule as `placements_collide`, with the second solid known to be a cuboid.
+    """
+    envelope = placement.envelope_box
+    if not envelope.intersects(box):
+        return False
+    shape = placement.hull_shape
+    if shape is None:
+        return True
+    return hull.collide(
+        shape, (envelope.origin.x, envelope.origin.y, envelope.origin.z),
+        _box_shape(box), (box.origin.x, box.origin.y, box.origin.z),
+    )
+
+
+def _box_shape(box: AxisAlignedBox) -> "hull.HullShape":
+    return hull.HullShape.box(box.dimensions.length.ticks, box.dimensions.width.ticks,
+                              box.dimensions.height.ticks)
 
 
 @dataclass(frozen=True, slots=True)

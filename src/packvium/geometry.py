@@ -25,6 +25,22 @@ class Rotation(str, Enum):
         return (cls.LWH, cls.WLH)
 
 
+class ShapeType(str, Enum):
+    """How much of an item's declared box the item actually occupies.
+
+    `RIGID_CUBOID` is the default and the whole of the contract before this epic: the item
+    is its box. The other two narrow that in one dimension each -- `CONVEX_HULL` in space,
+    `COMPRESSIBLE` in height under load -- and neither may be inferred. An engine that
+    packed a hull as its bounding box would return a plan that validates and does not
+    physically fit, which is why the value is refused rather than approximated until the
+    engine implements it.
+    """
+
+    RIGID_CUBOID = "rigid_cuboid"
+    CONVEX_HULL = "convex_hull"
+    COMPRESSIBLE = "compressible"
+
+
 @dataclass(frozen=True, slots=True)
 class Dimensions:
     length: Length
@@ -157,3 +173,72 @@ class AxisAlignedBox:
         dx = max(0, min(self.x2, other.x2) - max(self.origin.x, other.origin.x))
         dy = max(0, min(self.y2, other.y2) - max(self.origin.y, other.origin.y))
         return dx * dy
+
+
+#: The six axis-aligned faces a box can leave a container through, in a fixed order.
+#: Fixed because callers iterate it to pick the *first* clear direction, and a set would
+#: make which one they pick depend on hash order.
+ALL_DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
+
+
+class InvalidDirectionError(ValueError):
+    """A direction outside the six-value vocabulary was supplied. Rejected rather than
+    silently treated as one of the six -- `-z` in particular, since that was the sequence
+    module's own previous (wrong) default for anything unrecognised."""
+
+    code = "invalid_direction"
+
+    def __init__(self, direction: str):
+        self.direction = direction
+        super().__init__(f"unknown movement direction {direction!r}; expected one of {ALL_DIRECTIONS}")
+
+    def to_dict(self) -> dict:
+        return {"code": self.code, "direction": self.direction}
+
+
+def swept_volume(box: AxisAlignedBox, container: Dimensions,
+                 direction: str) -> tuple[int, int, int, int, int, int]:
+    """The region between `box`'s own face and the matching container wall along
+    `direction`.
+
+    Identical whether a box leaves through that wall (unloading) or arrives through it
+    (loading), which is why one primitive serves both. It lives here rather than beside
+    either caller because both the constraint layer and the sequence layer need it, and
+    the sequence layer already depends on the constraint layer -- putting it there would
+    invert the dependency direction the architecture fixes as one-way.
+    """
+    x1, y1, z1, x2, y2, z2 = box.origin.x, box.origin.y, box.origin.z, box.x2, box.y2, box.z2
+    if direction == "+x":
+        x1 = x2
+        x2 = container.length.ticks
+    elif direction == "-x":
+        x2 = x1
+        x1 = 0
+    elif direction == "+y":
+        y1 = y2
+        y2 = container.width.ticks
+    elif direction == "-y":
+        y2 = y1
+        y1 = 0
+    elif direction == "+z":
+        z1 = z2
+        z2 = container.height.ticks
+    elif direction == "-z":
+        z2 = z1
+        z1 = 0
+    else:
+        raise InvalidDirectionError(direction)
+    return x1, y1, z1, x2, y2, z2
+
+
+def sweep_intersects(sweep: tuple[int, int, int, int, int, int], box: AxisAlignedBox) -> bool:
+    """Does `box` stand anywhere inside a swept region?
+
+    Half-open on every axis, so boxes that merely touch a corridor's face do not block
+    it -- the same convention `AxisAlignedBox.intersects` uses, and the reason a box
+    flush against another's exit face is not treated as being in its way.
+    """
+    sx1, sy1, sz1, sx2, sy2, sz2 = sweep
+    return (sx1 < box.x2 and box.origin.x < sx2
+            and sy1 < box.y2 and box.origin.y < sy2
+            and sz1 < box.z2 and box.origin.z < sz2)

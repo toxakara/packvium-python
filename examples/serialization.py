@@ -16,7 +16,8 @@ Two consequences worth knowing:
   survives the trip intact (see units.py for why that matters);
 - a field this engine has deliberately not implemented yet is refused by name, never
   quietly ignored -- but a key the parser simply does not recognise *is* ignored. The
-  difference matters, and the last section shows both.
+  difference matters, and the last section shows both -- the refusal through the guard's
+  own test hook, because this engine has caught up and now refuses nothing of its own.
 """
 
 import json
@@ -129,16 +130,24 @@ except ValueError as refusal:
     print("unknown objective:", str(refusal)[:100])
 
 # And a field this engine has named as not-yet-implemented is refused explicitly, so a
-# request written for a newer engine fails loudly instead of being half-honoured. The
-# list is empty right now, which is what "this engine is caught up" looks like.
+# request written for a newer engine fails loudly instead of being half-honoured. The list
+# below is the engine's own constant, and it is empty:  implemented `convex_hull`
+# and `compressible`, the last reserved names left on it, so this engine now serves every
+# field and every `shape_type` value the schema defines.
 print("fields this engine refuses by name:",
       {scope: fields for scope, fields in UNSUPPORTED_FIELDS.items() if fields} or "none")
-from_the_future = json.loads(json.dumps(request))
-from_the_future["items"][0]["shape_type"] = "convex_hull"
+
+# Caught up is the right state and a poor demonstration, so the guard takes its lists as
+# parameters -- the same hook its own tests use. Passing the value  retired shows
+# the refusal a caller still gets from an engine that is behind, and shows it naming the
+# *value* rather than the field: `rigid_cuboid` is the default and is implemented, so a
+# caller who spells the default out must be served, not refused.
+behind = json.loads(json.dumps(request))
+behind["items"][0]["shape_type"] = "convex_hull"
 try:
-    reject_unsupported(from_the_future, {"item": ("shape_type",), "request": (), "configuration": (), "container": ()})
+    reject_unsupported(behind, shape_types=("convex_hull",))
 except UnsupportedFeatureError as refusal:
-    print("  what it looks like when one is:", str(refusal)[:110])
+    print("  what one looks like, from an engine that is not:", str(refusal)[:110])
 
 # ---------------------------------------------------------------------------------
 # The same document drives the command line, which reads a request on stdin and writes

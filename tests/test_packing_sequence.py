@@ -166,6 +166,41 @@ def test_a_second_escape_direction_saves_an_otherwise_blocked_stop():
     assert order == [1, 0]  # far (stop 0, index 1) lifts straight out first
 
 
+def test_two_placements_due_at_the_same_stop_may_block_each_other():
+    """Within one stop the unloading order is free, so being in the way is not a violation.
+
+    This is the case `docs/STOP-ACCESSIBILITY.md`'s per-candidate rule is deliberately
+    optimistic about: its blocker set is `s(q) > s(p)`, strictly greater, and tightening it
+    to `>=` would refuse this arrangement -- two pallets for the same delivery, one behind
+    the other, which is an ordinary load rather than a defect. The rule is written against
+    this test, so a future implementation that gets the comparison wrong fails here rather
+    than in a customer's van.
+    """
+    container = Dimensions.mm(20, 10, 10)
+    near, far = box(0, 0, 0, 10, 10, 10), box(10, 0, 0, 10, 10, 10)
+    assert safe_route_removal_order([near, far], [0, 0], container, directions=("-x",)) == [0, 1]
+
+
+def test_the_same_packing_can_be_legal_through_one_wall_and_illegal_through_another():
+    """Route legality is a property of the packing *and* the door, and only one of the two
+    is expressible in a request today.
+
+    The arrangement below is what the solvers actually produce for a two-stop van load, and
+    it unloads correctly through `-x` and not at all through `+x`. Nothing in the request
+    schema names which wall the door is on -- `stop_index` is there and no access field is --
+    so a solver enforcing route order has no way to know which of these two answers it is
+    being asked for. `docs/STOP-ACCESSIBILITY.md` records that as the first thing its design
+    needs and the reason the constraint cannot simply be switched on.
+    """
+    container = Dimensions.mm(100, 20, 20)
+    early, late = box(0, 0, 0, 50, 20, 20), box(50, 0, 0, 50, 20, 20)
+    assert safe_route_removal_order([early, late], [0, 1], container, directions=("-x",)) == [0, 1]
+    with pytest.raises(RouteSequenceError) as excinfo:
+        safe_route_removal_order([early, late], [0, 1], container, directions=("+x",))
+    assert excinfo.value.stop == 0
+    assert excinfo.value.stuck == frozenset({0})
+
+
 def test_no_routed_placements_schedules_nothing():
     """Every existing single-stop request leaves `stop_index` unset on every item --
     this must be a complete no-op, not merely a small one."""

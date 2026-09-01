@@ -53,6 +53,16 @@ class PackingConfig:
     container_plan_beam_width: int = 1
     #: Hard counted-work ceiling for container-plan nodes, independent of wall time.
     container_plan_node_limit: int = 1
+    #: The container walls an item may be unloaded through, for the
+    #: stop-accessibility constraint. Empty (the default) disables the check entirely and
+    #: reproduces every existing result byte-for-byte.
+    #:
+    #: Programmatic only, and deliberately so: the request schema has no access-directions
+    #: field yet (docs/STOP-ACCESSIBILITY.md files it as deferred until a contract freeze),
+    #: and defaulting to all six walls would enforce a rule true of no real vehicle. So a
+    #: caller who wants the check states the doors in code, the same non-request path
+    #: `safe_route_removal_order` is driven through today.
+    access_directions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.time_limit_ms <= 0 or self.top_k <= 0 or self.exact_item_limit <= 0

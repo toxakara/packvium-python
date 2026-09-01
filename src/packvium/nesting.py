@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Sequence
 
+from . import hull
+from .compression import applied_pressure, effective_height_ticks
+from .geometry import ShapeType
+
 if TYPE_CHECKING:
     from .models import Placement
 
@@ -54,9 +58,44 @@ def _nesting_overlap_volume(placements: Sequence["Placement"]) -> int:
     return overlap
 
 
+def occupied_volume(placement: "Placement") -> int:
+    """How much space a placement actually takes, which is its box only if it is one.
+
+    A `convex_hull` item occupies its hull. Counting its bounding box instead is not a
+    conservative approximation of utilisation, it is a wrong number: two interlocking wedges
+    filling one crate would report it 200% full, and the independent validator refuses that
+    before any caller sees it.
+    """
+    item = placement.instance.item
+    if item.shape_type is ShapeType.CONVEX_HULL:
+        # Collision may conservatively fall back to the envelope for route-bound items or a
+        # clearance margin. That does not turn the physical item into a box: utilisation and
+        # reserve accounting always use the authored solid.
+        assert item.hull_vertices is not None
+        return hull.shape_for(item.hull_vertices, placement.rotation.value).volume
+    if item.max_compression_pressure_kpa is None:
+        return placement.dimensions.volume
+    # Compression follows the item's rotated height axis, and `dimensions` is already rotated.
+    # The load is the one the placement reports, so this needs no support graph and stays in
+    # this layer; `top_load` is resolved before a result is ever built.
+    dimensions = placement.dimensions
+    footprint = dimensions.length.ticks * dimensions.width.ticks
+    pressure = applied_pressure(placement.top_load, footprint)
+    if pressure.exceeds_kpa(item.max_compression_pressure_kpa):
+        # A crushed item has no meaningful occupied volume, and the arrangement is already
+        # invalid -- `crushed` refuses it in the solver and the validator reports it. Reporting
+        # the uncompressed figure here keeps that a reported issue rather than an exception
+        # thrown out of a volume property.
+        return dimensions.volume
+    return footprint * effective_height_ticks(
+        dimensions.height.ticks, item.compression_ratio_ppm,
+        item.max_compression_pressure_kpa, pressure,
+    )
+
+
 def used_volume(placements: Sequence["Placement"]) -> int:
     """Physical volume actually occupied by `placements`, nesting overlap removed."""
-    return sum(p.dimensions.volume for p in placements) - _nesting_overlap_volume(placements)
+    return sum(occupied_volume(p) for p in placements) - _nesting_overlap_volume(placements)
 
 
 def used_volume_delta(placements: Sequence["Placement"], placement: "Placement") -> int:
@@ -69,7 +108,7 @@ def used_volume_delta(placements: Sequence["Placement"], placement: "Placement")
     """
     nesting = placement.instance.item.nesting_height
     if nesting is None:
-        return placement.dimensions.volume
+        return occupied_volume(placement)
     overlap = 0
     for existing in placements:
         if is_valid_nesting(existing, placement):

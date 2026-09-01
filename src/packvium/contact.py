@@ -75,19 +75,38 @@ class ContactGraph:
     forced them to share the definition.
     """
 
-    __slots__ = ("_supporters", "_children")
+    __slots__ = ("_supporters", "_children", "_boxes", "_cell", "_by_top", "_by_bottom",
+                 "_top_indexes", "_bottom_indexes")
 
-    def __init__(self, boxes: Sequence[AxisAlignedBox]):
+    def __init__(self, boxes: Sequence[AxisAlignedBox], cell_hint: int = 1):
+        """`cell_hint` is an upper bound on the footprint of any box that may later be
+        appended with `with_box`.
+
+        Without it the cell is sized from the boxes present now, and appending anything
+        wider has to fall back to a full rebuild -- which is correct but defeats the
+        point, because in a search the base is what is already placed and the candidate
+        is a *new* item that may well be the widest thing in the request. A caller that
+        knows the item set passes its widest footprint once and the delta path then
+        always applies. Too large a hint only makes each bucket coarser; too small a one
+        is impossible to get wrong, because the fallback covers it.
+        """
+        boxes = tuple(boxes)
         by_top: dict[int, list[tuple[int, AxisAlignedBox]]] = {}
+        by_bottom: dict[int, list[tuple[int, AxisAlignedBox]]] = {}
         for index, box in enumerate(boxes):
             by_top.setdefault(box.z2, []).append((index, box))
+            by_bottom.setdefault(box.origin.z, []).append((index, box))
         supporters: list[list[ContactEdge]] = [[] for _ in boxes]
         children: list[list[int]] = [[] for _ in boxes]
         # A single global cell size, not one derived per level from that level's own
         # candidates: a querying box can be any size in this scene, and `_LevelIndex`
         # is only correct when its cell is at least as large as every box it will ever
         # index or be queried with.
-        cell = max((max(box.x2 - box.origin.x, box.y2 - box.origin.y) for box in boxes), default=1)
+        cell = max(
+            (max(box.x2 - box.origin.x, box.y2 - box.origin.y) for box in boxes),
+            default=1,
+        )
+        cell = max(cell, cell_hint)
         indexes: dict[int, _LevelIndex] = {}
         for index, box in enumerate(boxes):
             candidates = by_top.get(box.origin.z)
@@ -114,6 +133,114 @@ class ContactGraph:
                     children[other_index].append(index)
         self._supporters = tuple(tuple(s) for s in supporters)
         self._children = tuple(tuple(c) for c in children)
+        self._boxes = boxes
+        self._cell = cell
+        self._by_top = by_top
+        self._by_bottom = by_bottom
+        # Only the top-plane indexes are populated by the build above; the bottom-plane
+        # ones are built on demand, because a from-scratch build never needs them and
+        # paying for them here would slow the common path to speed up the incremental one.
+        self._top_indexes = indexes
+        self._bottom_indexes: dict[int, _LevelIndex] = {}
+
+    def with_box(self, box: AxisAlignedBox) -> "ContactGraph":
+        """This graph plus one more box, appended at the next index.
+
+        Adding a box cannot create or destroy contact between two boxes that were
+        already here: contact is a pairwise geometric predicate over two boxes and
+        nothing else. That is the whole reason a delta is sound, and it is why this
+        returns a new graph that shares the base's edge tuples instead of recomputing
+        them -- only the new box's own two planes are queried.
+
+        The result is required to be identical to `ContactGraph(list(boxes) + [box])`,
+        not merely equivalent: `top_loads` splits a conserved integer across the
+        supporter tuple and hands the rounding remainder to its last edge, so edge
+        *order* is contract, not presentation. Appending the new box's index keeps every
+        existing tuple ascending because the new index is the largest one.
+        """
+        index = len(self._boxes)
+        footprint = max(box.x2 - box.origin.x, box.y2 - box.origin.y)
+        if footprint > self._cell:
+            # `_LevelIndex` is only correct while its cell is at least as large as every
+            # box indexed in or queried against it. A larger box could step over cells
+            # in the middle of its own footprint and miss a real overlap, so this is a
+            # correctness fallback, not an optimisation choice.
+            return ContactGraph(self._boxes + (box,), cell_hint=footprint)
+
+        supporters = list(self._supporters)
+        children = list(self._children)
+
+        # What the new box rests on: boxes whose top plane is its bottom plane.
+        own_supporters: list[ContactEdge] = []
+        for other_index, area in sorted(
+            (other_index, other.overlap_area_xy(box))
+            for other_index, other in self._near(self._by_top, self._top_indexes, box.origin.z, box)
+        ):
+            if area > 0:
+                own_supporters.append(ContactEdge(other_index, area))
+                children[other_index] = children[other_index] + (index,)
+
+        # What now rests on it: boxes whose bottom plane is its top plane. Their
+        # supporter tuples gain the new index, which is larger than every index already
+        # in them, so ascending order is preserved by appending.
+        own_children: list[int] = []
+        for other_index, area in sorted(
+            (other_index, other.overlap_area_xy(box))
+            for other_index, other in self._near(self._by_bottom, self._bottom_indexes, box.z2, box)
+        ):
+            if area > 0:
+                own_children.append(other_index)
+                supporters[other_index] = supporters[other_index] + (ContactEdge(index, area),)
+
+        supporters.append(tuple(own_supporters))
+        children.append(tuple(own_children))
+
+        # The by-plane buckets are carried forward rather than rederived: one box joins
+        # exactly two planes, so copying the outer dict (one entry per distinct plane,
+        # not per box) and rewriting those two buckets is all that changed. Rebuilding
+        # both dicts from `boxes` would put an O(n) dict-insert pass on a path whose
+        # whole purpose is to avoid touching the boxes that did not move.
+        by_top = dict(self._by_top)
+        by_top[box.z2] = by_top.get(box.z2, []) + [(index, box)]
+        by_bottom = dict(self._by_bottom)
+        by_bottom[box.origin.z] = by_bottom.get(box.origin.z, []) + [(index, box)]
+
+        # `_LevelIndex` is immutable once built, so every cached one may be shared with
+        # the base -- except on the two planes whose bucket just gained a member, where
+        # the cached index no longer describes its bucket and must be rebuilt on demand.
+        top_indexes = dict(self._top_indexes)
+        top_indexes.pop(box.z2, None)
+        bottom_indexes = dict(self._bottom_indexes)
+        bottom_indexes.pop(box.origin.z, None)
+
+        return ContactGraph._from_parts(
+            self._boxes + (box,), self._cell, tuple(supporters), tuple(children),
+            by_top, by_bottom, top_indexes, bottom_indexes)
+
+    @classmethod
+    def _from_parts(cls, boxes, cell, supporters, children,
+                    by_top, by_bottom, top_indexes, bottom_indexes) -> "ContactGraph":
+        graph = cls.__new__(cls)
+        graph._boxes = boxes
+        graph._cell = cell
+        graph._supporters = supporters
+        graph._children = children
+        graph._by_top = by_top
+        graph._by_bottom = by_bottom
+        graph._top_indexes = top_indexes
+        graph._bottom_indexes = bottom_indexes
+        return graph
+
+    def _near(self, buckets, cache, plane: int, box: AxisAlignedBox):
+        """Every box on `plane` that could overlap `box` in XY, deduped, via the hash."""
+        entries = buckets.get(plane)
+        if not entries:
+            return ()
+        level = cache.get(plane)
+        if level is None:
+            level = _LevelIndex(entries, self._cell)
+            cache[plane] = level
+        return level.near(box)
 
     def supporters(self, index: int) -> tuple[ContactEdge, ...]:
         """What `index` directly rests on, each with the contact area."""

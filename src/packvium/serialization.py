@@ -4,7 +4,8 @@ from dataclasses import replace
 
 from .config import PackingConfig, SolverProfile
 from .effort import EffortBudget
-from .geometry import AxisAlignedBox, Dimensions, Point, Rotation
+from .compression import ratio_to_ppm
+from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
 from .models import Axle, Container, Item, Obstacle, RateTable
 from .extensions import ExtensionRegistry
 from .packer import Packer
@@ -31,6 +32,25 @@ def _effort_budget(raw: dict | None) -> EffortBudget | None:
     )
 
 
+def _hull_vertices(raw, unit: str) -> "tuple[tuple[int, int, int], ...] | None":
+    """Parse `hull_vertices` into the integer tick frame before any geometry runs.
+
+    Coordinates go through `Length`, which refuses a negative value, so a hull crossing the
+    wire is authored as non-negative offsets from the corner of its own bounding box. A
+    library caller may still centre a hull wherever it likes -- `hull.rotate` normalises
+    either way -- but the wire keeps one convention so four engines cannot disagree about
+    where an item's frame starts.
+    """
+    if raw is None:
+        return None
+    return tuple(
+        (Length.parse(vertex["x"], unit).ticks,
+         Length.parse(vertex["y"], unit).ticks,
+         Length.parse(vertex["z"], unit).ticks)
+        for vertex in raw
+    )
+
+
 def _item(raw: dict, unit: str) -> Item:
     rotations = tuple(Rotation(v) for v in raw.get("allowed_rotations", [r.value for r in Rotation.all()]))
     return Item(
@@ -46,6 +66,11 @@ def _item(raw: dict, unit: str) -> Item:
         nesting_height=None if raw.get("nesting_height") is None else Length.parse(raw["nesting_height"], unit),
         stop_index=raw.get("stop_index"),
         value=raw.get("value"),
+        shape_type=ShapeType(raw.get("shape_type", ShapeType.RIGID_CUBOID.value)),
+        hull_vertices=_hull_vertices(raw.get("hull_vertices"), unit),
+        compression_ratio_ppm=(None if raw.get("compression_ratio") is None
+                               else ratio_to_ppm(float(raw["compression_ratio"]))),
+        max_compression_pressure_kpa=raw.get("max_compression_pressure_kpa"),
     )
 
 
@@ -108,12 +133,31 @@ class UnsupportedFeatureError(ValueError):
 UNSUPPORTED_FIELDS: dict[str, tuple[str, ...]] = {
     "request": (),
     "configuration": (),
+    # `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list
+    # in , when Python gained both the solver behaviour and the independent validation
+    # the staged rollout requires. PHP, Rust and the JavaScript fallback still carry them.
     "item": (),
     "container": (),
 }
 
+#: `item.shape_type` values this engine does not implement.
+#:
+#: Presence is the wrong test for this one field: `rigid_cuboid` is the default and is
+#: implemented, so a caller that spells the default out must be served, not refused. What
+#: is unimplemented is a *value*, and the refusal has to name it -- an engine that packed a
+#: `convex_hull` item as its bounding box would return a plan that looks valid and does not
+#: physically fit.
+#: Empty since : this engine implements every value the schema defines. The guard
+#: stays because the next reserved value will need it, and because `reject_unsupported` takes
+#: its lists as parameters precisely so it remains testable when they are empty.
+UNSUPPORTED_SHAPE_TYPES: tuple[str, ...] = ()
 
-def reject_unsupported(data: dict, unsupported: dict[str, tuple[str, ...]] | None = None) -> None:
+
+def reject_unsupported(
+    data: dict,
+    unsupported: dict[str, tuple[str, ...]] | None = None,
+    shape_types: tuple[str, ...] | None = None,
+) -> None:
     """Refuse a request that uses a field this engine has not implemented.
 
     The lists are a parameter rather than read from the module constant directly so the
@@ -122,6 +166,7 @@ def reject_unsupported(data: dict, unsupported: dict[str, tuple[str, ...]] | Non
     equally true of a guard that does nothing at all.
     """
     unsupported = UNSUPPORTED_FIELDS if unsupported is None else unsupported
+    shape_types = UNSUPPORTED_SHAPE_TYPES if shape_types is None else shape_types
     # Keyed by name, not appended per occurrence: fifty containers carrying one
     # unimplemented field are one complaint, not fifty.
     found: set[str] = set()
@@ -135,6 +180,9 @@ def reject_unsupported(data: dict, unsupported: dict[str, tuple[str, ...]] | Non
             if not isinstance(entry, dict):
                 continue
             found.update(f"{scope}.{key}" for key in unsupported.get(scope, ()) if key in entry)
+    for entry in data.get("items") or ():
+        if isinstance(entry, dict) and entry.get("shape_type") in shape_types:
+            found.add(f"item.shape_type={entry['shape_type']}")
     if not found:
         return
     raise UnsupportedFeatureError(
