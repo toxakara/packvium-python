@@ -8,8 +8,10 @@ class of bug the fixed-point design exists to prevent.
 
 from __future__ import annotations
 
+import json
 import random
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
@@ -396,6 +398,287 @@ def test_supporters_stay_ordered_by_index_for_the_remainder_split():
     ]
     graph = ContactGraph([beam, *below])
     assert [edge.index for edge in graph.supporters(0)] == [1, 2, 3]
+
+
+# ------------------------------------------------- incremental append
+
+def _touching_scene(rng: random.Random, count: int) -> list[AxisAlignedBox]:
+    """A scene whose boxes actually touch each other.
+
+    `_random_box` draws from a range wide enough that most of its scenes have no
+    contact at all, which is fine for the brute-force agreement property above -- an
+    empty edge set is still an edge set both implementations must agree on. It is not
+    fine here: what is under test is that a delta reproduces edges, so a corpus where
+    most scenes have no edges would pass with the delta returning nothing. Snapping
+    every coordinate and extent to one coarse lattice makes shared planes the norm.
+    """
+    return [
+        AxisAlignedBox(
+            Point(rng.randrange(0, 60, 10), rng.randrange(0, 60, 10), rng.choice([0, 10, 20, 30])),
+            Dimensions(*(Length(rng.choice([10, 20, 30])) for _ in range(3))),
+        )
+        for _ in range(count)
+    ]
+
+
+def _widest_footprint(boxes) -> int:
+    return max(max(box.x2 - box.origin.x, box.y2 - box.origin.y) for box in boxes)
+
+
+def _edges(graph, count: int):
+    """Both edge directions as ordered tuples.
+
+    Compared as sequences, never as sets: `top_loads` hands the integer rounding
+    remainder to whichever supporter is *last*, so two graphs holding the same edges in
+    a different order are two different answers.
+    """
+    return (
+        [tuple((edge.index, edge.area) for edge in graph.supporters(i)) for i in range(count)],
+        [tuple(graph.children(i)) for i in range(count)],
+    )
+
+
+def _count_full_builds(monkeypatch, target) -> list[int]:
+    """Record every from-scratch build of `target`, so a test can tell the delta path
+    from the fallback. Without this an assertion that the two graphs match is satisfied
+    by a `with_box` that quietly rebuilds everything -- correct, and none of the point."""
+    builds: list[int] = []
+    original = target.__init__
+
+    def counting(self, units, cell_hint=1):
+        builds.append(len(units))
+        original(self, units, cell_hint)
+
+    monkeypatch.setattr(target, "__init__", counting)
+    return builds
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_appending_a_box_matches_building_the_whole_scene_at_once(seed, monkeypatch):
+    """The delta is required to be *identical* to the full build, not merely equivalent.
+
+    The base is built with the widest footprint in the scene as its hint, which is what
+    a solver knows before it starts placing: the candidate about to be appended may be
+    larger than anything already placed, and sizing the spatial hash from the placed
+    boxes alone would send every append into the fallback.
+    """
+    rng = random.Random(2000 + seed)
+    boxes = _touching_scene(rng, rng.randint(2, 14))
+    split = max(1, len(boxes) // 2)
+    hint = _widest_footprint(boxes)
+
+    builds = _count_full_builds(monkeypatch, ContactGraph)
+    graph = ContactGraph(boxes[:split], cell_hint=hint)
+    for box in boxes[split:]:
+        graph = graph.with_box(box)
+
+    assert builds == [split], "an append fell back to a full rebuild"
+    assert _edges(graph, len(boxes)) == _edges(ContactGraph(boxes), len(boxes))
+
+
+@pytest.mark.parametrize("coordinates,extents,hint_mode", [
+    ((0, 1, 2, 5, 10), (1, 2, 3), "exact"),
+    ((0, 1, 2, 5, 10), (1, 2, 3), "one"),
+    ((0, 1, 2, 5, 10), (1, 5, 10, 40), "one"),
+    ((0, 1, 2, 5, 10), (1, 5, 10, 40), "huge"),
+    ((0, 10, 100, 10 ** 9), (1, 5, 10, 40), "exact"),
+    ((0, 10, 100, 10 ** 9), (1, 5, 10, 40), "one"),
+    ((0, 10, 100, 10 ** 9), (1, 2, 3), "huge"),
+])
+def test_the_delta_matches_a_rebuild_across_scene_shapes(coordinates, extents, hint_mode):
+    """The same invariant as the property test above, over shapes it deliberately excludes.
+
+    That test asserts *zero* fallbacks, because proving the delta ran was the thing at
+    stake. The consequence is that nothing exercised a run where the fallback and the delta
+    interleave -- and a hint of one forces exactly that, several times per scene.
+
+    The three axes vary independently on purpose. Tight coordinates make shared planes and
+    zero-area edge contacts the norm; coordinates at 10^9 push the spatial hash's cell
+    arithmetic somewhere a lattice never goes; a huge hint collapses every box into one
+    cell, which is the degenerate case the hash exists to avoid and therefore the one most
+    likely to be wrong.
+
+    Written after an unsound optimality bound in a neighbouring module survived 183 tests
+    that all shared one shape. Coverage there was complete; variety was not.
+    """
+    rng = random.Random(hash((coordinates, extents, hint_mode)) & 0xFFFF)
+    for _ in range(60):
+        count = rng.randint(1, 10)
+        boxes = [
+            AxisAlignedBox(
+                Point(rng.choice(coordinates), rng.choice(coordinates), rng.choice(coordinates)),
+                Dimensions(*(Length(rng.choice(extents)) for _ in range(3))),
+            )
+            for _ in range(count)
+        ]
+        widest = _widest_footprint(boxes)
+        hint = {"exact": widest, "one": 1, "huge": widest * 100}[hint_mode]
+        split = max(1, count // 2)
+        graph = ContactGraph(boxes[:split], cell_hint=hint)
+        for box in boxes[split:]:
+            graph = graph.with_box(box)
+        assert _edges(graph, count) == _edges(ContactGraph(boxes), count)
+
+
+def test_a_box_wider_than_the_hint_rebuilds_and_is_still_correct(monkeypatch):
+    """The hint is an optimisation; being wrong about it may cost time, never an answer.
+
+    `_LevelIndex` is only sound while its cell is at least the largest footprint it
+    indexes or is queried with, so a box that exceeds the cell has to be met with a
+    rebuild -- this asserts both halves: that the rebuild happens, and that the result
+    is the one the full build gives.
+    """
+    small = [
+        AxisAlignedBox(Point(0, 0, 0), Dimensions(Length(10), Length(10), Length(10))),
+        AxisAlignedBox(Point(10, 0, 0), Dimensions(Length(10), Length(10), Length(10))),
+    ]
+    wide = AxisAlignedBox(Point(0, 0, 10), Dimensions(Length(40), Length(10), Length(10)))
+
+    builds = _count_full_builds(monkeypatch, ContactGraph)
+    graph = ContactGraph(small).with_box(wide)
+
+    assert builds == [2, 3], "a box exceeding the cell must not use the delta path"
+    assert [edge.index for edge in graph.supporters(2)] == [0, 1]
+    assert _edges(graph, 3) == _edges(ContactGraph([*small, wide]), 3)
+
+
+def test_an_appended_box_lands_last_in_the_tuples_it_joins():
+    """The remainder-split contract, on the delta path specifically.
+
+    The new box always takes the highest index, so appending it to an existing
+    supporter tuple keeps that tuple ascending -- but only because it is appended and
+    not inserted, which is the kind of detail a from-scratch comparison on random
+    scenes can miss when no scene happens to produce the collision.
+    """
+    below = [
+        AxisAlignedBox(Point(0, 0, 0), Dimensions(Length(10), Length(10), Length(10))),
+        AxisAlignedBox(Point(10, 0, 0), Dimensions(Length(10), Length(10), Length(10))),
+    ]
+    resting = AxisAlignedBox(Point(0, 0, 10), Dimensions(Length(20), Length(10), Length(10)))
+    graph = ContactGraph([below[0], resting, below[1]], cell_hint=20).with_box(
+        AxisAlignedBox(Point(0, 0, 20), Dimensions(Length(10), Length(10), Length(10)))
+    )
+    assert [edge.index for edge in graph.supporters(1)] == [0, 2]
+    assert graph.children(1) == (3,)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_appending_a_unit_matches_building_the_support_graph_at_once(seed, monkeypatch):
+    rng = random.Random(4000 + seed)
+    boxes = _touching_scene(rng, rng.randint(2, 12))
+    units = [LoadUnit(box, 100, None, None, f"u{i}") for i, box in enumerate(boxes)]
+    hint = _widest_footprint(boxes)
+
+    builds = _count_full_builds(monkeypatch, LoadSupportGraph)
+    graph = LoadSupportGraph(units[:1], cell_hint=hint)
+    for unit in units[1:]:
+        graph = graph.with_unit(unit, cell_hint=hint)
+
+    assert builds == [1], "an append fell back to a full rebuild"
+    assert _edges(graph, len(units)) == _edges(LoadSupportGraph(units), len(units))
+
+
+def test_the_adversarial_dense_scene_costs_only_the_edges_it_reports(monkeypatch):
+    """The bound the delta is actually claimed to meet, on the shape that is worst for it.
+
+    Two layers of thin strips laid at right angles -- k running along x below, k along y
+    above -- so every upper strip crosses every lower one and the graph really holds
+    k*k edges. It is an ordinary criss-crossed dunnage stack, not a contrivance, and it is
+    the shape any exact contact representation is quadratic on: the edges are there, and
+    reporting them is the work.
+
+    So the delta is not claimed to be cheap here. It is claimed to cost the edges it
+    reports and nothing else: appending one strip touches k boxes, and the probe count
+    must stay within a constant factor of k rather than climbing towards the k*k a
+    from-scratch build performs -- which is what a delta being local *means*.
+    """
+    k = 40
+    span = k * 10
+    lower = [
+        AxisAlignedBox(Point(0, index * 10, 0), Dimensions(Length(span), Length(10), Length(10)))
+        for index in range(k)
+    ]
+    upper = [
+        AxisAlignedBox(Point(index * 10, 0, 10), Dimensions(Length(10), Length(span), Length(10)))
+        for index in range(k - 1)
+    ]
+    arriving = AxisAlignedBox(
+        Point((k - 1) * 10, 0, 10), Dimensions(Length(10), Length(span), Length(10)))
+
+    base = ContactGraph(lower + upper, cell_hint=span)
+    assert sum(len(base.supporters(i)) for i in range(len(lower) + len(upper))) == k * (k - 1), (
+        "the scene is meant to be quadratically dense; if it is not, the bound is untested"
+    )
+
+    probes = 0
+    original = AxisAlignedBox.overlap_area_xy
+
+    def counting(self, other):
+        nonlocal probes
+        probes += 1
+        return original(self, other)
+
+    monkeypatch.setattr(AxisAlignedBox, "overlap_area_xy", counting)
+    graph = base.with_box(arriving)
+
+    assert len(graph.supporters(len(lower) + len(upper))) == k
+    assert probes <= 4 * k, f"{probes} probes to report {k} edges is not a local delta"
+
+
+@pytest.mark.parametrize("coordinates,extents,hint_mode", [
+    ((0, 1, 2, 5, 10), (1, 2, 3), "exact"),
+    ((0, 1, 2, 5, 10), (1, 2, 3), "one"),
+    ((0, 1, 2, 5, 10), (1, 5, 10, 40), "one"),
+    ((0, 10, 100, 10 ** 9), (1, 5, 10, 40), "exact"),
+    ((0, 10, 100, 10 ** 9), (1, 2, 3), "huge"),
+])
+def test_appending_a_unit_matches_a_rebuild_across_scene_shapes(coordinates, extents, hint_mode):
+    """The support graph gets the same treatment as the contact graph beneath it.
+
+    `LoadSupportGraph.with_unit` reads its edges straight off the face graph, so in the
+    non-nesting case it is only as correct as `ContactGraph.with_box` -- but "only as
+    correct as" is an argument, and an argument is what the unsound optimality bound in a
+    neighbouring module also had. The shapes are varied here too rather than reasoned about.
+    """
+    rng = random.Random(hash((coordinates, extents, hint_mode)) & 0xFFFF)
+    for _ in range(40):
+        count = rng.randint(1, 9)
+        units = [
+            LoadUnit(
+                AxisAlignedBox(
+                    Point(rng.choice(coordinates), rng.choice(coordinates), rng.choice(coordinates)),
+                    Dimensions(*(Length(rng.choice(extents)) for _ in range(3))),
+                ),
+                rng.choice((0, 100, 5000)), None, None, f"u{index}",
+            )
+            for index in range(count)
+        ]
+        widest = _widest_footprint([unit.box for unit in units])
+        hint = {"exact": widest, "one": 1, "huge": widest * 100}[hint_mode]
+        graph = LoadSupportGraph(units[:1], cell_hint=hint)
+        for unit in units[1:]:
+            graph = graph.with_unit(unit, cell_hint=hint)
+        assert _edges(graph, count) == _edges(LoadSupportGraph(units), count)
+
+
+def test_a_nesting_unit_is_met_with_a_full_rebuild(monkeypatch):
+    """Nesting is deliberately excluded from the delta, and the exclusion is load-bearing.
+
+    A nesting predecessor replaces the face edges of its whole column, so one new unit
+    can rewrite edges arbitrarily far from itself -- the locality the delta rests on is
+    simply not there. The rebuild is the correct answer, so assert it is taken.
+    """
+    stack = (
+        unit(0, 0, 0, 10, 10, 10, label="a", nesting_item_id="tray", nesting_height_ticks=4),
+        unit(0, 0, 6, 10, 10, 10, label="b", nesting_item_id="tray", nesting_height_ticks=4),
+    )
+    arriving = unit(0, 0, 12, 10, 10, 10, label="c", nesting_item_id="tray", nesting_height_ticks=4)
+
+    builds = _count_full_builds(monkeypatch, LoadSupportGraph)
+    graph = LoadSupportGraph(stack[:1]).with_unit(stack[1]).with_unit(arriving)
+
+    assert builds == [1, 2, 3]
+    assert _edges(graph, 3) == _edges(LoadSupportGraph((*stack, arriving)), 3)
 
 
 # --------------------------------------------------------- stacked-item counting
@@ -975,3 +1258,375 @@ def test_the_blocked_item_and_its_blocker_are_both_named():
     code, detail = route_order_violated(column, [0.0, 1.0])
     assert code == "unloading_order_violation"
     assert "base" in detail and "top" in detail
+
+
+# ------------------------------------------------- stop accessibility
+#
+# The worked examples in docs/STOP-ACCESSIBILITY.md were derived by hand and confirmed
+# against the shipped whole-scene replay, and they are the acceptance criterion for this
+# constraint. They live in `conformance/scene/stop-accessibility-fixtures.json` and are
+# read from there below; the helpers here serve the degenerate and hostile inputs further
+# down, which are specific to this engine and have no cross-language counterpart.
+
+DOOR_AT_MINUS_X = ("-x",)
+ALL_DIRECTIONS_TUPLE = ("+x", "-x", "+y", "-y", "+z", "-z")
+
+
+def _mm(millimetres: int) -> int:
+    """The examples are written in millimetres and positions are taken in ticks, so the
+    conversion is stated once here rather than at every call site."""
+    return Length.mm(millimetres).ticks
+
+
+def _wide(id: str, x: int, length: int, stop=None):
+    """A box spanning the container's full width and height, so a corridor it stands in is
+    completely filled -- the examples turn on which *stop* blocks which, not on squeezing
+    past."""
+    instance = instance_of(id, length=length, width=100, height=100, stop_index=stop)
+    return instance, _mm(x)
+
+
+def _scene(first, second, directions=DOOR_AT_MINUS_X):
+    """Place `first`, then offer `second` as the candidate."""
+    (placed_instance, placed_x), (candidate, candidate_x) = first, second
+    constraint = constraints.StopAccessibilityConstraint(directions)
+    return constraint.evaluate(context(
+        candidate, x=candidate_x, placements=(placed(placed_instance, x=placed_x),),
+        dimensions=candidate.item.dimensions,
+    ))
+
+
+#: The worked examples, held once for all four engines instead of transcribed into each.
+#: Four copies of nine scenes is four chances for a verdict to drift in one engine and stay
+#: green in the other three. A published copy of the package does not carry the corpus, so
+#: the test that reads it skips rather than failing for everyone who installed the package.
+STOP_SCENES = Path(__file__).parents[2] / "conformance/scene/stop-accessibility-fixtures.json"
+requires_stop_scenes = pytest.mark.skipif(
+    not STOP_SCENES.is_file(),
+    reason="the shared cross-language scene corpus is not part of this package",
+)
+
+
+def _fixture_dimensions(raw) -> Dimensions:
+    """The corpus is in ticks, so it is read straight rather than through `Dimensions.mm`:
+    all four engines assert the same integers instead of each scaling by its own factor."""
+    return Dimensions(*(Length(raw[axis]) for axis in ("length", "width", "height")))
+
+
+def _fixture_placement(raw) -> Placement:
+    one, = Item.create(raw["id"], _fixture_dimensions(raw["dimensions"]),
+                       stop_index=raw["stop_index"]).instances()
+    return placed(one, *(raw["origin"][axis] for axis in ("x", "y", "z")))
+
+
+@requires_stop_scenes
+def test_shared_four_language_stop_accessibility_scenes():
+    """Every scene in the shared corpus, with the verdict every engine must reach.
+
+    `accessible` is asserted by all four engines. `code` is asserted here and in PHP, whose
+    constraint returns a reason rather than a boolean, and `route_order_allowed` here, in
+    PHP and in Rust -- the corpus records that asymmetry so it is not rediscovered.
+    """
+    payload = json.loads(STOP_SCENES.read_text())
+    assert payload["scenes"], "an empty corpus would pass this loop without asserting anything"
+    for scene in payload["scenes"]:
+        raw = scene["candidate"]
+        one, = Item.create(raw["id"], _fixture_dimensions(raw["dimensions"]),
+                           stop_index=raw["stop_index"]).instances()
+        evaluated = context(
+            one,
+            *(raw["origin"][axis] for axis in ("x", "y", "z")),
+            placements=tuple(_fixture_placement(each) for each in scene["placements"]),
+            container=Container.create("fixture", _fixture_dimensions(scene["container"])),
+        )
+        result = constraints.StopAccessibilityConstraint(tuple(scene["directions"])).evaluate(evaluated)
+
+        assert result.allowed == scene["accessible"], scene["id"]
+        if "code" in scene:
+            assert result.code == scene["code"], scene["id"]
+        if "route_order_allowed" in scene:
+            assert (RouteOrderConstraint().evaluate(evaluated).allowed
+                    == scene["route_order_allowed"]), scene["id"]
+
+
+def test_a_request_with_no_route_is_untouched():
+    """`route_sensitive` is False whenever no item in play declares a stop, which is the
+    same opt-in gate `RouteOrderConstraint` uses."""
+    instance = instance_of("plain", length=60, width=100, height=100)
+    scene = context(instance, x=0, placements=(placed(instance_of(
+        "other", length=40, width=100, height=100), x=_mm(60)),), route_sensitive=False)
+    assert constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X).evaluate(scene).allowed
+
+
+def test_directions_are_canonicalised_so_two_callers_search_identically():
+    """Order and duplicates in the caller's list must not reach the search: which door is
+    tried first decides which of several legal answers comes back."""
+    assert (constraints.StopAccessibilityConstraint(("+z", "-x", "-x"))._directions
+            == constraints.StopAccessibilityConstraint(("-x", "+z"))._directions)
+
+
+def test_swept_volume_refuses_an_unknown_direction_at_the_primitive():
+    """The constraint validates its doors at construction, but the primitive is public and
+    reachable on its own -- `packing_sequence` calls it -- so it owes the same refusal."""
+    from packvium.geometry import InvalidDirectionError, swept_volume
+
+    box = AxisAlignedBox(Point(0, 0, 0), Dimensions(Length(10), Length(10), Length(10)))
+    with pytest.raises(InvalidDirectionError):
+        swept_volume(box, Dimensions(Length(100), Length(100), Length(100)), "sideways")
+
+
+def test_the_corridor_base_is_reused_for_a_second_candidate_on_the_same_state():
+    """The cache is why a candidate costs `O(m * |D|)` rather than `O(m^2 * |D|)`: search
+    asks a run of candidates against one immutable state, so one entry covers the run.
+
+    It is keyed on the placements *and* the container. The container half is a guard rather
+    than something a legal scene can demonstrate -- a placement always lies inside its own
+    container, so widening a wall only lengthens a sweep into empty space. What it protects
+    against is one placement tuple being asked about two different containers, which a
+    multi-container solve can do; the key makes the second question rebuild instead of
+    inheriting the first answer.
+    """
+    constraint = constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X)
+    early, early_x = _wide("early", 60, 40, stop=0)
+    late, late_x = _wide("late", 0, 60, stop=1)
+    placements = (placed(early, x=early_x),)
+    scene = context(late, x=late_x, placements=placements)
+
+    first = constraint.evaluate(scene)
+    built = constraint._base_for(placements, BOX.inner_dimensions)
+    # Asking again on the same state must take the cached path and answer identically.
+    assert constraint._base_for(placements, BOX.inner_dimensions) == built
+    assert constraint.evaluate(scene).allowed == first.allowed
+
+    longer = Container.create("longer", Dimensions.mm(300, 100, 100))
+    constraint._base_for(placements, longer.inner_dimensions)
+    assert constraint._container == longer.inner_dimensions, (
+        "a different container must rebuild the base rather than inherit it")
+
+
+def test_permanent_cargo_that_blocks_nobody_is_allowed():
+    """The `rides the whole route` short-circuit after the placed-item loop. An item with no
+    stop needs no door of its own, so once it has taken nobody else's it is simply legal --
+    the counterpart to example D, where it took one."""
+    fixture = instance_of("fixture", length=40, width=100, height=100, stop_index=None)
+    early = instance_of("early", length=60, width=100, height=100, stop_index=0)
+    # The stop-0 item stands at the door; the permanent one sits behind it and blocks
+    # nothing, because a corridor to `-x` never crosses it.
+    scene = context(fixture, x=_mm(60), placements=(placed(early, x=0),))
+    assert constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X).evaluate(scene).allowed
+
+
+def test_an_unknown_direction_is_refused_rather_than_guessed():
+    with pytest.raises(constraints.InvalidDirectionError):
+        constraints.StopAccessibilityConstraint(("north",))
+
+
+# ------------------------------------- stop accessibility: degenerate and hostile input
+
+
+def test_a_corridor_runs_to_a_wall_so_the_container_is_part_of_the_question():
+    """The cached exit sets must not outlive the container they were computed for.
+
+    `+x` ends at the container's far wall, so the same two boxes have different exits in a
+    short container than in a long one: in the short one `a` is flush against the wall and
+    free, in the long one a later-stop box already stands in its corridor. A cache keyed on
+    the placements alone answered the second question with the first one's answer and
+    accepted a placement that walls `a` in.
+    """
+    long_box = Container.create("long", Dimensions.mm(400, 100, 100))
+    short_box = Container.create("short", Dimensions.mm(100, 100, 100))
+    near = instance_of("a", length=40, width=100, height=100, stop_index=0)
+    far = instance_of("b", length=50, width=100, height=100, stop_index=1)
+    placements = (placed(near, x=0), placed(far, x=_mm(150)))
+    candidate = instance_of("c", length=30, width=100, height=100, stop_index=1)
+    constraint = constraints.StopAccessibilityConstraint(("+x",))
+
+    def verdict(container):
+        return constraint.evaluate(ConstraintContext(
+            container, placements, candidate, Point(_mm(50), 0, 0), Rotation.LWH,
+            candidate.item.dimensions, candidate.item.dimensions)).allowed
+
+    assert verdict(long_box), "a had already lost its corridor before the candidate"
+    assert not verdict(short_box), "the candidate fills a's only corridor here"
+
+
+def test_the_largest_admissible_stops_stay_distinct():
+    """Exactness at the top of the range the wire contract admits.
+
+    An earlier version of this test used 2**53 and 2**53 + 1 to show the constraint kept
+    them apart where a float would merge them. Those values are now refused at
+    construction, because JavaScript cannot parse them without collapsing them and the
+    four engines would order such a load differently. The hazard is gone at its source, so
+    what is left to prove is that nothing widens a stop *inside* the admissible range --
+    the two largest neighbours it contains are still two.
+    """
+    from packvium.models import MAX_EXACT_STOP_INDEX
+
+    early = instance_of("early", length=40, width=100, height=100,
+                        stop_index=MAX_EXACT_STOP_INDEX - 1)
+    late = instance_of("late", length=60, width=100, height=100,
+                       stop_index=MAX_EXACT_STOP_INDEX)
+
+    result = constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X).evaluate(context(
+        late, x=0, placements=(placed(early, x=_mm(60)),)))
+
+    assert not result.allowed
+    assert str(MAX_EXACT_STOP_INDEX - 1) in result.detail
+
+
+def test_two_permanent_items_do_not_block_each_other():
+    """Neither is ever unloaded, so neither needs a corridor and neither is the other's
+    problem. `inf > inf` being false is what gives that for free -- an ordering sentinel
+    that compared greater-or-equal to itself would refuse every pair of fixtures."""
+    assert _scene(_wide("fixture-a", 60, 40, stop=None),
+                  _wide("fixture-b", 0, 60, stop=None)).allowed
+
+
+def test_a_permanent_item_needs_no_exit_of_its_own():
+    """Nothing is due later than "never", so its blocker set is empty by construction.
+
+    The fixture sits at the far end with a stop-1 item between it and the door, which for
+    any ordinary item would be a refusal. It is not one here: the fixture is not coming
+    out at stop 1, or at any stop.
+    """
+    assert _scene(_wide("fixture", 60, 40, stop=None), _wide("late", 0, 60, stop=1)).allowed
+
+
+def test_permanent_cargo_still_walls_in_an_item_that_does_have_to_come_out():
+    """The converse, and the asymmetry is the point.
+
+    An item due at stop 5 behind permanent cargo is refused, because "never" outranks
+    every stop. Pairing this with the test above pins the sentinel's direction: it is the
+    latest possible stop, not a value excused from the ordering.
+    """
+    result = _scene(_wide("fixture", 0, 60, stop=None), _wide("late", 60, 40, stop=5))
+    assert not result.allowed
+    assert "no exit" in result.detail
+
+
+def test_the_first_box_into_an_empty_container_is_never_refused():
+    """There is nothing to be blocked by and nothing to block, whatever its stop."""
+    instance = instance_of("only", length=60, width=100, height=100, stop_index=3)
+    assert constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X).evaluate(
+        context(instance, x=0)).allowed
+
+
+def test_a_box_flush_against_a_corridor_wall_does_not_stand_in_it():
+    """Half-open on every axis, matching `AxisAlignedBox.intersects`.
+
+    Two boxes side by side across the width: the `-x` corridor of one spans only its own
+    `y` band, so its neighbour merely touching that band's edge is not in the way. Treating
+    a shared face as an obstruction would refuse most ordinary side-by-side loads.
+    """
+    left = instance_of("left", length=40, width=50, height=100, stop_index=0)
+    right = instance_of("right", length=40, width=50, height=100, stop_index=1)
+    scene = ConstraintContext(
+        BOX, (placed(left, x=_mm(60), y=0),), right, Point(_mm(60), _mm(50), 0),
+        Rotation.LWH, right.item.dimensions, right.item.dimensions)
+    assert constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X).evaluate(scene).allowed
+
+
+def test_a_box_filling_the_container_has_an_empty_corridor_in_every_direction():
+    """Its faces are the walls, so no sweep has room for anything -- including the sweep
+    of the item that fills it. A rule that measured the corridor from the container's
+    centre, or that treated an empty region as blocked, would refuse a single-item load."""
+    whole = instance_of("whole", length=100, width=100, height=100, stop_index=0)
+    for directions in (("-x",), ("+x",), ALL_DIRECTIONS_TUPLE):
+        assert constraints.StopAccessibilityConstraint(directions).evaluate(
+            context(whole, x=0)).allowed
+
+
+def test_stop_zero_is_a_stop_and_not_an_absent_value():
+    """`0` is falsy, and a presence test written as `if stop:` would quietly turn the
+    first stop on the route into permanent cargo -- which reverses the rule for it."""
+    result = _scene(_wide("early", 60, 40, stop=0), _wide("late", 0, 60, stop=1))
+    assert not result.allowed
+    assert "stop 0" in result.detail
+
+
+def test_all_six_doors_accept_what_one_door_refuses():
+    """The vacuity the design warns about, pinned so the default cannot drift into it.
+
+    With every wall open a box is almost always free through some face, which is precisely
+    why `access_directions` defaults to empty rather than to all six.
+    """
+    assert _scene(_wide("early", 60, 40, stop=0), _wide("late", 0, 60, stop=1),
+                  directions=ALL_DIRECTIONS_TUPLE).allowed
+
+
+# ------------------------------- the support-polygon redundancy boundary
+
+
+@pytest.mark.parametrize("seed", range(80))
+def test_a_single_supporter_covering_over_half_the_base_always_contains_the_centroid(seed):
+    """Why `SupportConstraint`'s polygon test cannot fire above a 0.5 area ratio.
+
+    On one rectangular supporter the contact region is a rectangle inside the base. If it
+    covers more than half of each axis it must straddle the midpoint of that axis, so the
+    centroid is inside it and the polygon test is decided before it is asked. Measured
+    behaviour matches: at ratio 0.6 the conjunction refuses exactly what the area rule
+    refuses, and at 0.3 and 0.45 it refuses more (benchmarks/results/support-predicates.json).
+
+    This is the boundary, not a bug -- but it means the hull is built per candidate for a
+    verdict that a cheaper comparison already fixed, which is the finding  records.
+    """
+    rng = random.Random(6000 + seed)
+    length, width = rng.randint(20, 60), rng.randint(20, 60)
+    lower = instance_of("lower", length=100, width=100, height=10)
+    upper = instance_of("upper", length=length, width=width, height=10)
+
+    # A contact rectangle covering strictly more than half of the candidate on both axes.
+    overlap_l = rng.randint(length // 2 + 1, length)
+    overlap_w = rng.randint(width // 2 + 1, width)
+    offset_x = rng.randint(0, length - overlap_l)
+    offset_y = rng.randint(0, width - overlap_w)
+
+    candidate = AxisAlignedBox(Point(_mm(offset_x), _mm(offset_y), _mm(10)),
+                               Dimensions.mm(length, width, 10))
+    supporter = AxisAlignedBox(Point(_mm(offset_x), _mm(offset_y), 0),
+                               Dimensions.mm(overlap_l, overlap_w, 10))
+    del lower, upper  # built only to mirror the shapes the constraint sees
+
+    hull = constraints.convex_hull(constraints.contact_hull_points(candidate, [supporter]))
+    assert constraints.point_in_hull(constraints.doubled_centroid(candidate), hull), (
+        f"seed {seed}: {overlap_l}x{overlap_w} of {length}x{width} left the centroid outside"
+    )
+
+
+# -------------------------------------------- the representable stop range
+
+
+def test_a_stop_index_past_double_precision_is_refused_rather_than_mis_ordered():
+    """The bound exists because one engine cannot hold the number, not because of a limit.
+
+    Route order is decided by comparing stop indices. JavaScript keeps numbers as doubles,
+    and `JSON.parse` collapses 2**53 + 1 to 2**53 before any constraint sees it -- so two
+    consecutive stops above the safe range become one number there while Python, PHP and
+    Rust keep them apart, and the four engines order the same load differently. The
+    JavaScript engine already refused unsafe integers; this is the other three agreeing.
+
+    Refusing is the only honest option: the value cannot cross the wire identically, and
+    accepting it would mean returning a load plan that another engine would contradict.
+    """
+    from packvium.models import MAX_EXACT_STOP_INDEX
+
+    assert MAX_EXACT_STOP_INDEX == 2 ** 53 - 1
+    Item.create("ok", Dimensions.mm(10, 10, 10), stop_index=MAX_EXACT_STOP_INDEX)
+
+    for refused in (MAX_EXACT_STOP_INDEX + 1, 2 ** 53 + 1, -1):
+        with pytest.raises(ValueError, match="non-negative safe integer"):
+            Item.create("bad", Dimensions.mm(10, 10, 10), stop_index=refused)
+
+
+def test_the_two_stops_that_collapse_into_one_are_exactly_the_pair_the_bound_excludes():
+    """Names the failure the bound prevents, so the reason cannot be edited away.
+
+    `float(2**53) == float(2**53 + 1)`, and the route rule compares stops. With both
+    admitted, an item due at 2**53 + 1 resting on one due at 2**53 would be read as the
+    same stop and allowed -- a later item burying an earlier one, which is the exact
+    violation `RouteOrderConstraint` exists to catch.
+    """
+    assert float(2 ** 53) == float(2 ** 53 + 1)
+    assert 2 ** 53 != 2 ** 53 + 1
+    with pytest.raises(ValueError, match="non-negative safe integer"):
+        Item.create("collapses", Dimensions.mm(10, 10, 10), stop_index=2 ** 53)

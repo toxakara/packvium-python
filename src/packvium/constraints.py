@@ -5,10 +5,12 @@ from typing import Protocol, Sequence
 
 from .axle_load import axle_load_exceeded
 from .contact import ContactEdge, ContactGraph
-from .geometry import AxisAlignedBox, Dimensions, Point, Rotation
+from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
+                       Point, Rotation, sweep_intersects, swept_volume)
 from .models import Container, ItemInstance, Placement
 from .support_polygon import contact_hull_points, convex_hull, doubled_centroid, point_in_hull
-from .units import Length
+from .compression import applied_pressure
+from .units import Length, Weight
 
 # Support ratios arrive as floats from the public API but must never decide feasibility
 # in floating point. They are converted once to a scaled integer and every comparison
@@ -111,6 +113,11 @@ class LoadUnit:
     label: str
     nesting_item_id: str | None = None
     nesting_height_ticks: int | None = None
+    # Set only for a `compressible` item. Load propagation already computes the
+    # cumulative mass above every unit, which is exactly the numerator the pressure model
+    # needs, so the crush check rides the graph that is built anyway rather than a second one.
+    compression_ratio_ppm: int | None = None
+    max_compression_pressure_kpa: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,10 +229,10 @@ class LoadSupportGraph:
     order, preserving ContactGraph's integer-remainder and traversal contract.
     """
 
-    __slots__ = ("_supporters", "_children")
+    __slots__ = ("_supporters", "_children", "_face", "_units", "_nested")
 
-    def __init__(self, units: Sequence[LoadUnit]):
-        face = ContactGraph([unit.box for unit in units])
+    def __init__(self, units: Sequence[LoadUnit], cell_hint: int = 1):
+        face = ContactGraph([unit.box for unit in units], cell_hint=cell_hint)
         nesting = sorted(
             (
                 unit.nesting_item_id,
@@ -241,6 +248,9 @@ class LoadSupportGraph:
             for index, unit in enumerate(units)
             if unit.nesting_item_id is not None and unit.nesting_height_ticks is not None
         )
+        self._face = face
+        self._units = tuple(units)
+        self._nested = bool(nesting)
         if not nesting:
             self._supporters = tuple(face.supporters(index) for index in range(len(units)))
             self._children = tuple(face.children(index) for index in range(len(units)))
@@ -279,6 +289,35 @@ class LoadSupportGraph:
         self._supporters = tuple(tuple(edges) for edges in supporters)
         self._children = tuple(tuple(indices) for indices in children)
 
+    def with_unit(self, unit: LoadUnit, cell_hint: int = 1) -> "LoadSupportGraph":
+        """This graph plus one more unit, appended at the next index.
+
+        The search evaluates many candidates against one unchanged set of placements, and
+        rebuilding the whole support graph for each of them was the cost  exists to
+        remove. Adding a box cannot change contact between two boxes already placed, so
+        the face graph only needs its two planes queried -- see `ContactGraph.with_box`.
+
+        Nesting is the exception and falls back to a full rebuild. A nesting predecessor
+        *replaces* the face edges of everything in its column, so one new unit can rewrite
+        edges arbitrarily far from itself and the delta is no longer local. Nesting is an
+        opt-in field on a minority of requests; correctness there is worth more than the
+        speed, and the fallback keeps this method total.
+        """
+        if self._nested or unit.nesting_item_id is not None:
+            return LoadSupportGraph(self._units + (unit,), cell_hint=cell_hint)
+        index = len(self._units)
+        face = self._face.with_box(unit.box)
+        # Without nesting this graph *is* the face graph, so read the edges straight off
+        # it rather than patching a copy of the old ones. Re-deriving them by hand would
+        # be a second implementation of the same rule, free to drift from the first.
+        graph = LoadSupportGraph.__new__(LoadSupportGraph)
+        graph._supporters = tuple(face.supporters(i) for i in range(index + 1))
+        graph._children = tuple(face.children(i) for i in range(index + 1))
+        graph._face = face
+        graph._units = self._units + (unit,)
+        graph._nested = False
+        return graph
+
     def supporters(self, index: int) -> tuple[ContactEdge, ...]:
         return self._supporters[index]
 
@@ -307,7 +346,9 @@ def load_units(placements: Sequence[Placement], extra: LoadUnit | None = None) -
                  p.instance.item.max_stacked_items,
                  p.instance.id,
                  None if p.instance.item.nesting_height is None else p.instance.item.id,
-                 None if p.instance.item.nesting_height is None else p.instance.item.nesting_height.ticks)
+                 None if p.instance.item.nesting_height is None else p.instance.item.nesting_height.ticks,
+                 p.instance.item.compression_ratio_ppm,
+                 p.instance.item.max_compression_pressure_kpa)
         for p in placements
     ]
     if extra is not None: units.append(extra)
@@ -343,6 +384,30 @@ def overloaded(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = None)
     for unit, load in zip(units, top_loads(units, graph)):
         if unit.max_top_load_ticks is not None and load > unit.max_top_load_ticks:
             return ("top_load_exceeded", unit.label)
+    return None
+
+
+def crushed(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = None) -> tuple[str, str] | None:
+    """First compressible unit carrying more pressure than it declared it can take.
+
+    Deliberately shaped like `overloaded`, and reading the same `top_loads` result, because
+    they answer the same question in two currencies: `max_top_load` is a mass the box below
+    must bear, and `max_compression_pressure_kpa` is a pressure the item itself must survive.
+    An item can pass one and fail the other, so both are asked.
+
+    A crush is a hard boundary, not a worse score. The caller gets a refusal rather than a
+    plan in which something arrived flattened.
+    """
+    if all(unit.max_compression_pressure_kpa is None for unit in units):
+        return None
+    for unit, load in zip(units, top_loads(units, graph)):
+        limit = unit.max_compression_pressure_kpa
+        if limit is None:
+            continue
+        box = unit.box
+        footprint = (box.x2 - box.origin.x) * (box.y2 - box.origin.y)
+        if applied_pressure(Weight(load), footprint).exceeds_kpa(limit):
+            return ("crush_violation", unit.label)
     return None
 
 
@@ -546,6 +611,17 @@ class SupportConstraint:
         # above cannot see. Checked only once a minimum ratio is already being
         # enforced, so a caller who never asked for support checking sees no new
         # rejection code and no behaviour change.
+        #
+        # Above half the base the answer is already decided, so the hull is not built
+        #. A footprint is centrally symmetric, so every line through its centre
+        # bisects its area; a centroid outside the contact hull would put the whole
+        # contact region in one open half-plane through that centre, and therefore under
+        # half the base. Contact above half the base thus cannot leave the centroid
+        # outside -- whatever the number of supporters. Measured before it was proved: the
+        # shipped conjunction refused exactly what the ratio refused across the pinned
+        # corpus at ratio 0.6, and refused strictly more at 0.3 and 0.45.
+        if supporting_area * 2 > base_area:
+            return ConstraintResult.allow()
         hull = convex_hull(contact_hull_points(candidate, supporters))
         if not point_in_hull(doubled_centroid(candidate), hull):
             return ConstraintResult.reject("centre_of_gravity_unsupported", f"{supporting_area}/{base_area} met but centroid outside the {len(hull)}-point support hull")
@@ -557,21 +633,59 @@ class TopLoadConstraint:
 
     Bearing limits are checked against the cumulative load of the whole stack, not
     only the box directly underneath, so a tower of light items cannot crush its base.
+
+    The support graph over the *placed* boxes is the same for every candidate evaluated
+    against one search state, and rebuilding it per candidate was the cost 
+    removes. One base per placement tuple is kept here and each candidate is appended to
+    it. The cache is deliberately a single entry compared by identity: search evaluates a
+    run of candidates against one state before moving on, so a one-entry cache captures
+    the whole run, and holding the tuple keeps `is` sound because the object cannot be
+    collected and its identity reused while the cache refers to it.
     """
+
+    __slots__ = ("_placements", "_base", "_base_units", "_hint")
+
+    def __init__(self) -> None:
+        self._placements: tuple[Placement, ...] | None = None
+        self._base: LoadSupportGraph | None = None
+        self._base_units: tuple[LoadUnit, ...] = ()
+        self._hint = 1
+
+    def _base_for(self, placements: tuple[Placement, ...], footprint: int):
+        """The support graph over `placements` alone, rebuilt only when it cannot serve.
+
+        The cell hint has to cover every candidate that will be appended to this base,
+        and the widest of them is not known in advance -- a candidate is a *new* item and
+        may be the widest in the request. So the hint grows to fit the first candidate
+        that needs it and the base is rebuilt that once; after that the run is served from
+        cache. Sizing it from the container instead would always be safe and always
+        coarse, and a cell far larger than the boxes collapses the spatial hash back into
+        the all-pairs scan it exists to avoid.
+        """
+        if self._placements is placements and footprint <= self._hint:
+            return self._base, self._base_units
+        hint = max(self._hint if self._placements is placements else 1, footprint)
+        units = load_units(placements)
+        self._placements = placements
+        self._hint = hint
+        self._base_units = units
+        self._base = LoadSupportGraph(units, cell_hint=hint)
+        return self._base, units
 
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if not context.stack_sensitive: return ConstraintResult.allow()
         candidate = context.envelope_box
         item = context.item.item
-        units = load_units(
-            context.placements,
-            LoadUnit(candidate, context.item.weight.ticks,
-                     None if item.max_top_load is None else item.max_top_load.ticks,
-                     item.max_stacked_items, context.item.id,
-                     None if item.nesting_height is None else item.id,
-                     None if item.nesting_height is None else item.nesting_height.ticks),
-        )
-        graph = LoadSupportGraph(units)
+        unit = LoadUnit(candidate, context.item.weight.ticks,
+                        None if item.max_top_load is None else item.max_top_load.ticks,
+                        item.max_stacked_items, context.item.id,
+                        None if item.nesting_height is None else item.id,
+                        None if item.nesting_height is None else item.nesting_height.ticks,
+                        item.compression_ratio_ppm, item.max_compression_pressure_kpa)
+        footprint = max(candidate.x2 - candidate.origin.x, candidate.y2 - candidate.origin.y)
+        base, base_units = self._base_for(context.placements, footprint)
+        units = base_units + (unit,)
+        graph = base.with_unit(unit, cell_hint=self._hint)
         failure = non_stackable_failure(
             context.placements, context.item, graph, len(units) - 1
         )
@@ -580,6 +694,7 @@ class TopLoadConstraint:
         density_limit = None if context.container.max_stack_density is None else context.container.max_stack_density.ticks
         failure = (
             overloaded(units, graph)
+            or crushed(units, graph)
             or stack_limit_exceeded(units, graph)
             or stack_density_exceeded(units, density_limit, graph)
         )
@@ -615,6 +730,139 @@ class RouteOrderConstraint:
         failure = route_order_violated(units, stops)
         if failure is not None:
             return ConstraintResult.reject(*failure)
+        return ConstraintResult.allow()
+
+
+def _stop_of(placement: Placement) -> int | float:
+    """A placement's stop as an ordering value, with the absent case as `inf`.
+
+    An item with no `stop_index` rides the whole route, so it is never removed and blocks
+    every stop -- which is exactly what `inf` gives when the blocker test is `s(q) > s(p)`.
+    Making it a sentinel value rather than a separate branch is what lets one comparison
+    cover both a late-stop blocker and permanent cargo.
+
+    A present stop stays an `int` and is never widened to `float`. The schema puts no
+    ceiling on `stop_index`, and past 2**53 a float cannot tell two consecutive stops
+    apart -- which would silently merge them into one and hand the same-stop exclusion an
+    item it must not excuse. Mixed int/inf comparison is exact in Python, so the sentinel
+    costs nothing here.
+    """
+    stop = placement.instance.item.stop_index
+    return RIDES_THE_WHOLE_ROUTE if stop is None else stop
+
+
+class StopAccessibilityConstraint:
+    """Rejects a placement that walls an earlier-stop item away from every door.
+
+    `RouteOrderConstraint` above enforces the vertical half of route order -- nothing due
+    later may rest *above* something due earlier. This is the horizontal half: nothing due
+    later may stand *between* an earlier item and the way out. Both are necessary and
+    neither implies the other; docs/STOP-ACCESSIBILITY.md derives the rule and the
+    post-validator's whole-scene replay remains the sufficient check.
+
+    Opt-in twice over, and both are load-bearing. It is inert unless the caller supplies
+    exit directions, because the request schema has no field for them: assuming all six
+    walls open would enforce a rule that is true of no real vehicle and nearly vacuous
+    besides, since a box is almost always free through *some* face. And it is inert unless
+    two distinct stops are in play, which is what keeps a caller who never populates
+    `stop_index` paying nothing.
+
+    The blocker set is `{q : s(q) > s(p)}` -- strictly later. Items due at the *same* stop
+    are excluded because the order within a stop is free: whichever is in the way comes off
+    first. Using `>=` would refuse two same-stop pallets standing one behind the other,
+    which is an ordinary load.
+    """
+
+    __slots__ = ("_directions", "_placements", "_container", "_clear", "_stops")
+
+    def __init__(self, directions: Sequence[str] = ()) -> None:
+        for direction in directions:
+            if direction not in ALL_DIRECTIONS:
+                raise InvalidDirectionError(direction)
+        # Deduplicated in the canonical order rather than as given: two callers passing the
+        # same doors in different orders must search identically.
+        self._directions = tuple(d for d in ALL_DIRECTIONS if d in set(directions))
+        self._placements: tuple[Placement, ...] | None = None
+        self._container: Dimensions | None = None
+        self._clear: tuple[frozenset[str], ...] = ()
+        self._stops: tuple[float, ...] = ()
+
+    def _base_for(self, placements: tuple[Placement, ...], container: Dimensions):
+        """Per placed box, the doors still open to it against the already-placed boxes.
+
+        Cached by tuple identity for the same reason `TopLoadConstraint` does it: the
+        search evaluates a run of candidates against one state, so a single entry covers
+        the whole run, and holding the tuple keeps `is` sound.
+        """
+        # Keyed on the container as well as the placements, because a corridor runs to a
+        # *wall*: the same boxes have different exits in a longer container, and reusing
+        # the answer across two would silently accept a placement that walls an item in.
+        if self._placements is placements and self._container == container:
+            return self._clear, self._stops
+        stops = tuple(_stop_of(p) for p in placements)
+        boxes = [p.envelope_box for p in placements]
+        clear = []
+        for index, box in enumerate(boxes):
+            if stops[index] == RIDES_THE_WHOLE_ROUTE:
+                # Never unloaded, so it needs no door of its own -- it only ever blocks.
+                clear.append(frozenset(self._directions))
+                continue
+            open_doors = frozenset(
+                direction for direction in self._directions
+                if not any(other != index and stops[other] > stops[index]
+                           and sweep_intersects(swept_volume(box, container, direction), boxes[other])
+                           for other in range(len(boxes)))
+            )
+            clear.append(open_doors)
+        self._placements = placements
+        self._container = container
+        self._clear = tuple(clear)
+        self._stops = stops
+        return self._clear, self._stops
+
+    def evaluate(self, context: ConstraintContext) -> ConstraintResult:
+        if not self._directions: return ConstraintResult.allow()
+        if not context.route_sensitive: return ConstraintResult.allow()
+
+        candidate_stop = context.item.item.stop_index
+        if candidate_stop is None: candidate_stop = RIDES_THE_WHOLE_ROUTE
+        inner = context.container.inner_dimensions
+        clear, stops = self._base_for(context.placements, inner)
+
+        # One distinct stop means nothing can be due before anything else, so no corridor
+        # can be blocked by a later item. Checked over the candidate too, or the first
+        # placement into an empty container would skip a check it should make.
+        if len({*stops, candidate_stop}) < 2:
+            return ConstraintResult.allow()
+
+        candidate = context.envelope_box
+        for index, placement in enumerate(context.placements):
+            if not (candidate_stop > stops[index]): continue
+            if not clear[index]: continue
+            still_open = any(
+                not sweep_intersects(
+                    swept_volume(placement.envelope_box, inner, direction), candidate)
+                for direction in clear[index]
+            )
+            if not still_open:
+                return ConstraintResult.reject(
+                    "stop_accessibility_violation",
+                    f"{placement.instance.id} due at stop {stops[index]} "
+                    f"loses its last exit to {context.item.id}")
+
+        if candidate_stop == RIDES_THE_WHOLE_ROUTE:
+            return ConstraintResult.allow()
+
+        boxes = [p.envelope_box for p in context.placements]
+        if not any(
+            not any(stops[other] > candidate_stop
+                    and sweep_intersects(swept_volume(candidate, inner, direction), boxes[other])
+                    for other in range(len(boxes)))
+            for direction in self._directions
+        ):
+            return ConstraintResult.reject(
+                "stop_accessibility_violation",
+                f"{context.item.id} due at stop {candidate_stop} would have no exit")
         return ConstraintResult.allow()
 
 

@@ -40,25 +40,10 @@ from typing import Sequence
 from .constraints import (_touches_corners, direct_support_view, load_units, overloaded,
                           stack_density_exceeded, stack_limit_exceeded, stacked_counts)
 from .contact import ContactGraph
-from .geometry import AxisAlignedBox, Dimensions
+from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions,
+                       InvalidDirectionError, sweep_intersects, swept_volume)
 from .models import Container, Placement
 
-ALL_DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
-
-
-class InvalidDirectionError(ValueError):
-    """A direction outside the six-value vocabulary was supplied. Rejected rather than
-    silently treated as one of the six -- `-z` in particular, since that was this
-    module's own previous (wrong) default for anything unrecognised."""
-
-    code = "invalid_direction"
-
-    def __init__(self, direction: str):
-        self.direction = direction
-        super().__init__(f"unknown movement direction {direction!r}; expected one of {ALL_DIRECTIONS}")
-
-    def to_dict(self) -> dict:
-        return {"code": self.code, "direction": self.direction}
 
 
 def _validated(directions: Sequence[str]) -> Sequence[str]:
@@ -98,45 +83,20 @@ class RouteSequenceError(Exception):
         super().__init__(f"stop {stop}: placements {sorted(stuck)} cannot be unloaded there")
 
 
-def _swept_volume(box: AxisAlignedBox, container: Dimensions, direction: str) -> tuple[int, int, int, int, int, int]:
-    """The region between `box`'s own face and the matching container wall along
-    `direction` -- identical whether a box leaves through that wall (unloading) or
-    arrives through it (loading)."""
-    x1, y1, z1, x2, y2, z2 = box.origin.x, box.origin.y, box.origin.z, box.x2, box.y2, box.z2
-    if direction == "+x":
-        x1 = x2
-        x2 = container.length.ticks
-    elif direction == "-x":
-        x2 = x1
-        x1 = 0
-    elif direction == "+y":
-        y1 = y2
-        y2 = container.width.ticks
-    elif direction == "-y":
-        y2 = y1
-        y1 = 0
-    elif direction == "+z":
-        z1 = z2
-        z2 = container.height.ticks
-    elif direction == "-z":
-        z2 = z1
-        z1 = 0
-    else:
-        raise InvalidDirectionError(direction)
-    return x1, y1, z1, x2, y2, z2
+#: Kept as a module-private alias: this module's own callers and tests reach for the
+#: private name, while the definition now lives in `geometry` so the constraint layer can
+#: share it without the sequence layer having to be imported downwards.
+_swept_volume = swept_volume
 
 
 def _blocking_indices(index: int, box: AxisAlignedBox, boxes: Sequence[AxisAlignedBox],
                        present: frozenset[int], container: Dimensions, direction: str) -> frozenset[int]:
     """Every other currently-present box whose envelope intersects `box`'s `direction`
     sweep -- the evidence `_blocked` reduces to a bare boolean."""
-    sx1, sy1, sz1, sx2, sy2, sz2 = _swept_volume(box, container, direction)
+    sweep = swept_volume(box, container, direction)
     return frozenset(
         other_index for other_index in present
-        if other_index != index
-        and sx1 < boxes[other_index].x2 and boxes[other_index].origin.x < sx2
-        and sy1 < boxes[other_index].y2 and boxes[other_index].origin.y < sy2
-        and sz1 < boxes[other_index].z2 and boxes[other_index].origin.z < sz2
+        if other_index != index and sweep_intersects(sweep, boxes[other_index])
     )
 
 
@@ -148,12 +108,9 @@ def _blocked(index: int, box: AxisAlignedBox, boxes: Sequence[AxisAlignedBox],
     boolean callers (the safe-order search and reachability sweeps) ask it O(n*d)
     times per step and never read the set, which only the evidence paths need.
     """
-    sx1, sy1, sz1, sx2, sy2, sz2 = _swept_volume(box, container, direction)
+    sweep = swept_volume(box, container, direction)
     return any(
-        other_index != index
-        and sx1 < boxes[other_index].x2 and boxes[other_index].origin.x < sx2
-        and sy1 < boxes[other_index].y2 and boxes[other_index].origin.y < sy2
-        and sz1 < boxes[other_index].z2 and boxes[other_index].origin.z < sz2
+        other_index != index and sweep_intersects(sweep, boxes[other_index])
         for other_index in present
     )
 

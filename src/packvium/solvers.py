@@ -16,13 +16,18 @@ from .effort import EffortBudget
 from .extensions import UNPRICEABLE_MINOR, _grams
 from .constraints import (AxleLoadConstraint, CompatibilityConstraint, ConstraintContext,
                           ContainerEligibilityConstraint, FloorConstraint, LoadUnit, PlacementConstraint,
-                          RIDES_THE_WHOLE_ROUTE, RouteOrderConstraint, SupportConstraint,
+                          RIDES_THE_WHOLE_ROUTE, RouteOrderConstraint,
+                          StopAccessibilityConstraint, SupportConstraint,
                           TagCountConstraint, TopLoadConstraint, direct_support_view, load_units,
                           top_loads, usable_volume)
-from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, dimensional_weight
+from . import bounds, hull
+from .geometry import (AxisAlignedBox, Dimensions, Point, Rotation, ShapeType,
+                       dimensional_weight)
 from .lattice_summary import LatticeSummary
-from .models import Container, ItemInstance, PackedContainer, Placement, UnpackedItem
-from .nesting import is_valid_nesting, used_volume as nesting_used_volume, used_volume_delta
+from .models import (Container, ItemInstance, PackedContainer, Placement, UnpackedItem,
+                     hull_collision_is_exact, is_stack_sensitive)
+from .nesting import (is_valid_nesting, occupied_volume,
+                      used_volume as nesting_used_volume, used_volume_delta)
 from .result import SolverMetrics, StartRecord
 from .spatial_index import SpatialIndex
 from . import trace
@@ -45,6 +50,20 @@ class SearchStats:
     support_checks: int = 0
     space_partitions: int = 0
     search_nodes_expanded: int = 0
+    # Times the exact hull test overruled an axis-aligned collision. Deliberately
+    # absent from `to_metrics`: `algorithm.metrics` is serialised into every result, so a new
+    # key there changes the bytes of every existing golden and has to land in all four engines
+    # at once. This one stays internal, where tests can prove the refinement actually fired
+    # rather than infer it from a placement that might have succeeded anyway.
+    hull_refinements: int = 0
+    # The request-level lower bound on the objective vector, computed once at the root of an
+    # `exact_small` or global-beam solve. Internal for the same reason as
+    # `hull_refinements` above, and for one more: reporting a gap to a caller is a new public
+    # result field, and this project reserves and rejects such a field before a contract
+    # freeze rather than adding it mid-line ('s precedent, restated by ).
+    # `None` when no bound was computed -- a non-default objective keys its score vector
+    # differently, so a bound compared against it would compare different quantities.
+    objective_lower_bound: "tuple[int, ...] | None" = None
 
     def to_metrics(self) -> SolverMetrics:
         return SolverMetrics(
@@ -154,6 +173,21 @@ def _extent(box: AxisAlignedBox) -> tuple[int, int, int, int, int, int]:
     return (box.origin.x, box.origin.y, box.origin.z, box.x2, box.y2, box.z2)
 
 
+def _solids_collide(left: "hull.HullShape | None", left_origin: tuple[int, int, int],
+                    left_extent: tuple[int, int, int],
+                    right: "hull.HullShape | None", right_origin: tuple[int, int, int],
+                    right_extent: tuple[int, int, int]) -> bool:
+    """Exact overlap between two solids of which at least one is a hull.
+
+    Reached only after the axis-aligned test has already said their envelopes overlap, so the
+    cost is paid on the small set of pairs where a box answer would have been wrong.
+    """
+    return hull.collide(
+        left if left is not None else hull.HullShape.box(*left_extent), left_origin,
+        right if right is not None else hull.HullShape.box(*right_extent), right_origin,
+    )
+
+
 class ContainerState:
     """Placed boxes plus the candidate points they expose.
 
@@ -165,7 +199,7 @@ class ContainerState:
     """
 
     __slots__ = ("container", "sequence", "placements", "points", "ordered_points", "payload_ticks", "used_volume_ticks",
-                 "stack_sensitive", "route_sensitive", "max_z", "occupied", "bounds", "index",
+                 "stack_sensitive", "route_sensitive", "compression_sensitive", "max_z", "occupied", "bounds", "index", "hull_shapes",
                  "lattice_summary", "lattice_items")
 
     def __init__(self, container: Container, sequence: int):
@@ -176,6 +210,7 @@ class ContainerState:
         self.used_volume_ticks = 0
         self.stack_sensitive = False
         self.route_sensitive = False
+        self.compression_sensitive = False
         self.max_z = 0
         # Set instead of appending to `placements` when GridSolver's quantity-
         # compression fast path applies -- see `lattice_summary.py`.
@@ -185,6 +220,10 @@ class ContainerState:
         # Plain integer extents of everything solid. The candidate scan tests these
         # millions of times, and recomputing box properties there dominated the search.
         self.bounds: list[tuple[int, int, int, int, int, int]] = [_extent(b) for b in self.occupied]
+        # Parallel to `bounds`: the rotated hull of that solid, or `None` where the solid is
+        # an ordinary box. Obstacles are always boxes, so every entry starts `None` and the
+        # cuboid-only request never allocates anything beyond this list.
+        self.hull_shapes: list["hull.HullShape | None"] = [None] * len(self.occupied)
         dims = container.inner_dimensions
         self.index = SpatialIndex(dims.length.ticks, dims.width.ticks, dims.height.ticks)
         for position, bound in enumerate(self.bounds):
@@ -206,9 +245,11 @@ class ContainerState:
         other.used_volume_ticks = self.used_volume_ticks
         other.stack_sensitive = self.stack_sensitive
         other.route_sensitive = self.route_sensitive
+        other.compression_sensitive = self.compression_sensitive
         other.max_z = self.max_z
         other.occupied = list(self.occupied)
         other.bounds = list(self.bounds)
+        other.hull_shapes = list(self.hull_shapes)
         other.index = self.index.copy()
         other.lattice_summary = self.lattice_summary
         other.lattice_items = self.lattice_items
@@ -230,27 +271,42 @@ class ContainerState:
         self.payload_ticks += summary.total_weight_ticks
         self.used_volume_ticks += summary.used_volume_ticks
         self.stack_sensitive = self.stack_sensitive or any(
-            not item.item.stackable or item.item.max_top_load is not None
-            or item.item.max_stacked_items is not None for item in items
+            is_stack_sensitive(item.item) for item in items
         )
         self.route_sensitive = self.route_sensitive or any(item.item.stop_index is not None for item in items)
         if summary.max_z_ticks > self.max_z: self.max_z = summary.max_z_ticks
 
     def add(self, placement: Placement) -> None:
         box = placement.envelope_box
-        self.used_volume_ticks += used_volume_delta(self.placements, placement)
+        compression_sensitive = (
+            self.compression_sensitive
+            or placement.instance.item.shape_type is ShapeType.COMPRESSIBLE
+        )
+        if compression_sensitive:
+            self.used_volume_ticks = _used_volume_with_current_loads((*self.placements, placement))
+        else:
+            self.used_volume_ticks += used_volume_delta(self.placements, placement)
         self.placements.append(placement)
         self.payload_ticks += placement.instance.weight.ticks
         item = placement.instance.item
-        self.stack_sensitive = (self.stack_sensitive or not item.stackable or item.max_top_load is not None
-                                or item.max_stacked_items is not None)
+        self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
         self.route_sensitive = self.route_sensitive or item.stop_index is not None
+        self.compression_sensitive = compression_sensitive
         if box.z2 > self.max_z: self.max_z = box.z2
         self.occupied.append(box)
         bound = _extent(box)
         self.index.add(len(self.bounds), bound)
         self.bounds.append(bound)
-        retired = {key for key, point in self.points.items() if box.contains_point(point)}
+        shape = placement.hull_shape
+        self.hull_shapes.append(shape)
+        # Retiring a point because it falls inside a solid's box assumes the box *is* the
+        # solid. For a hull it is not: a placement origin is a corner of a bounding box, and
+        # a hull leaves most of that box -- including, for a wedge, the origin itself --
+        # available to the next item. Keeping those points alive is what lets the exact
+        # collision test below actually decide something; pruning them first would mean the
+        # engine could describe an interlocking pack it could never propose.
+        retired = ({key for key, point in self.points.items() if box.contains_point(point)}
+                   if shape is None else set())
         for key in retired:
             del self.points[key]
         if retired:
@@ -266,13 +322,20 @@ class ContainerState:
         an otherwise linear placement loop into quadratic work.
         """
         box = placement.envelope_box
-        self.used_volume_ticks += used_volume_delta(self.placements, placement)
+        compression_sensitive = (
+            self.compression_sensitive
+            or placement.instance.item.shape_type is ShapeType.COMPRESSIBLE
+        )
+        if compression_sensitive:
+            self.used_volume_ticks = _used_volume_with_current_loads((*self.placements, placement))
+        else:
+            self.used_volume_ticks += used_volume_delta(self.placements, placement)
         self.placements.append(placement)
         self.payload_ticks += placement.instance.weight.ticks
         item = placement.instance.item
-        self.stack_sensitive = (self.stack_sensitive or not item.stackable or item.max_top_load is not None
-                                or item.max_stacked_items is not None)
+        self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
         self.route_sensitive = self.route_sensitive or item.stop_index is not None
+        self.compression_sensitive = compression_sensitive
         if box.z2 > self.max_z:
             self.max_z = box.z2
 
@@ -345,7 +408,8 @@ class SingleContainerSolver(Protocol):
 def default_constraints(config: PackingConfig, custom: Sequence[PlacementConstraint] = ()) -> tuple[PlacementConstraint, ...]:
     return (FloorConstraint(), ContainerEligibilityConstraint(), CompatibilityConstraint(),
             TagCountConstraint(), SupportConstraint(config.minimum_support_ratio), TopLoadConstraint(),
-            RouteOrderConstraint(), AxleLoadConstraint(), *custom)
+            RouteOrderConstraint(), StopAccessibilityConstraint(config.access_directions),
+            AxleLoadConstraint(), *custom)
 
 
 def _candidate_score(state: ContainerState, point: Point, dims: Dimensions) -> tuple[int, ...]:
@@ -373,7 +437,7 @@ def _axle_balanced_points(state: ContainerState, item: ItemInstance, forms: Sequ
     tare_doubled_x = container.inner_dimensions.length.ticks
     floor_ys = sorted({point.y for point in state.points.values() if point.z == 0}) or [0]
     points: list[Point] = []
-    for _, _, _, dx, _, _ in forms:
+    for _, _, _, dx, _, _, _ in forms:
         for x1 in axle_balanced_origins(container.axles, other_units, tare_ticks, tare_doubled_x, item.weight.ticks, dx):
             if 0 <= x1 <= limit_x - dx:
                 points.extend(Point(x1, y, 0) for y in floor_ys)
@@ -404,7 +468,15 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     container = state.container
     if container.max_items is not None and len(state.placements) >= container.max_items: return []
     if container.max_payload is not None and state.payload_ticks + item.weight.ticks > container.max_payload.ticks: return []
-    if container.void_fill_reserve_ratio > 0 and item.item.nesting_height is None:
+    compression_sensitive = (
+        state.compression_sensitive or item.item.shape_type is ShapeType.COMPRESSIBLE
+    )
+    reserve_needs_candidate = (
+        item.item.nesting_height is not None
+        or item.item.shape_type is ShapeType.CONVEX_HULL
+        or compression_sensitive
+    )
+    if container.void_fill_reserve_ratio > 0 and not reserve_needs_candidate:
         if state.used_volume_ticks + item.dimensions.volume > usable_volume(container): return []
     inner = container.inner_dimensions
     limit_x, limit_y, limit_z = inner.length.ticks, inner.width.ticks, inner.height.ticks
@@ -412,18 +484,31 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     # Envelope and extents depend only on the rotation, so they are built once instead
     # of once per (point, rotation) pair.
     forms = []
-    for rotation, physical in item.dimensions.unique_rotations(item.item.allowed_rotations):
+    # A hull is not the same solid under two rotations that happen to give the same box, so
+    # `unique_rotations` -- which keys on the box -- would silently drop orientations that
+    # differ. Cuboids keep the deduplication they have always had.
+    is_hull = item.item.shape_type is ShapeType.CONVEX_HULL
+    exact_hull = hull_collision_is_exact(item.item, not clearance)
+    rotation_forms = (
+        tuple((rotation, item.dimensions.rotated(rotation)) for rotation in item.item.allowed_rotations)
+        if is_hull else item.dimensions.unique_rotations(item.item.allowed_rotations)
+    )
+    for rotation, physical in rotation_forms:
         envelope = physical.expand(config.clearance) if clearance else physical
-        forms.append((rotation, physical, envelope, envelope.length.ticks, envelope.width.ticks, envelope.height.ticks))
+        # A clearance margin around a hull is not a hull, so the refined test is dropped and
+        # the envelope stands -- over-reserving, which is the safe direction.
+        shape = (hull.shape_for(item.item.hull_vertices, rotation.value)
+                 if exact_hull else None)
+        forms.append((rotation, physical, envelope, envelope.length.ticks, envelope.width.ticks,
+                      envelope.height.ticks, shape))
     placed = tuple(state.placements)
     stack_sensitive = (state.stack_sensitive
-                       or not item.item.stackable
-                       or item.item.max_top_load is not None
-                       or item.item.max_stacked_items is not None
+                       or is_stack_sensitive(item.item)
                        or container.max_stack_density is not None)
     route_sensitive = (item.item.stop_index is not None
                        or state.route_sensitive)
     bounds = state.bounds
+    hull_shapes = state.hull_shapes
     index = state.index
     if points is None:
         if item.item.nesting_height is None:
@@ -442,7 +527,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
         deadline.check()
         stats.candidate_points_considered += 1
         x1, y1, z1 = point.x, point.y, point.z
-        for rotation, physical, envelope, dx, dy, dz in forms:
+        for rotation, physical, envelope, dx, dy, dz, shape in forms:
             stats.placements_attempted += 1
             x2, y2, z2 = x1 + dx, y1 + dy, z1 + dz
             if x2 > limit_x or y2 > limit_y or z2 > limit_z:
@@ -461,6 +546,15 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                 if x1 < bx2 and bx1 < x2 and y1 < by2 and by1 < y2 and z1 < bz2 and bz1 < z2:
                     placement_index = candidate_index - placement_offset
                     if tentative is not None and placement_index >= 0 and is_valid_nesting(placed[placement_index], tentative):
+                        continue
+                    blocker = hull_shapes[candidate_index]
+                    # The axis-aligned test is the broad phase and stays mandatory. Only when
+                    # a hull is one of the two solids does the exact test get to overrule it,
+                    # so a request of ordinary boxes never reaches this branch at all.
+                    if (shape is not None or blocker is not None) and not _solids_collide(
+                            shape, (x1, y1, z1), (dx, dy, dz),
+                            blocker, (bx1, by1, bz1), (bx2 - bx1, by2 - by1, bz2 - bz1)):
+                        stats.hull_refinements += 1
                         continue
                     blocked = True
                     break
@@ -483,9 +577,27 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
             position = (tentative.position if tentative is not None
                         else Point(x1 + clearance, y1 + clearance, z1 + clearance))
             candidate = Candidate(point, position, rotation, physical, envelope, _candidate_score(state, point, envelope))
-            if container.void_fill_reserve_ratio > 0 and item.item.nesting_height is not None:
-                assert tentative is not None
-                if state.used_volume_ticks + used_volume_delta(placed, tentative) > usable_volume(container):
+            if container.void_fill_reserve_ratio > 0 and reserve_needs_candidate:
+                reserve_placement = tentative or Placement(
+                    item, position, rotation, physical, point, envelope
+                )
+                if compression_sensitive:
+                    # Zero load gives the candidate its largest possible physical volume,
+                    # while appending it can only compress existing supports. Therefore this
+                    # is a safe upper bound: when it fits, the exact support-graph refresh
+                    # cannot turn the candidate into a reserve violation. Only candidates
+                    # close to the boundary pay the non-local calculation.
+                    upper_bound = state.used_volume_ticks + occupied_volume(reserve_placement)
+                    projected_volume = (
+                        upper_bound
+                        if upper_bound <= usable_volume(container)
+                        else _used_volume_with_current_loads((*placed, reserve_placement))
+                    )
+                else:
+                    projected_volume = state.used_volume_ticks + used_volume_delta(
+                        placed, reserve_placement
+                    )
+                if projected_volume > usable_volume(container):
                     continue
             stats.candidates_evaluated += 1
             if trace.active():
@@ -857,6 +969,14 @@ class GridSolver:
             # reaction after each added item. The general solver already applies the
             # exact gross axle constraint per candidate, so use it instead of ever
             # constructing a packing that only the post-validator can reject.
+            return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
+        if prototype.shape_type is not ShapeType.RIGID_CUBOID:
+            # The lattice is closed-form over boxes: it counts cells from envelope extents
+            # and caps a column from `max_top_load` arithmetic alone. Neither step can see a
+            # hull -- it would tile bounding boxes and call the result exact -- and neither
+            # can see pressure, so a compressible column would be sized without ever asking
+            # whether its bottom item survives. The general solver checks both per candidate
+            #.
             return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
         state = ContainerState(container, sequence)
         # Every non-floor lattice cell has one full-area direct supporter, including
@@ -1549,15 +1669,26 @@ def _with_top_loads(placements: Sequence[Placement]) -> tuple[Placement, ...]:
     )
 
 
+def _used_volume_with_current_loads(placements: Sequence[Placement]) -> int:
+    """Physical volume after this scene's support loads have been propagated.
+
+    Compression makes appending one placement non-local: a new upper item changes the
+    occupied height of existing supports. The rigid-item path keeps its O(1) delta; this
+    composite path rebuilds the support graph and nesting total in
+    O(n log n + q + e) time and O(n + e) graph space, where q is broad-phase work and e
+    is the contact-edge count; both become O(n^2) in a physically dense worst case. This
+    is the bound of one refresh, not one solve. The whole-solve sum over candidates and
+    search nodes is stated in docs/ALGORITHMS-AND-COMPLEXITY.md.
+    """
+    return nesting_used_volume(_with_top_loads(placements))
+
+
 class DefaultContainerSelector:
     """Prefers the container that holds the most items, then the cheapest, then the tightest."""
 
     def score(self, container: Container, solution: SingleContainerSolution) -> tuple:
         state = solution.state
-        if state.lattice_summary is not None:
-            used = state.lattice_summary.used_volume_ticks
-        else:
-            used = nesting_used_volume(state.placements)
+        used = state.used_volume_ticks
         return (-state.placement_count, container.cost_minor, container.inner_dimensions.volume - used, container.id)
 
 
@@ -2064,10 +2195,12 @@ class SolverOrchestrator:
         return False
 
     def _across_containers(self, solver, items, containers, config, stats, deadline):
-        if (
+        beam = (
             config.container_plan_beam_width > 1
             and isinstance(self.container_selector, DefaultContainerSelector)
-        ):
+        )
+        self._record_root_bound(solver, beam, items, containers, config, stats)
+        if beam:
             return self._across_containers_beam(
                 solver, items, containers, config, stats, deadline
             )
@@ -2138,6 +2271,40 @@ class SolverOrchestrator:
         remaining_signature = tuple(item.id for item in plan.remaining)
         packing_signature = tuple(container.id for container in plan.packed)
         return (*partial, remaining_signature, packing_signature)
+
+    @staticmethod
+    def _record_root_bound(solver, beam, items, containers, config, stats) -> None:
+        """Compute the request-level lower bound once, at the root.
+
+        The plan beam already computes the same relaxation *per node* to prune with -- the
+        request-level bound is that formula with the state empty, which is why this costs one
+        sort rather than a second search. `exact_small` gets it for the opposite reason: it
+        exhausts its candidate set and can say the incumbent is optimal over that set, and a
+        bound is what turns "I stopped looking" into a statement about the request.
+
+        Only for the default objective. `lowest_cost` and `maximum_value` order their score
+        keys differently, so a bound vector compared against them would line up cost against
+        container count -- not a weaker claim, a meaningless one.
+
+        Nothing downstream reads this yet, and that is deliberate: the number is visible to
+        the engines and to nothing else until a contract freeze decides whether a caller ever
+        sees a gap.
+        """
+        if stats.objective_lower_bound is not None:
+            return
+        if not (beam or getattr(solver, "name", None) == "exact_small"):
+            return
+        if config.objective != "default":
+            return
+        try:
+            stats.objective_lower_bound = bounds.compute(items, containers).as_tuple()
+        except bounds.BoundOverflowError:
+            # The bound refuses past its declared ceiling. Nothing reads it yet, so
+            # a refusal leaves it unset rather than failing a pack that is otherwise fine --
+            # the refusal is the bound declining to answer, not the request being invalid.
+            # When a caller-facing gap field exists, that field carries the refusal instead.
+            stats.objective_lower_bound = None
+
 
     def _across_containers_beam(self, solver, items, containers, config, stats, deadline):
         """Bounded deterministic beam over partial multi-container plans.

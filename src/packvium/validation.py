@@ -5,10 +5,11 @@ from ._compat import dataclass
 from .axle_load import axle_load_exceeded
 from .constraints import (CompatibilityConstraint, ConstraintContext, LoadSupportGraph,
                           SupportConstraint, TagCountConstraint, load_units,
-                          non_stackable_failure, overloaded, stack_density_exceeded,
+                          crushed, non_stackable_failure, overloaded, stack_density_exceeded,
                           stack_limit_exceeded)
 from .geometry import AxisAlignedBox, Point
-from .models import PackedContainer, PackingRequest, UnpackedItem
+from .models import (PackedContainer, PackingRequest, UnpackedItem, is_stack_sensitive,
+                     placement_hits_box, placements_collide)
 from .nesting import is_valid_nesting as _is_valid_nesting
 from .packing_sequence import RouteSequenceError, safe_route_removal_order
 from .units import Length
@@ -52,7 +53,7 @@ class IndependentSolutionValidator:
                                  or any(p.instance.item.minimum_support_ratio > 0
                                         or p.instance.item.ground_contact_rule not in (None, "free")
                                         for p in placements))
-            stack_sensitive = any(not p.instance.item.stackable for p in placements)
+            stack_sensitive = any(is_stack_sensitive(p.instance.item) for p in placements)
             stack_graph = LoadSupportGraph(load_units(placements)) if stack_sensitive else None
             for left, right in self._collision_pairs(placements):
                 issues.append(ValidationIssue(
@@ -67,7 +68,7 @@ class IndependentSolutionValidator:
                 if placement.rotation not in placement.instance.item.allowed_rotations: issues.append(ValidationIssue("forbidden_rotation", item_id))
                 if placement.dimensions != placement.instance.item.dimensions.rotated(placement.rotation): issues.append(ValidationIssue("dimension_mismatch", item_id))
                 if not self._envelope_matches(placement, clearance_ticks): issues.append(ValidationIssue("clearance_mismatch", item_id))
-                if any(placement.envelope_box.intersects(box) for o in packed.container.obstacles for box in o.boxes): issues.append(ValidationIssue("obstacle_collision", item_id))
+                if any(placement_hits_box(placement, box) for o in packed.container.obstacles for box in o.boxes): issues.append(ValidationIssue("obstacle_collision", item_id))
                 if placement.instance.item.must_be_on_floor and placement.envelope_origin.z != 0:
                     issues.append(ValidationIssue("must_be_on_floor", f"{item_id}: "))
                 eligible_tags = placement.instance.item.eligible_container_tags
@@ -100,7 +101,8 @@ class IndependentSolutionValidator:
             # reports the first offender it meets, this one is anchored on the container.
             units = load_units(packed.placements)
             density_limit = None if packed.container.max_stack_density is None else packed.container.max_stack_density.ticks
-            failure = overloaded(units) or stack_limit_exceeded(units) or stack_density_exceeded(units, density_limit)
+            failure = (overloaded(units) or crushed(units) or stack_limit_exceeded(units)
+                       or stack_density_exceeded(units, density_limit))
             if failure is not None: issues.append(ValidationIssue(failure[0], f"{packed.id}: {failure[1]}"))
             if packed.container.axles is not None:
                 axle_failure = axle_load_exceeded(
@@ -166,9 +168,8 @@ class IndependentSolutionValidator:
             active: list[tuple[int, int]] = []
             for x1, x2, index in ordered:
                 active = [(right, other) for right, other in active if right > x1]
-                box = placements[index].envelope_box
                 for _, other in active:
-                    if box.intersects(placements[other].envelope_box) and not _is_valid_nesting(placements[index], placements[other]):
+                    if placements_collide(placements[index], placements[other]) and not _is_valid_nesting(placements[index], placements[other]):
                         pairs.add((min(index, other), max(index, other)))
                 active.append((x2, index))
         return sorted(pairs)
