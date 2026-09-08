@@ -19,7 +19,7 @@ final word.
 
 from __future__ import annotations
 
-from typing import Iterable, Iterator
+from typing import Iterable, Sequence
 
 Bound = tuple[int, int, int, int, int, int]
 
@@ -38,25 +38,37 @@ class SpatialIndex:
     of placements spreads them across many buckets instead of one.
     """
 
-    __slots__ = ("cell_x", "cell_y", "cell_z", "cells")
+    __slots__ = ("cell_x", "cell_y", "cell_z", "cells", "_answers")
 
     def __init__(self, length_ticks: int, width_ticks: int, height_ticks: int, cells_per_axis: int = 8):
         self.cell_x = max(1, _ceil_div(max(1, length_ticks), cells_per_axis))
         self.cell_y = max(1, _ceil_div(max(1, width_ticks), cells_per_axis))
         self.cell_z = max(1, _ceil_div(max(1, height_ticks), cells_per_axis))
-        self.cells: dict[tuple[int, int, int], list[int]] = {}
+        # Cell contents are tuples, never lists: a bucket is replaced on insert rather than
+        # appended to, so a fork only has to copy the dict, and `query` can hand a bucket
+        # straight back without exposing anything a caller could mutate.
+        self.cells: dict[tuple[int, int, int], tuple[int, ...]] = {}
+        # Query answers by cell range, valid for the current contents only. A candidate
+        # scan asks about far more boxes than there are distinct cell ranges -- the grid
+        # is coarse by design -- and the answer for a range is a pure function of the
+        # contents, so it is computed once per range per generation of the index.
+        self._answers: dict[tuple[int, int, int, int, int, int], Sequence[int]] = {}
 
     def copy(self) -> "SpatialIndex":
         """A structural fork: independent of the original from this point on.
 
         Search branches copy a `ContainerState` and then diverge, each adding its own
-        placements -- sharing the cell lists would let one branch's insert corrupt
+        placements -- sharing the buckets would let one branch's insert corrupt
         another's index, the same reason `ContainerState.copy()` already copies its own
-        `bounds` list rather than aliasing it.
+        `bounds` list rather than aliasing it. Buckets are immutable, so a shallow copy
+        of the dict is a complete fork.
         """
         clone = SpatialIndex.__new__(SpatialIndex)
         clone.cell_x, clone.cell_y, clone.cell_z = self.cell_x, self.cell_y, self.cell_z
-        clone.cells = {key: list(indices) for key, indices in self.cells.items()}
+        clone.cells = dict(self.cells)
+        # Same contents, same answers. Safe to share: an insert on either side replaces
+        # the dict on that side rather than mutating it, so the other keeps a valid one.
+        clone._answers = self._answers
         return clone
 
     def _cell_range(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int):
@@ -68,22 +80,51 @@ class SpatialIndex:
     def add(self, index: int, bound: Bound) -> None:
         x1, y1, z1, x2, y2, z2 = bound
         ix1, ix2, iy1, iy2, iz1, iz2 = self._cell_range(x1, y1, z1, x2, y2, z2)
+        cells = self.cells
         for ix in range(ix1, ix2):
             for iy in range(iy1, iy2):
                 for iz in range(iz1, iz2):
-                    self.cells.setdefault((ix, iy, iz), []).append(index)
+                    key = (ix, iy, iz)
+                    cells[key] = cells.get(key, ()) + (index,)
+        self._answers = {}
 
-    def query(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> Iterator[int]:
-        """Bound indices sharing at least one cell with the given box, each at most once."""
-        ix1, ix2, iy1, iy2, iz1, iz2 = self._cell_range(x1, y1, z1, x2, y2, z2)
-        seen: set[int] = set()
+    def query(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> Sequence[int]:
+        """Bound indices sharing at least one cell with the given box, each at most once.
+
+        Cells are visited in `(x, y, z)` order and an index keeps its first position, so
+        the sequence is a deterministic function of the index contents. Returned as a
+        sequence rather than a generator: this is the innermost call of the candidate
+        scan, and a bucket can be handed back as-is when the box touches only one.
+        """
+        cell_x, cell_y, cell_z = self.cell_x, self.cell_y, self.cell_z
+        ix1, ix2 = x1 // cell_x, -(-max(x2, x1 + 1) // cell_x)
+        iy1, iy2 = y1 // cell_y, -(-max(y2, y1 + 1) // cell_y)
+        iz1, iz2 = z1 // cell_z, -(-max(z2, z1 + 1) // cell_z)
+        cell_range = (ix1, ix2, iy1, iy2, iz1, iz2)
+        answers = self._answers
+        answer = answers.get(cell_range)
+        if answer is not None: return answer
+        answers[cell_range] = answer = self._collect(ix1, ix2, iy1, iy2, iz1, iz2)
+        return answer
+
+    def _collect(self, ix1: int, ix2: int, iy1: int, iy2: int, iz1: int, iz2: int) -> Sequence[int]:
+        cells = self.cells
+        hits: list[tuple[int, ...]] = []
         for ix in range(ix1, ix2):
             for iy in range(iy1, iy2):
                 for iz in range(iz1, iz2):
-                    for index in self.cells.get((ix, iy, iz), ()):
-                        if index not in seen:
-                            seen.add(index)
-                            yield index
+                    bucket = cells.get((ix, iy, iz))
+                    if bucket: hits.append(bucket)
+        if not hits: return ()
+        if len(hits) == 1: return hits[0]
+        seen: set[int] = set()
+        found: list[int] = []
+        for bucket in hits:
+            for index in bucket:
+                if index not in seen:
+                    seen.add(index)
+                    found.append(index)
+        return found
 
 
 def build(bounds: Iterable[Bound], length_ticks: int, width_ticks: int, height_ticks: int) -> SpatialIndex:

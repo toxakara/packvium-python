@@ -19,6 +19,10 @@ share. That is deliberate: the shape fields are part of the JSON contract, so th
 request runs unchanged against the Python, PHP, Rust and JavaScript engines.
 """
 
+# `list | None` in a signature is PEP 604, which needs Python 3.10 at runtime. This
+# package supports 3.9, so the annotation is deferred rather than evaluated.
+from __future__ import annotations
+
 from packvium import pack_from_dict
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ._compat import dataclass
 from enum import Enum
+from functools import lru_cache
 from itertools import product
 from typing import Iterable
 
@@ -23,6 +24,16 @@ class Rotation(str, Enum):
     @classmethod
     def upright(cls) -> tuple["Rotation", ...]:
         return (cls.LWH, cls.WLH)
+
+
+# Which declared side lands on each axis under a rotation. A module-level table rather
+# than a dict literal inside `rotated`: that method runs once per rotation per candidate
+# search, and rebuilding six tuples there was measurable.
+_ROTATION_AXES: dict[Rotation, tuple[int, int, int]] = {
+    Rotation.LWH: (0, 1, 2), Rotation.LHW: (0, 2, 1),
+    Rotation.WLH: (1, 0, 2), Rotation.WHL: (1, 2, 0),
+    Rotation.HLW: (2, 0, 1), Rotation.HWL: (2, 1, 0),
+}
 
 
 class ShapeType(str, Enum):
@@ -84,24 +95,12 @@ class Dimensions:
         return max(self.length.ticks, self.width.ticks, self.height.ticks)
 
     def rotated(self, rotation: Rotation) -> "Dimensions":
-        l, w, h = self.length, self.width, self.height
-        values = {
-            Rotation.LWH: (l, w, h), Rotation.LHW: (l, h, w),
-            Rotation.WLH: (w, l, h), Rotation.WHL: (w, h, l),
-            Rotation.HLW: (h, l, w), Rotation.HWL: (h, w, l),
-        }[rotation]
-        return Dimensions(*values)
+        sides = (self.length, self.width, self.height)
+        first, second, third = _ROTATION_AXES[rotation]
+        return Dimensions(sides[first], sides[second], sides[third])
 
     def unique_rotations(self, allowed: Iterable[Rotation]) -> tuple[tuple[Rotation, "Dimensions"], ...]:
-        seen: set[tuple[int, int, int]] = set()
-        result = []
-        for rotation in allowed:
-            dims = self.rotated(rotation)
-            key = (dims.length.ticks, dims.width.ticks, dims.height.ticks)
-            if key not in seen:
-                seen.add(key)
-                result.append((rotation, dims))
-        return tuple(result)
+        return _unique_rotations(self, tuple(allowed))
 
     def fits_inside(self, other: "Dimensions") -> bool:
         return self.length.ticks <= other.length.ticks and self.width.ticks <= other.width.ticks and self.height.ticks <= other.height.ticks
@@ -112,6 +111,21 @@ class Dimensions:
 
     def to_dict(self, unit: str = "mm") -> dict:
         return {"length": self.length.to_dict(unit), "width": self.width.to_dict(unit), "height": self.height.to_dict(unit)}
+
+
+@lru_cache(maxsize=4096)
+def _unique_rotations(dimensions: Dimensions, allowed: tuple[Rotation, ...]) -> tuple[tuple[Rotation, Dimensions], ...]:
+    """Memoised on the (immutable) box and rotation list: every candidate search of an
+    item asks this again, and the answer is the same tuple of the same frozen values."""
+    seen: set[tuple[int, int, int]] = set()
+    result = []
+    for rotation in allowed:
+        dims = dimensions.rotated(rotation)
+        key = (dims.length.ticks, dims.width.ticks, dims.height.ticks)
+        if key not in seen:
+            seen.add(key)
+            result.append((rotation, dims))
+    return tuple(result)
 
 
 def dimensional_weight(dimensions: Dimensions, divisor: int, length_unit: str = "in", weight_unit: str = "lb") -> Weight:

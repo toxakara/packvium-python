@@ -81,6 +81,44 @@ class PlacementConstraint(Protocol):
     def evaluate(self, context: ConstraintContext) -> ConstraintResult: ...
 
 
+def active_constraints(constraints: Sequence[PlacementConstraint], container: Container, item: ItemInstance,
+                       stack_sensitive: bool, route_sensitive: bool) -> list[PlacementConstraint]:
+    """The constraints that could reject *some* candidate of `item` in `container`.
+
+    A candidate search evaluates the whole chain once per feasible position, and most rules
+    are opt-in: they begin by reading a flag on the item, the container or the search state
+    and allowing when it is off. Those flags are fixed for the duration of one search, so
+    the answer is read once here instead of once per position. A rule that is dropped would
+    have allowed every position, so the first rejecting rule -- and everything counted or
+    traced on the way to it -- is unchanged. Exact type checks are intentional: custom
+    constraints and subclasses with overridden behaviour are always evaluated, and an
+    unrelated extension method cannot accidentally opt into this internal optimisation.
+    """
+    active: list[PlacementConstraint] = []
+    for constraint in constraints:
+        constraint_type = type(constraint)
+        inert = (
+            (constraint_type is FloorConstraint and not item.item.must_be_on_floor)
+            or (constraint_type is ContainerEligibilityConstraint
+                and (not item.item.eligible_container_tags
+                     or bool(item.item.eligible_container_tags & container.tags)))
+            or (constraint_type is CompatibilityConstraint
+                and not item.item.tags and not item.item.incompatible_tags)
+            or (constraint_type is TagCountConstraint
+                and (not container.tag_limits
+                     or not (item.item.tags & container.tag_limits.keys())))
+            or (constraint_type is TopLoadConstraint and not stack_sensitive)
+            or (constraint_type is RouteOrderConstraint and not route_sensitive)
+            or (constraint_type is StopAccessibilityConstraint
+                and (not route_sensitive
+                     or not (container.access_directions or constraint._default_directions)))
+            or (constraint_type is AxleLoadConstraint and container.axles is None)
+        )
+        if not inert:
+            active.append(constraint)
+    return active
+
+
 class ProvenRejection(Protocol):
     """A constraint that can rule an item out of *every* offered container without
     searching for a placement first.
@@ -293,7 +331,7 @@ class LoadSupportGraph:
         """This graph plus one more unit, appended at the next index.
 
         The search evaluates many candidates against one unchanged set of placements, and
-        rebuilding the whole support graph for each of them was the cost  exists to
+        rebuilding the whole support graph for each of them was the cost exists to
         remove. Adding a box cannot change contact between two boxes already placed, so
         the face graph only needs its two planes queried -- see `ContactGraph.with_box`.
 
@@ -635,7 +673,7 @@ class TopLoadConstraint:
     only the box directly underneath, so a tower of light items cannot crush its base.
 
     The support graph over the *placed* boxes is the same for every candidate evaluated
-    against one search state, and rebuilding it per candidate was the cost 
+    against one search state, and rebuilding it per candidate was the cost
     removes. One base per placement tuple is kept here and each candidate is appended to
     it. The cache is deliberately a single entry compared by identity: search evaluates a
     run of candidates against one state before moving on, so a one-entry cache captures
@@ -760,12 +798,20 @@ class StopAccessibilityConstraint:
     neither implies the other; docs/STOP-ACCESSIBILITY.md derives the rule and the
     post-validator's whole-scene replay remains the sufficient check.
 
-    Opt-in twice over, and both are load-bearing. It is inert unless the caller supplies
-    exit directions, because the request schema has no field for them: assuming all six
-    walls open would enforce a rule that is true of no real vehicle and nearly vacuous
-    besides, since a box is almost always free through *some* face. And it is inert unless
-    two distinct stops are in play, which is what keeps a caller who never populates
-    `stop_index` paying nothing.
+    Opt-in twice over, and both are load-bearing. It is inert unless doors are stated,
+    because assuming all six walls open would enforce a rule that is true of no real
+    vehicle and nearly vacuous besides, since a box is almost always free through *some*
+    face. And it is inert unless two distinct stops are in play, which is what keeps a
+    caller who never populates `stop_index` paying nothing.
+
+    **The doors come from the container, and fall back to the configuration.**
+    `container.access_directions` is a request field, and it has to be a per-container one:
+    two doors on one trailer and none on another is the case that makes the rule worth
+    having, and a solve opening several container types would otherwise have to pick one
+    answer for all of them. The constructor argument stays as the default so that the
+    library callers who drove this through `PackingConfig(access_directions=...)` before
+    the field existed keep working unchanged -- a container that states its own doors
+    overrides it, a container that states none inherits it.
 
     The blocker set is `{q : s(q) > s(p)}` -- strictly later. Items due at the *same* stop
     are excluded because the order within a stop is free: whichever is in the way comes off
@@ -773,7 +819,8 @@ class StopAccessibilityConstraint:
     which is an ordinary load.
     """
 
-    __slots__ = ("_directions", "_placements", "_container", "_clear", "_stops")
+    __slots__ = ("_default_directions", "_placements", "_container", "_directions",
+                 "_clear", "_stops")
 
     def __init__(self, directions: Sequence[str] = ()) -> None:
         for direction in directions:
@@ -781,13 +828,15 @@ class StopAccessibilityConstraint:
                 raise InvalidDirectionError(direction)
         # Deduplicated in the canonical order rather than as given: two callers passing the
         # same doors in different orders must search identically.
-        self._directions = tuple(d for d in ALL_DIRECTIONS if d in set(directions))
+        self._default_directions = tuple(d for d in ALL_DIRECTIONS if d in set(directions))
         self._placements: tuple[Placement, ...] | None = None
         self._container: Dimensions | None = None
+        self._directions: tuple[str, ...] = ()
         self._clear: tuple[frozenset[str], ...] = ()
         self._stops: tuple[float, ...] = ()
 
-    def _base_for(self, placements: tuple[Placement, ...], container: Dimensions):
+    def _base_for(self, placements: tuple[Placement, ...], container: Dimensions,
+                  directions: tuple[str, ...]):
         """Per placed box, the doors still open to it against the already-placed boxes.
 
         Cached by tuple identity for the same reason `TopLoadConstraint` does it: the
@@ -797,7 +846,11 @@ class StopAccessibilityConstraint:
         # Keyed on the container as well as the placements, because a corridor runs to a
         # *wall*: the same boxes have different exits in a longer container, and reusing
         # the answer across two would silently accept a placement that walls an item in.
-        if self._placements is placements and self._container == container:
+        # And on the doors, since made them a property of the container rather than
+        # of the solve: two containers of the same size with different doors have different
+        # answers for the same boxes, and nothing else in the key separates them.
+        if (self._placements is placements and self._container == container
+                and self._directions == directions):
             return self._clear, self._stops
         stops = tuple(_stop_of(p) for p in placements)
         boxes = [p.envelope_box for p in placements]
@@ -805,10 +858,10 @@ class StopAccessibilityConstraint:
         for index, box in enumerate(boxes):
             if stops[index] == RIDES_THE_WHOLE_ROUTE:
                 # Never unloaded, so it needs no door of its own -- it only ever blocks.
-                clear.append(frozenset(self._directions))
+                clear.append(frozenset(directions))
                 continue
             open_doors = frozenset(
-                direction for direction in self._directions
+                direction for direction in directions
                 if not any(other != index and stops[other] > stops[index]
                            and sweep_intersects(swept_volume(box, container, direction), boxes[other])
                            for other in range(len(boxes)))
@@ -816,18 +869,23 @@ class StopAccessibilityConstraint:
             clear.append(open_doors)
         self._placements = placements
         self._container = container
+        self._directions = directions
         self._clear = tuple(clear)
         self._stops = stops
         return self._clear, self._stops
 
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
-        if not self._directions: return ConstraintResult.allow()
         if not context.route_sensitive: return ConstraintResult.allow()
+        # The container's own doors win; the configured tuple is what a container that
+        # states none inherits. `or` rather than a None check because both sides are
+        # already canonical tuples and "no doors" is the same answer either way.
+        directions = context.container.access_directions or self._default_directions
+        if not directions: return ConstraintResult.allow()
 
         candidate_stop = context.item.item.stop_index
         if candidate_stop is None: candidate_stop = RIDES_THE_WHOLE_ROUTE
         inner = context.container.inner_dimensions
-        clear, stops = self._base_for(context.placements, inner)
+        clear, stops = self._base_for(context.placements, inner, directions)
 
         # One distinct stop means nothing can be due before anything else, so no corridor
         # can be blocked by a later item. Checked over the candidate too, or the first
@@ -858,7 +916,7 @@ class StopAccessibilityConstraint:
             not any(stops[other] > candidate_stop
                     and sweep_intersects(swept_volume(candidate, inner, direction), boxes[other])
                     for other in range(len(boxes)))
-            for direction in self._directions
+            for direction in directions
         ):
             return ConstraintResult.reject(
                 "stop_accessibility_violation",

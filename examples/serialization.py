@@ -39,6 +39,14 @@ request = {
         "profile": "balanced",
         "seed": 42,
         "top_k": 2,
+        # An example must not change answer merely because the machine is busy. `top_k`
+        # asks the portfolio for runners-up, and how many it finds is bounded by the
+        # *wall clock* unless a budget says otherwise -- so without this line two runs on
+        # a loaded host can print a different number of alternatives, which is
+        # exactly. gave every conformance fixture an explicit budget for this
+        # reason; the examples were not part of that sweep. The value is a safety fuse,
+        # not a target: nothing here comes close to it.
+        "time_limit_ms": 60_000,
     },
     "items": [
         {
@@ -131,14 +139,14 @@ except ValueError as refusal:
 
 # And a field this engine has named as not-yet-implemented is refused explicitly, so a
 # request written for a newer engine fails loudly instead of being half-honoured. The list
-# below is the engine's own constant, and it is empty:  implemented `convex_hull`
+# below is the engine's own constant, and it is empty: implemented `convex_hull`
 # and `compressible`, the last reserved names left on it, so this engine now serves every
 # field and every `shape_type` value the schema defines.
 print("fields this engine refuses by name:",
       {scope: fields for scope, fields in UNSUPPORTED_FIELDS.items() if fields} or "none")
 
 # Caught up is the right state and a poor demonstration, so the guard takes its lists as
-# parameters -- the same hook its own tests use. Passing the value  retired shows
+# parameters -- the same hook its own tests use. Passing the value retired shows
 # the refusal a caller still gets from an engine that is behind, and shows it naming the
 # *value* rather than the field: `rigid_cuboid` is the default and is implemented, so a
 # caller who spells the default out must be served, not refused.

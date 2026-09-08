@@ -1379,29 +1379,74 @@ def test_the_corridor_base_is_reused_for_a_second_candidate_on_the_same_state():
     """The cache is why a candidate costs `O(m * |D|)` rather than `O(m^2 * |D|)`: search
     asks a run of candidates against one immutable state, so one entry covers the run.
 
-    It is keyed on the placements *and* the container. The container half is a guard rather
-    than something a legal scene can demonstrate -- a placement always lies inside its own
-    container, so widening a wall only lengthens a sweep into empty space. What it protects
-    against is one placement tuple being asked about two different containers, which a
-    multi-container solve can do; the key makes the second question rebuild instead of
-    inheriting the first answer.
+    It is keyed on the placements, the container *and* the doors. The container half is a
+    guard rather than something a legal scene can demonstrate -- a placement always lies
+    inside its own container, so widening a wall only lengthens a sweep into empty space.
+    What it protects against is one placement tuple being asked about two different
+    containers, which a multi-container solve can do; the key makes the second question
+    rebuild instead of inheriting the first answer.
+
+    The doors half is not a guard at all since made them a property of the
+    container: two containers of the same size with different doors give *different*
+    answers for the same boxes, and nothing else in the key separates them.
     """
     constraint = constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X)
     early, early_x = _wide("early", 60, 40, stop=0)
     late, late_x = _wide("late", 0, 60, stop=1)
     placements = (placed(early, x=early_x),)
     scene = context(late, x=late_x, placements=placements)
+    doors = tuple(DOOR_AT_MINUS_X)
 
     first = constraint.evaluate(scene)
-    built = constraint._base_for(placements, BOX.inner_dimensions)
+    built = constraint._base_for(placements, BOX.inner_dimensions, doors)
     # Asking again on the same state must take the cached path and answer identically.
-    assert constraint._base_for(placements, BOX.inner_dimensions) == built
+    assert constraint._base_for(placements, BOX.inner_dimensions, doors) == built
     assert constraint.evaluate(scene).allowed == first.allowed
 
     longer = Container.create("longer", Dimensions.mm(300, 100, 100))
-    constraint._base_for(placements, longer.inner_dimensions)
+    constraint._base_for(placements, longer.inner_dimensions, doors)
     assert constraint._container == longer.inner_dimensions, (
         "a different container must rebuild the base rather than inherit it")
+
+    # The same boxes and the same walls, through the other door: a different answer, and
+    # the entry above must not be handed back for it.
+    through_plus_x = constraint._base_for(placements, BOX.inner_dimensions, ("+x",))
+    assert constraint._directions == ("+x",)
+    assert through_plus_x != built, (
+        "the same placements behind two different doors are two different questions")
+
+
+def test_a_container_states_its_own_doors_and_a_silent_one_inherits_the_default():
+    """ . The field is per container because two doors on one trailer and none on
+    another is the case that makes the rule worth having; the constructor argument stays as
+    the default so the library callers who predate the field keep working."""
+    early, early_x = _wide("early", 60, 40, stop=0)
+    late, late_x = _wide("late", 0, 60, stop=1)
+    placements = (placed(early, x=early_x),)
+
+    sealed = Container.create("sealed", BOX.inner_dimensions)
+    through_minus_x = Container.create("through-minus-x", BOX.inner_dimensions,
+                                       access_directions=("-x",))
+    through_plus_x = Container.create("through-plus-x", BOX.inner_dimensions,
+                                      access_directions=("+x",))
+
+    def verdict(constraint, container):
+        return constraint.evaluate(
+            context(late, x=late_x, placements=placements, container=container)).allowed
+
+    # The stop-1 item fills the stop-0 item's only corridor to `-x`, and does not touch its
+    # corridor to `+x`. One container refuses it, the other does not, and nothing about the
+    # boxes changed.
+    stated = constraints.StopAccessibilityConstraint()
+    assert not verdict(stated, through_minus_x)
+    assert verdict(stated, through_plus_x)
+    assert verdict(stated, sealed), "no doors anywhere leaves the rule inert"
+
+    # A container that states none inherits what the caller configured.
+    configured = constraints.StopAccessibilityConstraint(DOOR_AT_MINUS_X)
+    assert not verdict(configured, sealed)
+    # And a container that states its own overrides it, rather than adding to it.
+    assert verdict(configured, through_plus_x)
 
 
 def test_permanent_cargo_that_blocks_nobody_is_allowed():
@@ -1568,7 +1613,7 @@ def test_a_single_supporter_covering_over_half_the_base_always_contains_the_cent
     refuses, and at 0.3 and 0.45 it refuses more (benchmarks/results/support-predicates.json).
 
     This is the boundary, not a bug -- but it means the hull is built per candidate for a
-    verdict that a cheaper comparison already fixed, which is the finding  records.
+    verdict that a cheaper comparison already fixed, which is the finding records.
     """
     rng = random.Random(6000 + seed)
     length, width = rng.randint(20, 60), rng.randint(20, 60)
