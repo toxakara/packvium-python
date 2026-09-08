@@ -1417,7 +1417,7 @@ def test_the_corridor_base_is_reused_for_a_second_candidate_on_the_same_state():
 
 
 def test_a_container_states_its_own_doors_and_a_silent_one_inherits_the_default():
-    """ . The field is per container because two doors on one trailer and none on
+    """. The field is per container because two doors on one trailer and none on
     another is the case that makes the rule worth having; the constructor argument stays as
     the default so the library callers who predate the field keep working."""
     early, early_x = _wide("early", 60, 40, stop=0)

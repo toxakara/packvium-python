@@ -46,8 +46,8 @@ class Axle:
     max_load: Weight | None = None
 
 
-#: The largest `stop_index` every engine can carry identically ( /KI defect found
-#: under ). Route order is decided by comparing stop indices, and JavaScript holds
+#: The largest `stop_index` every engine can carry identically (/KI defect found
+#: under). Route order is decided by comparing stop indices, and JavaScript holds
 #: numbers as doubles: `JSON.parse` already collapses 2**53 + 1 to 2**53 before any
 #: constraint sees it, so two consecutive stops above this bound become one number there
 #: and one engine silently disagrees with the other three. Since the value cannot cross
@@ -316,7 +316,7 @@ class Container:
     axles: tuple[Axle, Axle] | None = None
     # Which walls this container can be unloaded through. Empty means the
     # horizontal half of route order is not enforced for it -- not that it is sealed.
-    # A container with no stated doors is the pre- default, and defaulting to all
+    # A container with no stated doors is the pre-default, and defaulting to all
     # six instead would enforce a rule true of no real vehicle: a box is almost always
     # free through *some* face, so six doors is nearly the same as none, but it is a
     # *different* nearly-nothing and it would change answers for every caller who never
