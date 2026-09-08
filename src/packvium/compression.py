@@ -8,7 +8,7 @@ checking the oracle against itself.
 Every value on this path is an exact integer or a reduced rational. Pressure is carried as a
 numerator/denominator pair rather than a `Fraction` for two reasons: the hard limit is a
 comparison, which cross multiplication answers without dividing at all, and PHP, Rust and
-JavaScript have no rational type to port a `Fraction` to ( through ).
+JavaScript have no rational type to port a `Fraction` to (through).
 """
 
 from __future__ import annotations

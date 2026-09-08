@@ -232,7 +232,7 @@ def rebalance_weight(
                     continue
                 # A move that prices the destination past its tariff is not an
                 # improvement: the sentinel must never ride out through a rebalanced
-                # packing any more than through a packed one ( review).
+                # packing any more than through a packed one (review).
                 if unpriceable_container(tuple(trial), config) is not None:
                     continue
                 committed = (trial, source.placements[placement_index].instance.id, source.id, working[dest_index].id)

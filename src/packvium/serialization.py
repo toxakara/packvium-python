@@ -135,13 +135,13 @@ UNSUPPORTED_FIELDS: dict[str, tuple[str, ...]] = {
     "request": (),
     "configuration": (),
     # `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list
-    # in , when Python gained both the solver behaviour and the independent validation
+    # in, when Python gained both the solver behaviour and the independent validation
     # the staged rollout requires. PHP, Rust and the JavaScript fallback still carry them.
     "item": (),
     # `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract
     # freeze and is refused everywhere until an engine implements it from a request: a field
     # a caller can set and the solver ignores is worse than a refusal.
-    # `access_directions` left this list in , which wired the reserved field through
+    # `access_directions` left this list in, which wired the reserved field through
     # to `StopAccessibilityConstraint` in all four engines at once.
     "container": ("pallet_overhang_limit",),
 }
@@ -153,7 +153,7 @@ UNSUPPORTED_FIELDS: dict[str, tuple[str, ...]] = {
 #: is unimplemented is a *value*, and the refusal has to name it -- an engine that packed a
 #: `convex_hull` item as its bounding box would return a plan that looks valid and does not
 #: physically fit.
-#: Empty since : this engine implements every value the schema defines. The guard
+#: Empty since: this engine implements every value the schema defines. The guard
 #: stays because the next reserved value will need it, and because `reject_unsupported` takes
 #: its lists as parameters precisely so it remains testable when they are empty.
 UNSUPPORTED_SHAPE_TYPES: tuple[str, ...] = ()

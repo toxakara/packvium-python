@@ -2,7 +2,7 @@
 
 These are the numbers the document commits to in prose. Pinning them here means a later
 optimisation of the axis set or the compression arithmetic has to keep answering the
-published examples, and it means PHP, Rust and JavaScript ( through ) have a
+published examples, and it means PHP, Rust and JavaScript (through) have a
 concrete target rather than a paragraph to interpret.
 
 The cross-implementation property tests live in `conformance/tests/test_irregular_items.py`,

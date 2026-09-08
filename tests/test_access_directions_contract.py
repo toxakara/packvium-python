@@ -50,7 +50,7 @@ def test_every_legal_direction_survives_canonicalisation():
 
 
 def test_a_container_states_no_doors_by_default():
-    """The pre- default, and it is *inert* rather than permissive: six walls and
+    """The pre-default, and it is *inert* rather than permissive: six walls and
     none are both nearly-vacuous, but they are different nearly-vacuous, and defaulting to
     six would switch a real constraint on for every caller who never set the field."""
     assert crate().access_directions == ()

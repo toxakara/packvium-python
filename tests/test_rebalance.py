@@ -240,7 +240,7 @@ def test_a_rebalance_move_never_prices_a_container_past_its_bracket():
     """The only spread-improving move -- one brick into the lighter box -- would bill it
     at 2000 g, past its 1500 g card. Under lowest_landed_cost that is not an
     improvement: the sentinel must never ride out through a rebalanced packing any more
-    than through a packed one ( review)."""
+    than through a packed one (review)."""
     from packvium import Container, Dimensions, Item
     from packvium.models import RateTable
     from packvium.packer import Packer
@@ -273,7 +273,7 @@ def test_a_rebalance_move_never_prices_a_container_past_its_bracket():
 def test_rebalance_refuses_an_unpriceable_input():
     """A caller handing rebalance a packing whose container already bills past its
     bracket gets the same refusal `Packer.pack` gives on the way out, not a rebalanced
-    version of a shipment with no published price ( review)."""
+    version of a shipment with no published price (review)."""
     from packvium import Container, Dimensions, Item
     from packvium.models import RateTable, UnratedWeightError
     from packvium.packer import Packer
@@ -308,7 +308,7 @@ def test_rebalance_refuses_an_unpriceable_input():
 def test_rebalance_applies_the_same_landed_cost_admission_as_pack():
     """The public rebalance entry point must not accept a request the pack entry point
     rejects: pricing requires a divisor and a rate card on every available container,
-    including a container the current packing did not happen to use ( review)."""
+    including a container the current packing did not happen to use (review)."""
     from packvium import Container, Dimensions, Item
     from packvium.extensions import UnknownObjectiveError
     from packvium.models import RateTable

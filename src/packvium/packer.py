@@ -41,7 +41,7 @@ class Packer:
         # is a static property of the request, unlike a billed weight past the last
         # bracket, which depends on how the search filled the box and loses a candidate
         # instead. Rust and the JavaScript fallback refuse both at admission with these
-        # same sentences ( review); the scorer's late checks stay as the backstop
+        # same sentences (review); the scorer's late checks stay as the backstop
         # for callers who bypass `Packer.pack`.
         if (
             self.config.objective in ("shipping_cost", "lowest_landed_cost")
@@ -179,7 +179,7 @@ class Packer:
             # The sentinel is a search device, never an answer -- alternatives included.
             # A runner-up the tariff cannot price is dropped before the slice, so up to
             # top_k-1 usable packings survive when priceable runners exist beyond an
-            # unpriceable one ( review).
+            # unpriceable one (review).
             tuple(
                 runner for runner in selected[1:]
                 if unpriceable_container(runner.containers, self.config) is None

@@ -60,7 +60,8 @@ class SearchStats:
     # `exact_small` or global-beam solve. Internal for the same reason as
     # `hull_refinements` above, and for one more: reporting a gap to a caller is a new public
     # result field, and this project reserves and rejects such a field before a contract
-    # freeze rather than adding it mid-line ('s precedent, restated by ).
+    # freeze rather than adding it mid-line, following the precedent set for the reserved
+    # container field and restated by the objective-bound wave.
     # `None` when no bound was computed -- a non-default objective keys its score vector
     # differently, so a bound compared against it would compare different quantities.
     objective_lower_bound: "tuple[int, ...] | None" = None
@@ -1574,7 +1575,7 @@ class ExactSmallSolver:
 
             Landed cost precedes unused volume in the public objective. A promotional
             bracket may make a heavier equal-count subset cheaper, so the historical
-            count/volume rank was wrong for this objective ( second review).
+            count/volume rank was wrong for this objective (second review).
             """
             count = len(state.placements)
             if config.objective != "lowest_landed_cost":
@@ -2507,7 +2508,7 @@ class SolverOrchestrator:
                         config.dimensional_weight_weight_unit,
                     ).ticks
                     # `payload_ticks` and `placement_count` are lattice-aware: the
-                    #  compact path carries no per-item placements, so summing
+                    # compact path carries no per-item placements, so summing
                     # `state.placements` here priced a quantity-compressed trial as
                     # tare alone and let an unpriceable container win the round.
                     gross = container.tare_weight.ticks + one.state.payload_ticks

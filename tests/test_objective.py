@@ -492,7 +492,7 @@ def test_a_bracket_step_makes_the_cheaper_shipment_the_heavier_one():
 
 
 def test_a_quantity_compressed_round_still_prices_the_true_payload():
-    """ compact states carry no per-item `Placement`s, so a round key that sums
+    """compact states carry no per-item `Placement`s, so a round key that sums
     `state.placements` prices a quantity-compressed trial as tare alone. Eight 2000 g
     cubes bill 16000 g -- past alpha's last bracket -- but alpha's dimensional 5400 g
     is not, so a tare-only key committed alpha and refused a request that beta ships
@@ -784,7 +784,7 @@ def test_alternatives_never_quote_the_sentinel():
     """The refusal guarded only the winner; `alternatives` (top_k defaults to 3) could
     carry a feasible-status packing of an unpriceable container with the sentinel as
     its landed cost -- the exact number this objective exists to never invent. Runner-
-    ups the tariff cannot price are dropped before the slice ( review)."""
+    ups the tariff cannot price are dropped before the slice (review)."""
     from packvium.config import PackingConfig, SolverProfile
     from packvium.extensions import UNPRICEABLE_MINOR, unpriceable_container
     from packvium.models import RateTable
