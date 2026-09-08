@@ -258,7 +258,7 @@ def test_a_score_below_its_bound_is_refused_and_an_attained_one_reports_no_gap()
 
 
 def test_a_nesting_request_drops_the_volume_argument_end_to_end():
-    """The branch  found unsound, exercised through `compute` rather than the helper.
+    """The branch found unsound, exercised through `compute` rather than the helper.
 
     Five 10mm cubes cannot fit one 10mm container by volume, and the bound says four are
     stranded. Declare a nesting height on the same items and the volume argument is dropped

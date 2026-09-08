@@ -7,7 +7,8 @@ from typing import Any, Iterable, Mapping
 
 from .centre_of_mass import centre_of_mass_offset_ppm
 from . import compression, hull
-from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
+from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
+                       Point, Rotation, ShapeType)
 from .lattice_summary import LatticeSummary
 from .nesting import used_volume as nesting_used_volume
 from .units import Length, Weight
@@ -45,7 +46,7 @@ class Axle:
     max_load: Weight | None = None
 
 
-#: The largest `stop_index` every engine can carry identically (/KI defect found
+#: The largest `stop_index` every engine can carry identically ( /KI defect found
 #: under ). Route order is decided by comparing stop indices, and JavaScript holds
 #: numbers as doubles: `JSON.parse` already collapses 2**53 + 1 to 2**53 before any
 #: constraint sees it, so two consecutive stops above this bound become one number there
@@ -313,6 +314,14 @@ class Container:
     max_stack_density: Weight | None = None
     # (front, rear), front nearer the container's own x origin.
     axles: tuple[Axle, Axle] | None = None
+    # Which walls this container can be unloaded through. Empty means the
+    # horizontal half of route order is not enforced for it -- not that it is sealed.
+    # A container with no stated doors is the pre- default, and defaulting to all
+    # six instead would enforce a rule true of no real vehicle: a box is almost always
+    # free through *some* face, so six doors is nearly the same as none, but it is a
+    # *different* nearly-nothing and it would change answers for every caller who never
+    # set the field.
+    access_directions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id: raise ValueError("container id is required")
@@ -326,6 +335,14 @@ class Container:
             if front.position.ticks < 0 or rear.position.ticks > self.inner_dimensions.length.ticks:
                 raise ValueError("axle positions must lie within the container's length")
         if any(limit < 1 for limit in self.tag_limits.values()): raise ValueError("tag_limits must be at least 1")
+        # Deduplicated into the canonical order rather than kept as given: two callers
+        # naming the same doors in a different order must search identically, and this is
+        # the one place every construction path passes through.
+        for direction in self.access_directions:
+            if direction not in ALL_DIRECTIONS:
+                raise InvalidDirectionError(direction)
+        object.__setattr__(self, "access_directions",
+                           tuple(d for d in ALL_DIRECTIONS if d in set(self.access_directions)))
         if self.outer_dimensions and not self.inner_dimensions.fits_inside(self.outer_dimensions): raise ValueError("outer dimensions cannot be smaller than inner dimensions")
         boundary = AxisAlignedBox(Point(0, 0, 0), self.inner_dimensions)
         for obstacle in self.obstacles:

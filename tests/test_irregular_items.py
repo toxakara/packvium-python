@@ -337,7 +337,7 @@ def test_a_face_carrying_a_non_corner_vertex_is_wound_past_it():
     leave every other vertex on one side, it takes the farthest, which skips an edge-interior
     point instead of turning the face into a degenerate spur. Getting it wrong does not raise
     -- it produces a surface that fails to close and a volume that is quietly too small, which
-    is how the defect fixed in  survived a review cycle.
+    is how the defect fixed in survived a review cycle.
 
     A pyramid on a square base, with a redundant vertex at the midpoint of one base edge. The
     base is five coplanar points and only four of them are corners; the volume is a third of

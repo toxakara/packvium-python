@@ -18,8 +18,8 @@ from .constraints import (AxleLoadConstraint, CompatibilityConstraint, Constrain
                           ContainerEligibilityConstraint, FloorConstraint, LoadUnit, PlacementConstraint,
                           RIDES_THE_WHOLE_ROUTE, RouteOrderConstraint,
                           StopAccessibilityConstraint, SupportConstraint,
-                          TagCountConstraint, TopLoadConstraint, direct_support_view, load_units,
-                          top_loads, usable_volume)
+                          TagCountConstraint, TopLoadConstraint, active_constraints, direct_support_view,
+                          load_units, top_loads, usable_volume)
 from . import bounds, hull
 from .geometry import (AxisAlignedBox, Dimensions, Point, Rotation, ShapeType,
                        dimensional_weight)
@@ -131,7 +131,13 @@ class Deadline:
         return Deadline(0, limit_ns=self.remaining_ns, clock=self._clock, effort_budget=effort_budget, stats=stats)
 
     def check(self) -> None:
-        if self.expired: raise TimeLimitReached("packing time limit reached")
+        # Polled once per candidate point; the same test as `expired`, without the three
+        # chained property calls that made it measurable there.
+        budget = self._effort_budget
+        if budget is not None and self._stats is not None and budget.exceeded(self._stats):
+            raise TimeLimitReached("packing time limit reached")
+        if self.limit_ns - (self._clock() - self.started) <= 0:
+            raise TimeLimitReached("packing time limit reached")
 
     @property
     def uses_real_clock(self) -> bool:
@@ -305,13 +311,17 @@ class ContainerState:
         # available to the next item. Keeping those points alive is what lets the exact
         # collision test below actually decide something; pruning them first would mean the
         # engine could describe an interlocking pack it could never propose.
-        retired = ({key for key, point in self.points.items() if box.contains_point(point)}
-                   if shape is None else set())
-        for key in retired:
-            del self.points[key]
-        if retired:
-            self.ordered_points = [point for point in self.ordered_points
-                                   if (point.x, point.y, point.z) not in retired]
+        if shape is None:
+            x1, y1, z1, x2, y2, z2 = bound
+            retired = [key for key in self.points
+                       if x1 <= key[0] < x2 and y1 <= key[1] < y2 and z1 <= key[2] < z2]
+            for key in retired:
+                del self.points[key]
+            # `ordered_points` holds exactly the points of `points`, so the same test
+            # retires the same set there without rebuilding a key per point.
+            if retired:
+                self.ordered_points = [point for point in self.ordered_points
+                                       if not (x1 <= point.x < x2 and y1 <= point.y < y2 and z1 <= point.z < z2)]
         self._absorb(self._exposed_points(box))
 
     def add_direct(self, placement: Placement) -> None:
@@ -342,13 +352,18 @@ class ContainerState:
     def _absorb(self, points: Iterable[Point]) -> None:
         dims = self.container.inner_dimensions
         length, width, height = dims.length.ticks, dims.width.ticks, dims.height.ticks
+        # A solid containing a point is registered in that point's cell, so only that
+        # bucket has to be checked rather than every bound in the container.
+        index, bounds = self.index, self.bounds
+        cell_x, cell_y, cell_z, cells = index.cell_x, index.cell_y, index.cell_z, index.cells
         for point in points:
             x, y, z = point.x, point.y, point.z
             if x >= length or y >= width or z >= height: continue
             key = (x, y, z)
             if key in self.points: continue
+            bucket = cells.get((x // cell_x, y // cell_y, z // cell_z), ())
             if any(bx1 <= x < bx2 and by1 <= y < by2 and bz1 <= z < bz2
-                   for bx1, by1, bz1, bx2, by2, bz2 in self.bounds): continue
+                   for bx1, by1, bz1, bx2, by2, bz2 in map(bounds.__getitem__, bucket)): continue
             self.points[key] = point
             point_key = (z, y, x)
             low, high = 0, len(self.ordered_points)
@@ -375,14 +390,40 @@ class ContainerState:
         ]
         return [*corners, *projections]
 
+    # Each projection is the highest face at or below a ceiling among the solids whose
+    # footprint covers the point on the other two axes. Such a solid ends inside the
+    # ceiling, so it is registered in one of the cells of the ray below it: walking that
+    # ray visits every solid that can contribute, and a maximum is indifferent to seeing
+    # one twice.
     def _surface_z(self, x: int, y: int, ceiling: int) -> int:
-        return max((b[5] for b in self.bounds if b[5] <= ceiling and b[0] <= x < b[3] and b[1] <= y < b[4]), default=0)
+        index, bounds = self.index, self.bounds
+        ix, iy, cells = x // index.cell_x, y // index.cell_y, index.cells
+        best = 0
+        for iz in range(-(-ceiling // index.cell_z)):
+            for position in cells.get((ix, iy, iz), ()):
+                b = bounds[position]
+                if best < b[5] <= ceiling and b[0] <= x < b[3] and b[1] <= y < b[4]: best = b[5]
+        return best
 
     def _surface_y(self, x: int, z: int, ceiling: int) -> int:
-        return max((b[4] for b in self.bounds if b[4] <= ceiling and b[0] <= x < b[3] and b[2] <= z < b[5]), default=0)
+        index, bounds = self.index, self.bounds
+        ix, iz, cells = x // index.cell_x, z // index.cell_z, index.cells
+        best = 0
+        for iy in range(-(-ceiling // index.cell_y)):
+            for position in cells.get((ix, iy, iz), ()):
+                b = bounds[position]
+                if best < b[4] <= ceiling and b[0] <= x < b[3] and b[2] <= z < b[5]: best = b[4]
+        return best
 
     def _surface_x(self, y: int, z: int, ceiling: int) -> int:
-        return max((b[3] for b in self.bounds if b[3] <= ceiling and b[1] <= y < b[4] and b[2] <= z < b[5]), default=0)
+        index, bounds = self.index, self.bounds
+        iy, iz, cells = y // index.cell_y, z // index.cell_z, index.cells
+        best = 0
+        for ix in range(-(-ceiling // index.cell_x)):
+            for position in cells.get((ix, iy, iz), ()):
+                b = bounds[position]
+                if best < b[3] <= ceiling and b[1] <= y < b[4] and b[2] <= z < b[5]: best = b[3]
+        return best
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,9 +551,19 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     bounds = state.bounds
     hull_shapes = state.hull_shapes
     index = state.index
+    nesting = item.item.nesting_height is not None
+    placement_offset = len(bounds) - len(placed)
+    reserve_check = container.void_fill_reserve_ratio > 0 and reserve_needs_candidate
+    usable = usable_volume(container) if reserve_check else 0
+    # Everything that decides whether a rule can fire is fixed for this call, so the chain
+    # is pruned once here rather than answered "allow" once per position. The support rule
+    # stays in regardless: `support_checks` counts every time the chain reaches it.
+    active = [(constraint, isinstance(constraint, SupportConstraint))
+              for constraint in active_constraints(constraints, container, item, stack_sensitive, route_sensitive)]
+    tracing = trace.active()
     if points is None:
         if item.item.nesting_height is None:
-            ordered = list(state.ordered_points[:config.max_candidate_points])
+            ordered = state.ordered_points[:config.max_candidate_points]
         else:
             merged = {(point.x, point.y, point.z): point
                       for point in (*state.ordered_points, *_nesting_points(state, item))}
@@ -531,14 +582,13 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
             stats.placements_attempted += 1
             x2, y2, z2 = x1 + dx, y1 + dy, z1 + dz
             if x2 > limit_x or y2 > limit_y or z2 > limit_z:
-                if trace.active():
+                if tracing:
                     trace.emit({"type": "filter", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "reason": "boundary"})
                 continue
             tentative = None
-            if item.item.nesting_height is not None:
+            if nesting:
                 position = Point(x1 + clearance, y1 + clearance, z1 + clearance)
                 tentative = Placement(item, position, rotation, physical, point, envelope)
-            placement_offset = len(bounds) - len(placed)
             blocked = False
             for candidate_index in index.query(x1, y1, z1, x2, y2, z2):
                 bx1, by1, bz1, bx2, by2, bz2 = bounds[candidate_index]
@@ -559,17 +609,17 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                     blocked = True
                     break
             if blocked:
-                if trace.active():
+                if tracing:
                     trace.emit({"type": "filter", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "reason": "collision"})
                 continue
             context = ConstraintContext(container, placed, item, point, rotation, physical, envelope, stack_sensitive, route_sensitive)
             rejected = False
-            for constraint in constraints:
-                if isinstance(constraint, SupportConstraint):
+            for constraint, counts_support in active:
+                if counts_support:
                     stats.support_checks += 1
                 result = constraint.evaluate(context)
                 if not result.allowed:
-                    if trace.active():
+                    if tracing:
                         trace.emit({"type": "placement_rejection", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "constraint": type(constraint).__name__, "code": result.code})
                     rejected = True
                     break
@@ -577,7 +627,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
             position = (tentative.position if tentative is not None
                         else Point(x1 + clearance, y1 + clearance, z1 + clearance))
             candidate = Candidate(point, position, rotation, physical, envelope, _candidate_score(state, point, envelope))
-            if container.void_fill_reserve_ratio > 0 and reserve_needs_candidate:
+            if reserve_check:
                 reserve_placement = tentative or Placement(
                     item, position, rotation, physical, point, envelope
                 )
@@ -590,17 +640,17 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                     upper_bound = state.used_volume_ticks + occupied_volume(reserve_placement)
                     projected_volume = (
                         upper_bound
-                        if upper_bound <= usable_volume(container)
+                        if upper_bound <= usable
                         else _used_volume_with_current_loads((*placed, reserve_placement))
                     )
                 else:
                     projected_volume = state.used_volume_ticks + used_volume_delta(
                         placed, reserve_placement
                     )
-                if projected_volume > usable_volume(container):
+                if projected_volume > usable:
                     continue
             stats.candidates_evaluated += 1
-            if trace.active():
+            if tracing:
                 trace.emit({"type": "score", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "score": list(candidate.score)})
             if max_candidates == 1:
                 if best is None or candidate.score < best.score: best = candidate

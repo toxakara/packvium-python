@@ -75,6 +75,20 @@ def test_a_constraint_that_refuses_everything_leaves_the_order_unpacked():
     assert result.containers == ()
 
 
+def test_an_extension_method_named_inert_for_does_not_opt_out_of_the_chain():
+    """Activity pruning is an internal built-in specification, not a duck-typed public
+    extension point whose name an unrelated constraint can accidentally collide with."""
+    class MisleadingConstraint(RejectEverything):
+        def inert_for(self, *_args):
+            return True
+
+    result = packer(placement_constraints=(MisleadingConstraint(),)).pack(
+        [item("a", 10, 10, 10)], [container("b", 100, 100, 100)])
+
+    assert not result.complete
+    assert result.containers == ()
+
+
 def test_a_custom_constraint_is_applied_at_every_candidate_point():
     items = [item("a", 40, 40, 40, quantity=8)]
     containers = [container("c", 100, 100, 100, quantity=4)]

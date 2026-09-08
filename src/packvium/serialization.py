@@ -109,6 +109,7 @@ def _container(raw: dict, unit: str) -> Container:
         tag_limits={str(k): int(v) for k, v in raw.get("tag_limits", {}).items()}, metadata=raw.get("metadata", {}),
         max_stack_density=None if raw.get("max_stack_density") is None else Weight.parse(raw["max_stack_density"]),
         axles=_axles(raw.get("axles"), unit),
+        access_directions=tuple(str(d) for d in raw.get("access_directions", ())),
     )
 
 
@@ -137,7 +138,12 @@ UNSUPPORTED_FIELDS: dict[str, tuple[str, ...]] = {
     # in , when Python gained both the solver behaviour and the independent validation
     # the staged rollout requires. PHP, Rust and the JavaScript fallback still carry them.
     "item": (),
-    "container": (),
+    # `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract
+    # freeze and is refused everywhere until an engine implements it from a request: a field
+    # a caller can set and the solver ignores is worse than a refusal.
+    # `access_directions` left this list in , which wired the reserved field through
+    # to `StopAccessibilityConstraint` in all four engines at once.
+    "container": ("pallet_overhang_limit",),
 }
 
 #: `item.shape_type` values this engine does not implement.

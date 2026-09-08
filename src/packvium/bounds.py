@@ -3,8 +3,8 @@
 The mathematics is fixed by [docs/OPTIMALITY-CERTIFICATES.md](../../../docs/OPTIMALITY-CERTIFICATES.md)
 and `scripts/optimality_bounds.py` is the independent oracle. This module is written from
 the document and never imports the oracle, so the property tests compare two
-implementations rather than one implementation with itself -- the discipline  set
-for irregular items and  restated here.
+implementations rather than one implementation with itself -- the discipline set
+for irregular items and restated here.
 
 What a bound is for. Every solver in this project is a heuristic: it returns an
 arrangement and has no notion of what it did not try. A bound is the other half of that
@@ -22,7 +22,7 @@ stop summing and every capacity argument built on them stops being a bound. The 
 are *dropped* rather than scaled -- a bound that is sometimes wrong is not a bound.
 
 `convex_hull` and `compressible` have exactly the same property and the document does not
-say so, because  was written before the irregular shapes existed. A hull occupies
+say so, because was written before the irregular shapes existed. A hull occupies
 its hull rather than its bounding box, and a compressible item gives up height under load;
 summing nominal box volumes over-states what a solution must carry, which over-states the
 container count.
