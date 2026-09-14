@@ -6,7 +6,7 @@ dependencies**, exact integer geometry.
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.1.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.2.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -66,6 +66,8 @@ in `constraints.py` have failed you.
 | [`shapes.py`](https://github.com/toxakara/packvium-python/blob/main/examples/shapes.py) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, and a cushion that compresses under load until the crush limit refuses it. |
 | [`nested.py`](https://github.com/toxakara/packvium-python/blob/main/examples/nested.py) | Units into cartons, cartons onto a pallet, in one call. |
 | [`commerce.py`](https://github.com/toxakara/packvium-python/blob/main/examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
+| [`execution.py`](https://github.com/toxakara/packvium-python/blob/main/examples/execution.py) | Turn a result into dock instructions: solver facts kept apart from screen text, a step order that is injected or honestly absent, and an operator lock that yields a second plan rather than editing the approved one. |
+| [`intelligence.py`](https://github.com/toxakara/packvium-python/blob/main/examples/intelligence.py) | Prove a carton change is worth publishing: two scenarios compared order by order, a proposal that refuses to exist on thin evidence, and a replay against held-out history where a cheaper packing your validator rejects still counts as a regression. |
 | [`extensions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/extensions.py) | A rule the schema has no field for — and an honest account of what you give up by writing one. |
 
 ```bash
@@ -88,6 +90,16 @@ PYTHONPATH=src python3 examples/objectives.py
   containers.
 - **Extensible.** Register your own constraints, item orderings, candidate scorers,
   container selectors or complete solvers.
+- **Work orders, not just coordinates.** `packvium.execution` turns a validated result
+  into a plan: solver facts kept apart from the text that cites them, an injected loading
+  order or an honest `unavailable`, and a canonical form four engines emit byte for byte.
+  `packvium.locks` lets an operator pin a placement and get a *second* plan beside the
+  approved one — never an edit of it, and never a placement the engine would refuse.
+- **Decide before you publish.** `packvium.simulation` and `packvium.recommendations`
+  compare two catalog scenarios order by order and propose a change only when the paired
+  cohort supports it; `packvium.holdout` replays that proposal against history it has not
+  seen. Python-only, and supported but not yet signature-frozen — see
+  [PUBLIC-API.md](https://github.com/toxakara/packvium-python/blob/main/docs/PUBLIC-API.md).
 
 ## Documentation
 

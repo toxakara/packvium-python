@@ -23,6 +23,11 @@ from packvium import (
     explain_unpacked_item,
 )
 
+#: An example must not change answer merely because the host was busy. These solves need
+#: a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+#: loaded machine cannot cut the multi-start portfolio short and let a different start win.
+SAFETY_FUSE_MS = 60_000
+
 items = [
     # `keep_upright` forbids every rotation that would tip the item over. An open tub of
     # paint is the usual reason.
@@ -84,7 +89,7 @@ containers = [
     ),
 ]
 
-result = Packer(PackingConfig.balanced()).pack(items, containers)
+result = Packer(PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS)).pack(items, containers)
 
 
 def millimetres(ticks: int) -> str:
@@ -135,7 +140,7 @@ else:
 def compare(rule: str, without: list[Item], with_rule: list[Item], containers: list[Container]) -> None:
     print(f"\n{rule}")
     for label, variant in (("without the rule", without), ("with the rule   ", with_rule)):
-        outcome = Packer(PackingConfig.balanced()).pack(variant, containers)
+        outcome = Packer(PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS)).pack(variant, containers)
         placements = sum(len(container.placements) for container in outcome.containers)
         print(
             f"  {label}: {len(outcome.containers)} container(s), "

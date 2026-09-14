@@ -20,6 +20,11 @@ from packvium import Container, Dimensions, Item, Length, Packer, PackingConfig
 from packvium.constraints import ConstraintContext, ConstraintResult
 from packvium.extensions import DefaultSolutionScorer, ExtensionRegistry
 
+#: An example must not change answer merely because the host was busy. These solves need
+#: a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+#: loaded machine cannot cut the multi-start portfolio short and let a different start win.
+SAFETY_FUSE_MS = 60_000
+
 # ---------------------------------------------------------------------------------
 # A custom placement constraint. `max_top_load` caps what may rest on an item, and
 # `must_be_on_floor` pins one to the bottom -- but neither says "nothing fragile above
@@ -61,14 +66,14 @@ items = [
 ]
 containers = [Container.create("column", Dimensions.mm("400", "400", "1300"), max_payload="200 kg", quantity=1)]
 
-unrestricted = Packer(PackingConfig.balanced()).pack(items, containers)
+unrestricted = Packer(PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS)).pack(items, containers)
 highest_vase = max(
     p.position.z for c in unrestricted.containers for p in c.placements if p.instance.item.id == "vase"
 )
 print("without the rule, the highest vase sits at", Length(highest_vase).decimal("mm"), "mm")
 
 restricted = Packer(
-    PackingConfig.balanced(),
+    PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS),
     ExtensionRegistry(placement_constraints=(FragileHeightLimit(Length.parse("400 mm")),)),
 ).pack(items, containers)
 
@@ -110,7 +115,7 @@ two_boxes = [Container.create("box", Dimensions.mm("400", "200", "200"), max_pay
 
 print()
 for label, scorer in (("default", None), ("evenly loaded", EvenlyLoadedContainers())):
-    result = Packer(PackingConfig.balanced(), solution_scorer=scorer).pack(lopsided_items, two_boxes)
+    result = Packer(PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS), solution_scorer=scorer).pack(lopsided_items, two_boxes)
     contents = [sorted(p.instance.item.id for p in c.placements) for c in result.containers]
     weights = [c.payload_weight.decimal("kg") + " kg" for c in result.containers]
     print(f"{label:>15}: {contents}  ->  {weights}")

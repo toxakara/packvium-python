@@ -538,6 +538,18 @@ def test_two_groups_stay_separate():
     assert group_batches([*left, *right]) == [left, right]
 
 
+def test_interleaved_groups_keep_first_occurrence_and_member_order():
+    first = instances("a", 10, 10, 10, quantity=2, group="00")
+    second = instances("b", 10, 10, 10, quantity=2, group="0")
+    third = instances("c", 10, 10, 10, quantity=2, group="1")
+    loose = instances("loose", 10, 10, 10, quantity=2)
+    ordered = [second[1], loose[0], third[0], first[1], second[0], first[0], loose[1], third[1]]
+    assert group_batches(ordered) == [
+        (second[1], second[0]), (loose[0],), third,
+        (first[1], first[0]), (loose[1],),
+    ]
+
+
 # --------------------------------------------------------------- maximal spaces
 
 def space(x, y, z, length, width, height) -> Space:
@@ -719,6 +731,45 @@ def test_a_wider_beam_returns_a_sorted_prefix():
     assert [c.score for c in top] == sorted(c.score for c in top)
 
 
+@pytest.mark.parametrize("width", [1, 2, 3, 7, 128])
+@pytest.mark.parametrize("clearance", [0, 1])
+def test_bounded_candidates_preserve_full_sort_ties_work_and_trace(width, clearance):
+    from packvium.constraints import ConstraintResult
+    from packvium.trace import use_trace
+
+    class RecordingConstraint:
+        def __init__(self):
+            self.calls = []
+
+        def evaluate(self, context):
+            self.calls.append((context.point, context.rotation))
+            return ConstraintResult.allow()
+
+    config, constraints = config_and_constraints(clearance=Length.mm(clearance))
+    state = ContainerState(Container.create("c", Dimensions.mm(100, 100, 100)), 1)
+    item, = instances("a", 30, 20, 10)
+    # On a square base, swapped horizontal rotations have exactly equal scores.
+    # Later x origins improve the score, so the bounded selection must also evict.
+    points = [Point(Length.mm(x).ticks, 0, 0) for x in (95, 40, 20, 0)]
+    rule = RecordingConstraint()
+    full_stats, bounded_stats = SearchStats(), SearchStats()
+    full_trace, bounded_trace = [], []
+    with use_trace(full_trace.append):
+        every = find_candidates(state, item, config, (*constraints, rule), full_stats,
+                                generous(), None, points=points)
+    full_calls = rule.calls[:]
+    rule.calls.clear()
+    with use_trace(bounded_trace.append):
+        selected = find_candidates(state, item, config, (*constraints, rule), bounded_stats,
+                                   generous(), width, points=points)
+
+    assert len({candidate.score for candidate in every}) < len(every)
+    assert selected == every[:width]
+    assert bounded_stats == full_stats
+    assert bounded_trace == full_trace
+    assert rule.calls == full_calls
+
+
 def test_an_item_that_cannot_fit_yields_no_candidate():
     config, constraints = config_and_constraints()
     state = ContainerState(Container.create("c", Dimensions.mm(10, 10, 10)), 1)
@@ -792,6 +843,20 @@ def test_the_lattice_admits_a_declared_type_that_is_a_rotation_of_another():
     purposes -- a real catalog pattern (the same carton listed under two SKUs)."""
     swapped = instances("b", 12, 6, 20)  # "a" is 6x12x20; this is length/width swapped.
     assert GridSolver().supports([*instances("a", 6, 12, 20, quantity=11), *swapped])
+
+
+def test_lattice_profile_checks_survive_interleaved_aliases_and_reuse():
+    first = instances("same-id", 6, 12, 20, quantity=2)
+    alias = instances("alias", 12, 6, 20, quantity=2)
+    # Direct solver callers can supply different immutable objects sharing an id.
+    # Identity reuse must never become an id-based assumption about their geometry.
+    different = instances("same-id", 7, 12, 20)
+    ordered = [first[0], alias[0], first[1], alias[1]]
+    solver = GridSolver()
+    assert solver.supports(ordered)
+    assert not solver.supports([*ordered, *different])
+    assert solver.supports(alias)
+    assert not solver.supports([])
 
 
 def test_the_lattice_keeps_different_declared_nesting_types_out_of_one_column():

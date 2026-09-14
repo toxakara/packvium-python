@@ -659,6 +659,24 @@ def test_appending_a_unit_matches_a_rebuild_across_scene_shapes(coordinates, ext
         for unit in units[1:]:
             graph = graph.with_unit(unit, cell_hint=hint)
         assert _edges(graph, count) == _edges(LoadSupportGraph(units), count)
+        expected_order = tuple(sorted(
+            range(count), key=lambda i: (-units[i].box.z2, -units[i].box.origin.z, i)
+        ))
+        assert graph._descending_indices() == expected_order
+
+
+def test_candidate_load_order_preserves_height_ties_and_sibling_independence():
+    units = [unit(0, 0, 9, 1, 1, 1), unit(10, 0, 0, 1, 1, 10), unit(20, 0, 8, 1, 1, 2)]
+    base = LoadSupportGraph(units)
+    assert base._descending_indices() == (0, 2, 1)
+    above = base.with_unit(unit(30, 0, 10, 1, 1, 1))
+    below = base.with_unit(unit(30, 0, 0, 1, 1, 1))
+    tied = base.with_unit(unit(30, 0, 8, 1, 1, 2))
+    assert above._descending_indices() == (3, 0, 2, 1)
+    assert below._descending_indices() == (0, 2, 1, 3)
+    assert tied._descending_indices() == (0, 2, 3, 1)
+    assert base._descending_indices() == (0, 2, 1)
+    assert LoadSupportGraph([])._descending_indices() == ()
 
 
 def test_a_nesting_unit_is_met_with_a_full_rebuild(monkeypatch):
@@ -679,6 +697,7 @@ def test_a_nesting_unit_is_met_with_a_full_rebuild(monkeypatch):
 
     assert builds == [1, 2, 3]
     assert _edges(graph, 3) == _edges(LoadSupportGraph((*stack, arriving)), 3)
+    assert graph._descending_indices() == (2, 1, 0)
 
 
 # --------------------------------------------------------- stacked-item counting

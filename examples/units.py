@@ -89,7 +89,10 @@ print("400mm cube = 64,000 cm^3 / 5,000 =", billed.decimal("kg"), "kg dimensiona
 print()
 print("on the wire:", Length.parse("12 3/8 in").to_dict(), Weight.parse("2 3/4 lb").to_dict())
 
-result = Packer(PackingConfig.balanced()).pack(
+# An example must not change answer merely because the host was busy. This solve needs
+# a fraction of the budget below; the generous wall-clock value is only a safety fuse, so
+# a loaded machine cannot cut the multi-start portfolio short and let a different start win.
+result = Packer(PackingConfig.balanced(time_limit_ms=60_000)).pack(
     [Item.create("shelf", Dimensions.inches("12 3/8", "9 1/2", "3/4"), "2 3/4 lb", quantity=3)],
     [Container.create("carton", Dimensions.inches("13", "10", "4"), max_payload="20 lb")],
 )
