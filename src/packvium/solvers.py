@@ -6,7 +6,7 @@ import heapq
 
 from ._compat import dataclass
 from time import monotonic_ns
-from typing import Callable, Iterable, Protocol, Sequence
+from typing import Callable, Iterable, Protocol, Sequence, cast
 
 from .axle_load import axle_balanced_origins
 from .config import PackingConfig
@@ -575,6 +575,8 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
         ordered = sorted(points, key=lambda p: (p.z, p.y, p.x))
     candidates: list[Candidate] = []
     best: Candidate | None = None
+    retained: list[tuple[tuple[int, ...], int, Candidate]] = []
+    bounded = max_candidates is not None and max_candidates > 1
     for point in ordered:
         deadline.check()
         stats.candidate_points_considered += 1
@@ -625,10 +627,11 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                     rejected = True
                     break
             if rejected: continue
-            position = (tentative.position if tentative is not None
-                        else Point(x1 + clearance, y1 + clearance, z1 + clearance))
-            candidate = Candidate(point, position, rotation, physical, envelope, _candidate_score(state, point, envelope))
+            score = _candidate_score(state, point, envelope)
+            position = tentative.position if tentative is not None else None
             if reserve_check:
+                if position is None:
+                    position = Point(x1 + clearance, y1 + clearance, z1 + clearance)
                 reserve_placement = tentative or Placement(
                     item, position, rotation, physical, point, envelope
                 )
@@ -652,20 +655,31 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                     continue
             stats.candidates_evaluated += 1
             if tracing:
-                trace.emit({"type": "score", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "score": list(candidate.score)})
+                trace.emit({"type": "score", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "score": list(score)})
+            # Keep every check, counter and trace event, but materialize only candidates
+            # that survive selection. Equal scores keep the earlier enumeration entry.
+            if max_candidates == 1 and best is not None and score >= best.score:
+                continue
+            if bounded and len(retained) == max_candidates and score >= retained[0][2].score:
+                continue
+            if position is None:
+                position = Point(x1 + clearance, y1 + clearance, z1 + clearance)
+            candidate = Candidate(point, position, rotation, physical, envelope, score)
             if max_candidates == 1:
-                if best is None or candidate.score < best.score: best = candidate
+                best = candidate
+            elif bounded:
+                # Negate the full integer key and ordinal so heapq's root is the worst
+                # retained entry, including the latest entry in a stable-sort tie.
+                entry = (tuple(-value for value in score), -stats.candidates_evaluated, candidate)
+                if len(retained) < max_candidates:
+                    heapq.heappush(retained, entry)
+                else:
+                    heapq.heapreplace(retained, entry)
             else: candidates.append(candidate)
     if max_candidates == 1: return [] if best is None else [best]
-    if max_candidates is not None and len(candidates) > max_candidates:
-        # Top-k selection avoids an O(f log f) full sort when the beam only consumes
-        # k candidates.  Enumerated insertion order is the deterministic tie-break.
-        selected = heapq.nsmallest(
-            max_candidates,
-            enumerate(candidates),
-            key=lambda entry: (entry[1].score, entry[0]),
-        )
-        return [candidate for _, candidate in selected]
+    if bounded:
+        return [entry[2] for entry in sorted(retained, reverse=True)]
+    if max_candidates is not None: return []
     candidates.sort(key=lambda c: c.score)
     return candidates
 
@@ -690,17 +704,28 @@ def group_batches(items: Sequence[ItemInstance]) -> list[tuple[ItemInstance, ...
     A batch that does not fit is rejected as a whole and leaves the rest of the order
     untouched -- an impossible group must never strand unrelated items.
     """
-    batches: list[tuple[ItemInstance, ...]] = []
-    seen: set[str] = set()
+    batches: list[tuple[ItemInstance, ...] | list[ItemInstance]] = []
+    groups: dict[str, list[ItemInstance]] = {}
     for item in items:
         group = item.item.group
         if group is None:
             batches.append((item,))
             continue
-        if group in seen: continue
-        seen.add(group)
-        batches.append(tuple(other for other in items if other.item.group == group))
-    return batches
+        members = groups.get(group)
+        if members is None:
+            members = [item]
+            groups[group] = members
+            batches.append(members)
+        else:
+            members.append(item)
+    # Output slots follow first appearance, and members follow input order. Freeze
+    # grouped buckets in place, releasing the lookup before allocating the tuples.
+    if groups:
+        groups.clear()
+        for position, batch in enumerate(batches):
+            if isinstance(batch, list):
+                batches[position] = tuple(batch)
+    return cast(list[tuple[ItemInstance, ...]], batches)
 
 
 def _place_batch(state: ContainerState, batch: Sequence[ItemInstance], config: PackingConfig, constraints: Sequence[PlacementConstraint], stats: SearchStats, deadline: Deadline, width: int | None):
@@ -995,7 +1020,18 @@ class GridSolver:
     order_insensitive = True
 
     def supports(self, items: Sequence[ItemInstance]) -> bool:
-        return bool(items) and len({_lattice_profile(i.item) for i in items}) == 1
+        if not items: return False
+        prototype = items[0].item
+        profile = _lattice_profile(prototype)
+        previous = prototype
+        for instance in items:
+            item = instance.item
+            # Quantities reuse an immutable Item; only a different object can bring
+            # a different profile. Keep one profile instead of materializing a set.
+            if item is not prototype and item is not previous and _lattice_profile(item) != profile:
+                return False
+            previous = item
+        return True
 
     def pack_one(self, container, sequence, items, config, stats, deadline):
         if container.obstacles or not items or not self.supports(items):

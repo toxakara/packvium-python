@@ -267,7 +267,7 @@ class LoadSupportGraph:
     order, preserving ContactGraph's integer-remainder and traversal contract.
     """
 
-    __slots__ = ("_supporters", "_children", "_face", "_units", "_nested")
+    __slots__ = ("_supporters", "_children", "_face", "_units", "_nested", "_descending", "_prior_descending")
 
     def __init__(self, units: Sequence[LoadUnit], cell_hint: int = 1):
         face = ContactGraph([unit.box for unit in units], cell_hint=cell_hint)
@@ -289,9 +289,11 @@ class LoadSupportGraph:
         self._face = face
         self._units = tuple(units)
         self._nested = bool(nesting)
+        self._descending: tuple[int, ...] | None = None
+        self._prior_descending: tuple[int, ...] | None = None
         if not nesting:
-            self._supporters = tuple(face.supporters(index) for index in range(len(units)))
-            self._children = tuple(face.children(index) for index in range(len(units)))
+            self._supporters = ()
+            self._children = ()
             return
         supporters = [list(face.supporters(index)) for index in range(len(units))]
         for lower, upper in zip(nesting, nesting[1:]):
@@ -343,24 +345,51 @@ class LoadSupportGraph:
         """
         if self._nested or unit.nesting_item_id is not None:
             return LoadSupportGraph(self._units + (unit,), cell_hint=cell_hint)
-        index = len(self._units)
         face = self._face.with_box(unit.box)
         # Without nesting this graph *is* the face graph, so read the edges straight off
         # it rather than patching a copy of the old ones. Re-deriving them by hand would
         # be a second implementation of the same rule, free to drift from the first.
         graph = LoadSupportGraph.__new__(LoadSupportGraph)
-        graph._supporters = tuple(face.supporters(i) for i in range(index + 1))
-        graph._children = tuple(face.children(i) for i in range(index + 1))
+        graph._supporters = ()
+        graph._children = ()
         graph._face = face
         graph._units = self._units + (unit,)
         graph._nested = False
+        graph._descending = None
+        graph._prior_descending = self._descending_indices()
         return graph
 
+    def _descending_indices(self) -> tuple[int, ...]:
+        """Canonical load order, sharing the settled order across candidate siblings."""
+        if self._descending is not None:
+            return self._descending
+        if self._prior_descending is None:
+            self._descending = tuple(sorted(
+                range(len(self._units)),
+                key=lambda i: (-self._units[i].box.z2, -self._units[i].box.origin.z, i),
+            ))
+            return self._descending
+        order = self._prior_descending
+        index = len(self._units) - 1
+        box = self._units[index].box
+        key = (-box.z2, -box.origin.z, index)
+        lo, hi = 0, len(order)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            other = order[mid]
+            other_box = self._units[other].box
+            if key < (-other_box.z2, -other_box.origin.z, other):
+                hi = mid
+            else:
+                lo = mid + 1
+        self._descending = order[:lo] + (index,) + order[lo:]
+        return self._descending
+
     def supporters(self, index: int) -> tuple[ContactEdge, ...]:
-        return self._supporters[index]
+        return self._supporters[index] if self._nested else self._face.supporters(index)
 
     def children(self, index: int) -> tuple[int, ...]:
-        return self._children[index]
+        return self._children[index] if self._nested else self._face.children(index)
 
 
 def non_stackable_failure(
@@ -402,7 +431,7 @@ def top_loads(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = None) 
     """
     graph = graph if graph is not None else LoadSupportGraph(units)
     loads = [0] * len(units)
-    descending = sorted(range(len(units)), key=lambda i: (-units[i].box.z2, -units[i].box.origin.z, i))
+    descending = graph._descending_indices()
     for upper_index in descending:
         supports = graph.supporters(upper_index)
         total_area = sum(edge.area for edge in supports)

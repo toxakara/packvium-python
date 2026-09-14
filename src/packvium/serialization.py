@@ -198,7 +198,8 @@ def reject_unsupported(
     )
 
 
-def pack_from_dict(data: dict) -> dict:
+def pack_from_dict(data: dict, *,
+                   extensions: ExtensionRegistry | None = None) -> dict:
     reject_unsupported(data)
     unit = data.get("units", {}).get("length", "mm"); cfg = data.get("configuration", {})
     profile = SolverProfile(cfg.get("solver_profile", "balanced"))
@@ -224,8 +225,18 @@ def pack_from_dict(data: dict) -> dict:
     # Rules compile into this engine's own constraint pipeline rather than post-filtering
     # a chosen answer: an illegal candidate is rejected during search, so the packing that
     # wins was never allowed to be illegal in the first place.
+    # A caller's extensions are *added to* the compiled policy rules, never substituted for
+    # them. Replacing would let an operator lock silently drop a policy rule the
+    # request asked for, which is the one thing a lock must not be able to do.
+    supplied = extensions or ExtensionRegistry()
     extensions = ExtensionRegistry(
-        placement_constraints=PolicyRuleSet.from_dict(data.get("policy")).constraints()
+        placement_constraints=(
+            *PolicyRuleSet.from_dict(data.get("policy")).constraints(),
+            *supplied.placement_constraints,
+        ),
+        item_order_strategies=supplied.item_order_strategies,
+        solvers=supplied.solvers,
+        container_selector=supplied.container_selector,
     )
     result = Packer(config, extensions).pack([_item(i, unit) for i in data["items"]], [_container(c, unit) for c in data["containers"]])
     result = replace(result, catalog_versions_used=references)

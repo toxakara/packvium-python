@@ -32,7 +32,7 @@ def summarise(label: str, request: dict) -> None:
     `pack_from_dict` answers in the same JSON shape the other three engines return, so
     everything read here is the cross-language contract rather than a Python attribute.
     """
-    result = pack_from_dict(request)
+    result = pack_from_dict({**request, **SAFETY_FUSE})
     containers = result["containers"]
     placed = sum(len(container["placements"]) for container in containers)
     print(
@@ -48,6 +48,10 @@ def crate(length: str, width: str, height: str) -> list:
 
 
 MM = {"units": {"length": "mm"}}
+# An example must not change answer merely because the host was busy. These solves need a
+# fraction of the budget; the generous wall-clock value is only a safety fuse, so a loaded
+# machine cannot cut the multi-start portfolio short and let a different start win.
+SAFETY_FUSE = {"configuration": {"time_limit_ms": 60_000}}
 
 
 # ------------------------------------------------------------------ convex_hull
@@ -125,7 +129,7 @@ def brick(kilograms: int) -> dict:
 
 def load(label: str, kilograms: int) -> None:
     """One crate, one cushion, one brick -- only the brick's mass changes."""
-    result = pack_from_dict({**MM, "items": [cushion(100), brick(kilograms)],
+    result = pack_from_dict({**MM, **SAFETY_FUSE, "items": [cushion(100), brick(kilograms)],
                              "containers": crate("100", "100", "200")})
     unused = result["score"][3]
     print(f"  {label:22s} {len(result['containers'])} container(s), "

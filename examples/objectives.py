@@ -17,6 +17,11 @@ Ratios are parts per million. See docs/OBJECTIVE.md for the full key ordering.
 from packvium import Container, Dimensions, Item, Packer, PackingConfig
 from packvium.models import RateTable, UnratedWeightError
 
+#: An example must not change answer merely because the host was busy. These solves need
+#: a fraction of the budget; the generous wall-clock value is only a safety fuse, so a
+#: loaded machine cannot cut the multi-start portfolio short and let a different start win.
+SAFETY_FUSE_MS = 60_000
+
 WIDGETS = [Item.create("widget", Dimensions.mm("100", "100", "100"), "500 g", quantity=8)]
 
 
@@ -32,14 +37,14 @@ def solve(config: PackingConfig, containers) -> tuple[str, tuple[int, ...]]:
 snug = Container.create("snug", Dimensions.mm("300", "300", "300"), max_payload="20 kg", cost_minor=500)
 roomy = Container.create("roomy", Dimensions.mm("400", "400", "400"), max_payload="20 kg", cost_minor=150)
 
-print("default          ", solve(PackingConfig.balanced(), [snug, roomy]))
+print("default          ", solve(PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS), [snug, roomy]))
 
 # ---------------------------------------------------------------------------------
 # `lowest_cost` -- the cheapest *packaging*. `cost_minor` is what the box itself costs
 # you, so this is the objective for a warehouse buying cartons, not for a shipper paying
 # a carrier. Here it prefers the roomy box precisely because the snug one costs more.
 # ---------------------------------------------------------------------------------
-print("lowest_cost      ", solve(PackingConfig(objective="lowest_cost"), [snug, roomy]))
+print("lowest_cost      ", solve(PackingConfig(objective="lowest_cost", time_limit_ms=SAFETY_FUSE_MS), [snug, roomy]))
 
 # ---------------------------------------------------------------------------------
 # `shipping_cost` -- carrier-billable *weight*. Billed weight is the greater of actual
@@ -55,6 +60,7 @@ by_weight = PackingConfig(
     dimensional_weight_divisor=5000,
     dimensional_weight_length_unit="cm",
     dimensional_weight_weight_unit="kg",
+    time_limit_ms=SAFETY_FUSE_MS,
 )
 print("shipping_cost    ", solve(by_weight, [snug, roomy]))
 
@@ -80,6 +86,7 @@ by_money = PackingConfig(
     dimensional_weight_divisor=5000,
     dimensional_weight_length_unit="cm",
     dimensional_weight_weight_unit="kg",
+    time_limit_ms=SAFETY_FUSE_MS,
 )
 print("landed_cost      ", solve(by_money, [dear_per_gram, cheap_per_gram]))
 
@@ -98,7 +105,7 @@ except UnratedWeightError as refusal:
 # `open_dimension_height` -- pack into the shortest stack. For a container with no lid,
 # or a pallet whose height you are trying to keep under a doorway.
 # ---------------------------------------------------------------------------------
-print("open_dimension   ", solve(PackingConfig(objective="open_dimension_height"), [snug, roomy]))
+print("open_dimension   ", solve(PackingConfig(objective="open_dimension_height", time_limit_ms=SAFETY_FUSE_MS), [snug, roomy]))
 
 # ---------------------------------------------------------------------------------
 # `maximum_value` -- when not everything fits, leave the *cheap* things behind. Ranked by
@@ -112,7 +119,7 @@ mixed = [
     Item.create("gold", Dimensions.mm("100", "100", "100"), "500 g", quantity=2, value=90_000),
     Item.create("gravel", Dimensions.mm("100", "100", "100"), "500 g", quantity=2, value=10),
 ]
-result = Packer(PackingConfig(objective="maximum_value")).pack(mixed, tiny)
+result = Packer(PackingConfig(objective="maximum_value", time_limit_ms=SAFETY_FUSE_MS)).pack(mixed, tiny)
 kept = sorted(p.instance.item.id for c in result.containers for p in c.placements)
 left = sorted(u.instance.item.id for u in result.unpacked)
 print("maximum_value    ", "packed:", kept, "left behind:", left)
