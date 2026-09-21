@@ -253,10 +253,12 @@ def _resolve_effective(versions: list[Tariff], *, as_of: int) -> Optional[Tariff
     """Same effective-dating resolution `packvium.commerce.catalog`'s `CatalogRegistry`
     and `packvium.commerce.policy`'s `PolicyRegistry` use: the highest `effective_at` not
     after `as_of`, ties broken by the higher (later-published) version."""
-    candidates = [v for v in versions if v.effective_at <= as_of]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda v: (v.effective_at, v.version))
+    winner = None
+    for candidate in versions:
+        if candidate.effective_at <= as_of and (winner is None or
+                (candidate.effective_at, candidate.version) > (winner.effective_at, winner.version)):
+            winner = candidate
+    return winner
 
 
 class CarrierRegistry:
@@ -290,10 +292,13 @@ class CarrierRegistry:
         return tariff
 
     def versions(self, carrier_id: str, service_id: str) -> tuple[Tariff, ...]:
+        return tuple(self._history(carrier_id, service_id))
+
+    def _history(self, carrier_id: str, service_id: str) -> list[Tariff]:
         key = (carrier_id, service_id)
         if key not in self._versions:
             raise TariffNotFoundError(f"no tariff registered for {carrier_id}/{service_id}")
-        return tuple(self._versions[key])
+        return self._versions[key]
 
     def tariff(self, carrier_id: str, service_id: str, version: int) -> Tariff:
         """Resolve one immutable tariff version without performing a rating.
@@ -302,9 +307,14 @@ class CarrierRegistry:
         the same pinned object, avoiding an ``O(h)`` history scan per candidate where
         ``h`` is the number of published tariff versions.
         """
-        for tariff in self.versions(carrier_id, service_id):
-            if tariff.version == version:
-                return tariff
+        history = self._history(carrier_id, service_id)
+        if type(version) is int:
+            if 1 <= version <= len(history):
+                return history[version - 1]
+        else:
+            for tariff in history:
+                if tariff.version == version:
+                    return tariff
         raise TariffNotFoundError(f"{carrier_id}/{service_id} has no version {version}")
 
     def effective_tariff(self, carrier_id: str, service_id: str, *, as_of: int) -> Tariff:
@@ -314,7 +324,7 @@ class CarrierRegistry:
         to report *which* resolution step failed, or that evaluates many requests
         against one instant, resolves once here instead of re-scanning the history.
         """
-        tariff = _resolve_effective(list(self.versions(carrier_id, service_id)), as_of=as_of)
+        tariff = _resolve_effective(self._history(carrier_id, service_id), as_of=as_of)
         if tariff is None:
             raise TariffNotFoundError(
                 f"{carrier_id}/{service_id} has no tariff version effective as of {as_of}"

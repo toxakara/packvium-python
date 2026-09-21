@@ -883,6 +883,7 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
         else:
             greedy_unplaced = (*greedy_unplaced, *batch)
     incumbent: tuple[ContainerState, tuple[ItemInstance, ...]] = (greedy, greedy_unplaced)
+    incumbent_key = _node_key(incumbent)
     for position, batch in enumerate(batches):
         expansions: list[tuple[ContainerState, tuple[ItemInstance, ...]]] = []
         exhausted = False
@@ -909,8 +910,10 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
         future = tuple(item for later in batches[position + 1:] for item in later)
         for state, unplaced in expansions:
             candidate = (state, (*unplaced, *future))
-            if _node_key(candidate) < _node_key(incumbent):
+            candidate_key = _node_key(candidate)
+            if candidate_key < incumbent_key:
                 incumbent = candidate
+                incumbent_key = candidate_key
         if not expansions:
             break
         expansions.sort(key=lambda node: _node_key(node, future))
@@ -923,7 +926,7 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
             state, unplaced = incumbent
             return SingleContainerSolution(state, unplaced, False, deadline.expired)
     completed = min(beam, key=_node_key) if beam else incumbent
-    state, unplaced = min((completed, incumbent), key=_node_key)
+    state, unplaced = completed if _node_key(completed) <= incumbent_key else incumbent
     return SingleContainerSolution(state, unplaced)
 
 

@@ -31,8 +31,9 @@ the rendering the same `exactScalar` also carries.
 
 from __future__ import annotations
 
-import json
 from typing import Any, Mapping, Optional, Sequence
+
+from ._canonical_json import canonical_json
 
 __all__ = [
     "FORMAT",
@@ -237,5 +238,10 @@ def canonical_plan_json(plan: Mapping[str, Any]) -> str:
     Cross-language equality is asserted on this string rather than on a parsed object, so
     key order and whitespace cannot make two identical plans look different -- the same
     discipline `packvium.commerce.canonical_json` applies to a quote.
+
+    The spelling is RFC 8785, shared with the operational artifact. Until 1.3.0 this
+    was `json.dumps(sort_keys=True)`, which is the same bytes for every plan an engine emits
+    but not for a string holding U+2028, a key outside the Basic Multilingual Plane, or a
+    float, where the four adapters disagreed.
     """
-    return json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return canonical_json(plan)
