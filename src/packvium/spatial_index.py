@@ -19,6 +19,7 @@ final word.
 
 from __future__ import annotations
 
+from itertools import chain
 from typing import Iterable, Sequence
 
 Bound = tuple[int, int, int, int, int, int]
@@ -117,14 +118,7 @@ class SpatialIndex:
                     if bucket: hits.append(bucket)
         if not hits: return ()
         if len(hits) == 1: return hits[0]
-        seen: set[int] = set()
-        found: list[int] = []
-        for bucket in hits:
-            for index in bucket:
-                if index not in seen:
-                    seen.add(index)
-                    found.append(index)
-        return found
+        return list(dict.fromkeys(chain.from_iterable(hits)))
 
 
 def build(bounds: Iterable[Bound], length_ticks: int, width_ticks: int, height_ticks: int) -> SpatialIndex:

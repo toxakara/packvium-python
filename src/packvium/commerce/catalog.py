@@ -45,7 +45,9 @@ these exact objects. See docs/COMMERCE-API.md for the wrapper contract built on 
 from __future__ import annotations
 
 from .._compat import dataclass
+from dataclasses import fields
 from enum import Enum
+from types import MappingProxyType
 from typing import Sequence
 
 
@@ -220,8 +222,12 @@ def _find(entries: Sequence, id: str, kind: CatalogEntryKind):
     raise CatalogEntryNotFoundError(f"no {kind.value} with id {id!r} in this catalog snapshot")
 
 
+class _SnapshotLookupCache:
+    __slots__ = ("_entry_indexes",)
+
+
 @dataclass(frozen=True, slots=True)
-class CatalogSnapshot:
+class CatalogSnapshot(_SnapshotLookupCache):
     """The complete, immutable content of one catalog version: every item, carton and
     pallet master record, exclusion rule and facility override active under that version.
 
@@ -245,13 +251,40 @@ class CatalogSnapshot:
         _require_unique_ids("facility override", self.overrides)
 
     def item(self, id: str) -> ItemMaster:
-        return _find(self.items, id, CatalogEntryKind.ITEM)
+        return self._lookup(self.items, id, CatalogEntryKind.ITEM, ItemMaster)
 
     def carton(self, id: str) -> CartonMaster:
-        return _find(self.cartons, id, CatalogEntryKind.CARTON)
+        return self._lookup(self.cartons, id, CatalogEntryKind.CARTON, CartonMaster)
 
     def pallet(self, id: str) -> PalletMaster:
-        return _find(self.pallets, id, CatalogEntryKind.PALLET)
+        return self._lookup(self.pallets, id, CatalogEntryKind.PALLET, PalletMaster)
+
+
+    def _lookup(self, entries, id, kind, entry_type):
+        if type(entries) is not tuple:
+            return _find(entries, id, kind)
+        indexes = getattr(self, "_entry_indexes", {})
+        index = indexes.get(kind)
+        if index is None:
+            index = (MappingProxyType({entry.id: entry for entry in entries})
+                     if all(type(entry) is entry_type and type(entry.id) is str for entry in entries)
+                     else False)
+            object.__setattr__(self, "_entry_indexes", {**indexes, kind: index})
+        if index is False or type(id) is not str:
+            return _find(entries, id, kind)
+        try:
+            return index[id]
+        except KeyError:
+            raise CatalogEntryNotFoundError(f"no {kind.value} with id {id!r} in this catalog snapshot") from None
+
+    def __getstate__(self):
+        # Derived indexes are not part of the value, serialization or a copied snapshot.
+        return [getattr(self, field.name) for field in fields(self)]
+
+    def __setstate__(self, state):
+        # Also accept the dictionary state produced by older non-slotted runtimes.
+        for index, field in enumerate(fields(self)):
+            object.__setattr__(self, field.name, state[field.name] if isinstance(state, dict) else state[index])
 
 
 # ------------------------------------------------------------------------------- version
@@ -451,18 +484,26 @@ class CatalogRegistry:
             if not self._versions:
                 raise CatalogVersionNotFoundError(f"catalog {self._catalog_id!r} has no published versions")
             return self._versions[0]
-        candidates = [v for v in self._versions if v.effective_at <= as_of]
-        if not candidates:
+        target = None
+        for candidate in self._versions:
+            if candidate.effective_at <= as_of and (target is None or candidate.effective_at >= target.effective_at):
+                target = candidate
+        if target is None:
             raise NoEffectiveCatalogVersionError(
                 f"catalog {self._catalog_id!r} has no version effective as of {as_of}"
             )
         # Ties in effective_at are broken by the higher (later-published) version number,
         # so a same-instant correction or rollback deterministically wins rather than
         # being ambiguous.
-        return max(candidates, key=lambda v: (v.effective_at, v.number))
+        return target
 
     def _version(self, number: int) -> CatalogVersion:
-        for v in self._versions:
-            if v.number == number:
-                return v
+        if type(number) is int:
+            if 1 <= number <= len(self._versions):
+                return self._versions[number - 1]
+        else:
+            # Preserve equality-based resolution for existing non-int callers.
+            for v in self._versions:
+                if v.number == number:
+                    return v
         raise CatalogVersionNotFoundError(f"catalog {self._catalog_id!r} has no version {number}")

@@ -180,3 +180,22 @@ class TestTheReportTypeGuardsItsOwnClaims:
     def test_no_winner_alongside_a_frontier_of_two_is_well_formed(self):
         report = ProfileReport(profile="fast", pareto_optimal=("php", "python"), dominated=())
         assert report.winner is None
+
+
+def test_prepared_frontiers_match_independent_pairwise_comparison():
+    import random
+
+    rng = random.Random(914)
+    values = [-float('inf'), -(10 ** 100), -1, -0.0, 0, 1, 10 ** 100, float('inf')]
+    for dimension in (1, 2, 3, 5):
+        for scene in range(30):
+            directions = {f'axis{i}': bool(rng.randrange(2)) for i in range(dimension)}
+            candidates = [CandidateResult('p', str(i), {axis: rng.choice(values) for axis in directions})
+                          for i in range(2 + scene * 2)]
+            expected = tuple(sorted(candidate.engine for candidate in candidates
+                                    if not any(other is not candidate and dominates(other.metrics, candidate.metrics, directions)
+                                               for other in candidates)))
+            report, = generate_report(candidates, directions)
+            assert report.pareto_optimal == expected
+            assert report.dominated == tuple(sorted(set(c.engine for c in candidates) - set(expected)))
+            assert generate_report(list(reversed(candidates)), directions) == (report,)

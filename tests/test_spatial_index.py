@@ -113,3 +113,12 @@ def test_a_box_spanning_many_cells_is_found_from_any_of_them():
     index.add(0, big)
     for x in (0, 200, 400, 600, 790):
         assert 0 in set(index.query(x, 0, 0, x + 5, 5, 5)), x
+
+
+def test_multi_bucket_collection_preserves_first_appearance():
+    index = SpatialIndex(80, 80, 80)
+    index.cells[(0, 0, 0)] = (3, 1)
+    index.cells[(1, 0, 0)] = (1, 2, 3)
+    assert index.query(0, 0, 0, 20, 1, 1) == [3, 1, 2]
+    assert index.query(0, 0, 0, 1, 1, 1) is index.cells[(0, 0, 0)]
+    assert index.query(70, 70, 70, 80, 80, 80) == ()

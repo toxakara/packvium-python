@@ -139,7 +139,7 @@ def dominates(a: Mapping[str, float], b: Mapping[str, float], higher_is_better: 
     return at_least_as_good and strictly_better_somewhere
 
 
-def _pareto_frontier(candidates: Sequence[CandidateResult], higher_is_better: Mapping[str, bool]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _pairwise_frontier(candidates: Sequence[CandidateResult], higher_is_better: Mapping[str, bool]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     optimal: list[str] = []
     dominated: list[str] = []
     for candidate in candidates:
@@ -149,6 +149,52 @@ def _pareto_frontier(candidates: Sequence[CandidateResult], higher_is_better: Ma
         )
         (dominated if is_dominated else optimal).append(candidate.engine)
     return tuple(sorted(optimal)), tuple(sorted(dominated))
+
+
+def _pareto_frontier(candidates: Sequence[CandidateResult], higher_is_better: Mapping[str, bool]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    axes = tuple(higher_is_better.items())
+    # Keep the public comparison path for invalid or custom numeric inputs, including
+    # its historical error order. Caller mappings may have changed since construction.
+    if len(candidates) < 2 or any(
+        any(axis not in candidate.metrics for axis, _ in axes)
+        or any(type(value) not in (int, float) or (isinstance(value, float) and math.isnan(value))
+               for value in candidate.metrics.values())
+        for candidate in candidates
+    ):
+        return _pairwise_frontier(candidates, higher_is_better)
+    vectors = [tuple(-candidate.metrics[axis] if higher else candidate.metrics[axis]
+                     for axis, higher in axes) for candidate in candidates]
+    if len(axes) == 2:
+        optimal_indices = _two_axis_frontier(vectors)
+    else:
+        optimal_indices = {
+            index for index, vector in enumerate(vectors)
+            if not any(other != vector and all(a <= b for a, b in zip(other, vector))
+                       for other in vectors)
+        }
+    return (tuple(sorted(candidate.engine for index, candidate in enumerate(candidates) if index in optimal_indices)),
+            tuple(sorted(candidate.engine for index, candidate in enumerate(candidates) if index not in optimal_indices)))
+
+
+def _two_axis_frontier(vectors: Sequence[tuple]) -> set[int]:
+    ordered = sorted(range(len(vectors)), key=vectors.__getitem__)
+    optimal: set[int] = set()
+    best_y = None
+    position = 0
+    while position < len(ordered):
+        first = ordered[position]
+        x, y = vectors[first]
+        survives = best_y is None or y < best_y
+        end = position
+        while end < len(ordered) and vectors[ordered[end]][0] == x:
+            index = ordered[end]
+            if survives and vectors[index][1] == y:
+                optimal.add(index)
+            end += 1
+        if survives:
+            best_y = y
+        position = end
+    return optimal
 
 
 def generate_report(candidates: Sequence[CandidateResult], higher_is_better: Mapping[str, bool]) -> tuple[ProfileReport, ...]:
