@@ -6,7 +6,7 @@ dependencies**, exact integer geometry.
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.3.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.4.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -45,6 +45,29 @@ echo '{"items":[{"id":"box","quantity":8,"dimensions":{"length":"50","width":"50
   | python -m packvium
 ```
 
+## Errors
+
+A request that no engine may answer raises `packvium.InvalidRequestError`, a `ValueError`, before
+anything is solved. It names the problem instead of describing it:
+
+```python
+from packvium import InvalidRequestError, pack_from_dict
+
+try:
+    result = pack_from_dict(request)
+except InvalidRequestError as error:
+    error.code     # "invalid_request"
+    error.reason   # "below_minimum"
+    error.field    # "/items/0/quantity" -- a JSON Pointer into your request
+    str(error)     # "invalid_request: /items/0/quantity: must be at least 1"
+```
+
+`reason` is one of `missing_field`, `wrong_type`, `below_minimum`, `above_maximum`, `negative_measure`, `invalid_unit`, `duplicate_id`, `not_allowed` or `invalid_value`. `FixedPlacementError` is a subclass, with code
+`invalid_fixed_placement` and reason `malformed` or `cannot_hold`.
+The message is the same in every Packvium engine. Branch on `reason` and `field`; show the
+message to a person. A request that is valid but does not fit completely is not an error: the
+result lists what was left out, and why, in `unpacked_items`.
+
 ## Examples
 
 Runnable, in [`examples/`](https://github.com/toxakara/packvium-python/tree/main/examples). Each one is a single file you can read top to bottom
@@ -68,6 +91,7 @@ in `constraints.py` have failed you.
 | [`commerce.py`](https://github.com/toxakara/packvium-python/blob/main/examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`execution.py`](https://github.com/toxakara/packvium-python/blob/main/examples/execution.py) | Turn a result into dock instructions: solver facts kept apart from screen text, a step order that is injected or honestly absent, and an operator lock that yields a second plan rather than editing the approved one. |
 | [`artifacts.py`](https://github.com/toxakara/packvium-python/blob/main/examples/artifacts.py) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable work order, with an honest replay level. |
+| [`revisions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/revisions.py) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, and a hash-chained record that notices an edit. |
 | [`intelligence.py`](https://github.com/toxakara/packvium-python/blob/main/examples/intelligence.py) | Prove a carton change is worth publishing: two scenarios compared order by order, a proposal that refuses to exist on thin evidence, and a replay against held-out history where a cheaper packing your validator rejects still counts as a regression. |
 | [`extensions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/extensions.py) | A rule the schema has no field for — and an honest account of what you give up by writing one. |
 
@@ -100,6 +124,12 @@ PYTHONPATH=src python3 examples/objectives.py
   plan with geometry, display values and provenance, including the request itself and an
   honest replay level. `packvium.artifact_exports` writes it as RFC 8785 JSON, CSV or a
   self-contained HTML work order, byte for byte what the other engines write.
+- **Items already in place, and replanning around them.** `fixed_placements` pins items to
+  known positions before the solve: they keep their place, carry weight and support, and come
+  back marked `fixed: true`. `packvium.revisions` records what changed on the dock — a missing
+  item, a substituted container, a lock, a verification — as an append-only chain linked by
+  SHA-256, and derives the request the next plan solves. `packvium.revision_outcomes` feeds
+  those events to the historical evaluation (Python only).
 - **Decide before you publish.** `packvium.simulation` and `packvium.recommendations`
   compare two catalog scenarios order by order and propose a change only when the paired
   cohort supports it; `packvium.holdout` replays that proposal against history it has not

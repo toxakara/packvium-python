@@ -101,6 +101,8 @@ class SpatialIndex:
         ix1, ix2 = x1 // cell_x, -(-max(x2, x1 + 1) // cell_x)
         iy1, iy2 = y1 // cell_y, -(-max(y2, y1 + 1) // cell_y)
         iz1, iz2 = z1 // cell_z, -(-max(z2, z1 + 1) // cell_z)
+        if ix1 + 1 == ix2 and iy1 + 1 == iy2 and iz1 + 1 == iz2:
+            return self.cells.get((ix1, iy1, iz1), ())
         cell_range = (ix1, ix2, iy1, iy2, iz1, iz2)
         answers = self._answers
         answer = answers.get(cell_range)

@@ -106,7 +106,11 @@ class Length:
         if isinstance(value, dict):
             return cls.of(value["value"], value.get("unit", default_unit), rounding)
         if isinstance(value, float):
-            raise TypeError("float length input is intentionally rejected; use a decimal string")
+            # A fraction in binary floating point is not the decimal the caller wrote; an
+            # integral float is exact, and JavaScript cannot send anything else for `100`.
+            if not value.is_integer():
+                raise TypeError("float length input is intentionally rejected; use a decimal string")
+            value = int(value)
         if isinstance(value, str):
             match = re.fullmatch(r"(.+?)\s*(mm|cm|m|in|inch|inches|ft|ticks?)", value.strip(), re.I)
             if match:
@@ -166,7 +170,11 @@ class Weight:
         if isinstance(value, dict):
             return cls.of(value["value"], value.get("unit", default_unit), rounding)
         if isinstance(value, float):
-            raise TypeError("float weight input is intentionally rejected; use a decimal string")
+            # A fraction in binary floating point is not the decimal the caller wrote; an
+            # integral float is exact, and JavaScript cannot send anything else for `100`.
+            if not value.is_integer():
+                raise TypeError("float weight input is intentionally rejected; use a decimal string")
+            value = int(value)
         if isinstance(value, str):
             match = re.fullmatch(r"(.+?)\s*(mg|kg|g|oz|lbs?|ticks?)", value.strip(), re.I)
             if match:

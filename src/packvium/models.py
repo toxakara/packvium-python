@@ -322,6 +322,11 @@ class Container:
     # *different* nearly-nothing and it would change answers for every caller who never
     # set the field.
     access_directions: tuple[str, ...] = ()
+    # Items already in this one container instance before search starts. Set only by the
+    # orchestrator, on the instance a request's `fixed_placements` name, so every solver's
+    # `ContainerState` starts from them without knowing they exist; a packed result carries
+    # the container with this emptied again (docs/PLAN-REVISIONS.md).
+    preloaded: tuple["Placement", ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id: raise ValueError("container id is required")
@@ -335,6 +340,7 @@ class Container:
             if front.position.ticks < 0 or rear.position.ticks > self.inner_dimensions.length.ticks:
                 raise ValueError("axle positions must lie within the container's length")
         if any(limit < 1 for limit in self.tag_limits.values()): raise ValueError("tag_limits must be at least 1")
+        if self.max_items is not None and self.max_items < 1: raise ValueError("container max_items must be at least 1")
         # Deduplicated into the canonical order rather than kept as given: two callers
         # naming the same doors in a different order must search identically, and this is
         # the one place every construction path passes through.
@@ -402,6 +408,8 @@ class Placement:
     envelope_dimensions: Dimensions
     support_ratio: float = 1.0
     top_load: Weight = Weight(0)
+    # Placed by the request's `fixed_placements`, not by search; nothing may move it.
+    fixed: bool = False
 
     @property
     def box(self) -> AxisAlignedBox: return AxisAlignedBox(self.position, self.dimensions)
@@ -577,9 +585,34 @@ class UnpackedItem:
 
 
 @dataclass(frozen=True, slots=True)
+class FixedPlacement:
+    """An item already in a known place before the solve: loaded, or locked there.
+
+    Addressed by container type and instance rather than by a result's container index,
+    which does not exist until the solve finishes. `position` is the physical origin, as a
+    result reports it, so a result placement can be fixed by quoting it
+    (docs/PLAN-REVISIONS.md).
+    """
+    item_id: str
+    container_id: str
+    position: Point
+    rotation: Rotation
+    container_instance: int = 1
+
+    def __post_init__(self) -> None:
+        if self.container_instance < 1:
+            raise ValueError("container_instance counts from 1")
+
+    @property
+    def packed_container_id(self) -> str:
+        return f"{self.container_id}#{self.container_instance}"
+
+
+@dataclass(frozen=True, slots=True)
 class PackingRequest:
     items: tuple[Item, ...]
     containers: tuple[Container, ...]
+    fixed_placements: tuple[FixedPlacement, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.items: raise ValueError("at least one item is required")

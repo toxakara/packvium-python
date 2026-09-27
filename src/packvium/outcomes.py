@@ -75,6 +75,9 @@ class OutcomeEventType(str, Enum):
     DAMAGE = "damage"
     RETURN = "return"
     OPERATOR_OVERRIDE = "operator_override"
+    # Recorded from an approved plan revision (`packvium.revision_outcomes`).
+    ITEM_MISSING = "item_missing"
+    PLACEMENT_VERIFIED = "placement_verified"
 
 
 #: The closed, named payload vocabulary per event type. Deliberately narrow and
@@ -93,6 +96,8 @@ ALLOWED_FIELDS: dict[OutcomeEventType, frozenset[str]] = {
     OutcomeEventType.DAMAGE: frozenset({"reason_code", "severity"}),
     OutcomeEventType.RETURN: frozenset({"reason_code"}),
     OutcomeEventType.OPERATOR_OVERRIDE: frozenset({"reason_code", "operator_id"}),
+    OutcomeEventType.ITEM_MISSING: frozenset({"item_type", "quantity"}),
+    OutcomeEventType.PLACEMENT_VERIFIED: frozenset({"item_type", "container_type"}),
 }
 
 

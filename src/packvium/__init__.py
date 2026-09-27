@@ -10,8 +10,10 @@ from .explain import (
 )
 from .extensions import ContainerSelector, DefaultSolutionScorer, ExtensionRegistry, ItemOrderStrategy, SolutionScorer
 from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, dimensional_weight
-from .models import (Axle, Container, Item, ItemInstance, Obstacle, PackedContainer, PackingRequest,
-                     Placement, ReasonProof, RejectionObservation, UnpackedItem)
+from .fixed_placements import FixedPlacementError
+from .request_errors import InvalidRequestError
+from .models import (Axle, Container, FixedPlacement, Item, ItemInstance, Obstacle, PackedContainer,
+                     PackingRequest, Placement, ReasonProof, RejectionObservation, UnpackedItem)
 from .nested import NestedPacker, NestedPackingResult, PackingLevel
 from .packer import Packer
 from .packing_sequence import (
@@ -51,7 +53,7 @@ from .validation import IndependentSolutionValidator, ValidationIssue, Validatio
 
 __all__ = [
     "ALL_DIRECTIONS", "AlgorithmReport", "Axle", "AxisAlignedBox", "Container", "DefaultSolutionScorer", "Dimensions",
-    "EffortBudget", "ExtensionRegistry",
+    "EffortBudget", "ExtensionRegistry", "FixedPlacement", "FixedPlacementError", "InvalidRequestError",
     "IndependentSolutionValidator", "InvalidDirectionError", "Item", "ItemInstance", "LEVEL_PREFIXES", "Length",
     "LoadingDependencyGraph", "NestedPacker",
     "NestedPackingResult", "Obstacle", "PackedContainer", "Packer", "PackingConfig",

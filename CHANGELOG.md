@@ -4,6 +4,45 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0]
+
+Replanning a job that has already started: items already loaded stay where they are, and every
+change is recorded against the plan it changed. A request the schema never allowed is now
+refused (see *Fixed*).
+
+### Added
+
+- **`fixed_placements`** in a request, and `FixedPlacement` for typed requests. Each entry pins
+  an item type to a container type and instance, at the origin a result reports, in one
+  orientation. Fixed items keep their place, count toward weight, support and top load, and
+  come back marked `"fixed": true`. A fixed set that is not a valid packing on its own raises
+  `FixedPlacementError` (`invalid_fixed_placement: ...`) before any search.
+- **`packvium.revisions`** — `root_revision`, `derive_revision`, `apply_events`,
+  `verify_revision_chain`, `document_digest` and `canonical_revision_json`. A
+  `packvium-plan-revision/v1` chain records what happened on the dock — `item_missing`,
+  `container_substituted`, `placement_locked`, `placement_verified` — against the artifact it
+  changed, linked by SHA-256, and carries the request the next plan solves. Every Packvium
+  engine computes the same bytes from the same inputs.
+- **`packvium.revision_outcomes`** — turns a chain's events into outcome events for the
+  historical evaluation. Supported, not yet signature-frozen, like the rest of that surface.
+- **`InvalidRequestError`.** A malformed request names what is wrong: `code` is
+  `invalid_request`, `reason` one of a closed set (`missing_field`, `wrong_type`,
+  `below_minimum`, `above_maximum`, `negative_measure`, `invalid_unit`, `duplicate_id`,
+  `not_allowed`, `invalid_value`), `field` the JSON Pointer of the bad value, and the message
+  reads `invalid_request: /items/0/quantity: must be at least 1`. It is a `ValueError`, so
+  existing handlers still catch it, and `FixedPlacementError` is its subclass.
+- `examples/revisions.py`.
+
+### Changed
+
+- **`packvium.revisions`, `FixedPlacement` and `FixedPlacementError` are in the frozen API
+  snapshot.**
+
+### Fixed
+
+- **Limits below their floor are refused.** A zero or negative `max_items`, `max_containers`
+  or effort-budget limit was accepted; each now raises `ValueError`.
+
 ## [1.3.0]
 
 Portable operational artifacts: hand a packing result to a WMS, a TMS or a printer that runs

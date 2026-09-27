@@ -45,7 +45,10 @@ _DASH = "&mdash;"
 
 
 def export_json(artifact: Mapping[str, Any]) -> str:
-    return canonical_artifact_json(_require(artifact))
+    found = artifact.get("format") if isinstance(artifact, Mapping) else None
+    if found != FORMAT:
+        raise OperationalArtifactError("unknown_format", f"cannot export format {found!r}; this exporter reads {FORMAT}")
+    return canonical_artifact_json(artifact)
 
 
 def export_csv(artifact: Mapping[str, Any]) -> str:

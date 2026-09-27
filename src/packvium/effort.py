@@ -25,6 +25,15 @@ class EffortBudget:
     max_search_nodes: int | None = None
     max_restarts: int | None = None
 
+    def __post_init__(self) -> None:
+        # A limit of zero or less would stop every search before its first step, which no
+        # caller means; the schema's floor for each is 1.
+        for name in ("max_candidates_evaluated", "max_placement_attempts", "max_search_nodes",
+                     "max_restarts"):
+            limit = getattr(self, name)
+            if limit is not None and limit < 1:
+                raise ValueError(f"effort_budget.{name} must be at least 1")
+
     def exceeded(self, stats: "SearchStats") -> bool:
         return ((self.max_candidates_evaluated is not None and stats.candidates_evaluated >= self.max_candidates_evaluated)
                 or (self.max_placement_attempts is not None and stats.placements_attempted >= self.max_placement_attempts)

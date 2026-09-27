@@ -6,6 +6,7 @@ from dataclasses import replace
 from .config import PackingConfig
 from .extensions import (ExtensionRegistry, SolutionScorer, UnknownObjectiveError,
                          resolve_objective_scorer, unpriceable_container)
+from .fixed_placements import admit_fixed_placements
 from .models import Container, Item, PackingRequest, UnratedWeightError
 from .result import AlgorithmReport, PackingResult, PackingStatus
 from .result import aggregate_termination
@@ -32,8 +33,8 @@ class Packer:
         self.clock = clock
         self.trace = trace
 
-    def pack(self, items, containers) -> PackingResult:
-        request = PackingRequest(tuple(items), tuple(containers))
+    def pack(self, items, containers, fixed_placements=()) -> PackingResult:
+        request = PackingRequest(tuple(items), tuple(containers), tuple(fixed_placements))
         # Both weight objectives price the same billed weight, so both need the divisor
         # up front -- a wrong guess would silently misprice every shipment. And rating
         # some containers while others carry no tariff would rank a priced packing
@@ -58,6 +59,10 @@ class Packer:
                     f"the lowest_landed_cost objective requires a rate_table on every "
                     f"container; {unrated.id!r} has none"
                 )
+        fixed = admit_fixed_placements(
+            request, self.config.minimum_support_ratio, self.config.clearance,
+            self.config.max_containers,
+        )
         deadline = (
             Deadline(self.config.time_limit_ms, clock=self.clock)
             if self.clock is not None
@@ -69,7 +74,8 @@ class Packer:
         # silently overriding it with `None`.
         scope = use_trace(self.trace) if self.trace is not None else nullcontext()
         with scope:
-            portfolio = orchestrator.solve(request.instances, request.containers, self.config, deadline)
+            portfolio = orchestrator.solve(fixed.free, request.containers, self.config, deadline,
+                                           fixed.containers)
         raw_solutions = portfolio.solutions
         ranked = []
         validator = IndependentSolutionValidator()

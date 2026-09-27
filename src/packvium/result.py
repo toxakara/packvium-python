@@ -201,6 +201,8 @@ class PackingResult:
                 "orientation": p.rotation.value,
                 "support_ratio": f"{p.support_ratio:.6f}",
                 "top_load": p.top_load.to_dict(weight_unit),
+                # Absent unless true, so a request without fixed placements keeps its bytes.
+                **({"fixed": True} if p.fixed else {}),
             }
         def lattice_summary_dict(summary):
             # Omitted entirely (not even a `null` key) when this container was not built

@@ -70,6 +70,8 @@ class PackingConfig:
                 or self.parallel_starts <= 0 or self.container_plan_beam_width <= 0
                 or self.container_plan_node_limit <= 0):
             raise ValueError("positive configuration values required")
+        if self.max_containers is not None and self.max_containers < 1:
+            raise ValueError("max_containers must be at least 1")
         if self.max_candidate_points < 16:
             raise ValueError("max_candidate_points must be at least 16")
         if not 0 <= self.minimum_support_ratio <= 1: raise ValueError("minimum_support_ratio must be between 0 and 1")
