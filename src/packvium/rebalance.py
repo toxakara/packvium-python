@@ -212,6 +212,8 @@ def rebalance_weight(
 
         committed = None
         for placement_index in ranked_items:
+            if source.placements[placement_index].fixed:
+                continue
             weight_ticks = source.placements[placement_index].instance.weight.ticks
             if weight_ticks <= 0:
                 continue

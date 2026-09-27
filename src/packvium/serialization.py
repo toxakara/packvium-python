@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
+from typing import Any
+from contextlib import contextmanager
 from dataclasses import replace
 
 from .config import PackingConfig, SolverProfile
 from .effort import EffortBudget
 from .compression import ratio_to_ppm
 from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
-from .models import Axle, Container, Item, Obstacle, RateTable
+from .models import Axle, Container, FixedPlacement, Item, Obstacle, RateTable
+from ._canonical_json import json_integer
 from .extensions import ExtensionRegistry
+from .fixed_placements import require_fixed_placement_shapes
+from .request_errors import InvalidRequestError, check_request
 from .packer import Packer
 from .policy import PolicyRuleSet
 from .units import Length, Weight
@@ -74,12 +80,29 @@ def _item(raw: dict, unit: str) -> Item:
     )
 
 
+def _point_ticks(raw: dict, unit: str) -> tuple[int, int, int]:
+    return (Length.parse(raw.get("x", 0), unit).ticks, Length.parse(raw.get("y", 0), unit).ticks,
+            Length.parse(raw.get("z", 0), unit).ticks)
+
+
 def _box(raw: dict, unit: str) -> AxisAlignedBox:
-    origin = raw.get("origin", {})
     return AxisAlignedBox(
-        Point(Length.parse(origin.get("x", 0), unit).ticks, Length.parse(origin.get("y", 0), unit).ticks, Length.parse(origin.get("z", 0), unit).ticks),
+        Point(*_point_ticks(raw.get("origin", {}), unit)),
         Dimensions.from_dict(raw["dimensions"], unit),
     )
+
+
+def _fixed_placements(raw: object, unit: str) -> list[FixedPlacement]:
+    return [
+        FixedPlacement(
+            item_id=entry["item_type"],
+            container_id=entry["container_type"],
+            position=Point(*_point_ticks(entry.get("position", {}), unit)),
+            rotation=Rotation(entry["orientation"]),
+            container_instance=json_integer(entry.get("container_instance", 1)),
+        )
+        for entry in require_fixed_placement_shapes(raw, unit)
+    ]
 
 
 def _rate_table(raw: dict | None) -> RateTable | None:
@@ -132,6 +155,8 @@ class UnsupportedFeatureError(ValueError):
 #: a `rejected:unsupported_feature` support level for Python, which is what makes the
 #: conformance corpus assert the rejection instead of merely tolerating it.
 UNSUPPORTED_FIELDS: dict[str, tuple[str, ...]] = {
+    # `fixed_placements` left this list in 1.4.0, when this engine gained seeding, admission
+    # and the fixed-placement validator rule (docs/PLAN-REVISIONS.md).
     "request": (),
     "configuration": (),
     # `hull_vertices`, `compression_ratio` and `max_compression_pressure_kpa` left this list
@@ -200,11 +225,75 @@ def reject_unsupported(
 
 def pack_from_dict(data: dict, *,
                    extensions: ExtensionRegistry | None = None) -> dict:
+    """Solve a JSON request. A request that is not one any engine may answer raises
+    `InvalidRequestError` (or its subclass `FixedPlacementError`) naming the bad value."""
+    if not isinstance(data, Mapping):
+        raise InvalidRequestError("wrong_type", "", "must be an object")
     reject_unsupported(data)
-    unit = data.get("units", {}).get("length", "mm"); cfg = data.get("configuration", {})
+    check_request(data)
+    data = _without_null_optionals(data)
+    with _as_request_error():
+        unit = (data.get("units") or {}).get("length", "mm")
+        config = _config(data.get("configuration") or {}, unit)
+        references = _catalog_versions_used(data.get("catalog_versions_used", []))
+        extensions = _extensions(data, extensions)
+        items = [_item(i, unit) for i in data["items"]]
+        containers = [_container(c, unit) for c in data["containers"]]
+        fixed = _fixed_placements(data.get("fixed_placements"), unit)
+    result = Packer(config, extensions).pack(items, containers, fixed)
+    result = replace(result, catalog_versions_used=references)
+    output = data.get("output", {})
+    return result.to_dict(output.get("length_unit", unit), output.get("weight_unit", "g"))
+
+
+def _without_null_optionals(data: Mapping[str, Any]) -> dict:
+    """The request with every null optional removed, where the rule table already treats null
+    as absent: the model builders take their defaults from a missing key, and a null that
+    reached them would be read as a value. Only the request's own records are cleaned --
+    `metadata` and the like are echoed back and keep their nulls."""
+    request = _without_nulls(data)
+    if isinstance(request.get("configuration"), Mapping):
+        configuration = _without_nulls(request["configuration"])
+        if isinstance(configuration.get("effort_budget"), Mapping):
+            configuration["effort_budget"] = _without_nulls(configuration["effort_budget"])
+        request["configuration"] = configuration
+    # The rule table has already required both lists and every entry in them to be objects.
+    for key in ("items", "containers"):
+        request[key] = [_record_without_nulls(entry) for entry in request[key]]
+    return request
+
+
+def _record_without_nulls(entry: Mapping[str, Any]) -> dict:
+    record = _without_nulls(entry)
+    if isinstance(record.get("rate_table"), Mapping):
+        record["rate_table"] = _without_nulls(record["rate_table"])
+    return record
+
+
+def _without_nulls(record: Mapping[str, Any]) -> dict:
+    return {key: value for key, value in record.items() if value is not None}
+
+
+@contextmanager
+def _as_request_error() -> Iterator[None]:
+    """Whatever the rule table did not name still reaches the caller as a request error.
+
+    Only turning JSON into the model runs inside this, never the solve, so a solver defect is
+    never dressed up as the caller's mistake. An error that already carries its own `code`
+    (a policy, catalog or fixed-placement refusal) passes through unchanged.
+    """
+    try:
+        yield
+    except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+        if isinstance(error, InvalidRequestError) or hasattr(error, "code"):
+            raise
+        raise InvalidRequestError("invalid_value", "", str(error)) from error
+
+
+def _config(cfg: dict, unit: str) -> PackingConfig:
     profile = SolverProfile(cfg.get("solver_profile", "balanced"))
     quality = profile is SolverProfile.QUALITY
-    config = PackingConfig(
+    return PackingConfig(
         profile=profile, time_limit_ms=int(cfg.get("time_limit_ms", 1000)),
         top_k=int(cfg.get("alternatives", 3)), seed=int(cfg.get("seed", 42)), max_containers=cfg.get("max_containers"),
         clearance=Length.parse(cfg.get("clearance", 0), unit), minimum_support_ratio=float(cfg.get("minimum_support_ratio", 0)),
@@ -221,15 +310,17 @@ def pack_from_dict(data: dict, *,
         container_plan_beam_width=int(cfg.get("container_plan_beam_width", 16 if quality else 1)),
         container_plan_node_limit=int(cfg.get("container_plan_node_limit", 100_000 if quality else 1)),
     )
-    references = _catalog_versions_used(data.get("catalog_versions_used", []))
+
+
+def _extensions(data: dict, supplied: ExtensionRegistry | None) -> ExtensionRegistry:
     # Rules compile into this engine's own constraint pipeline rather than post-filtering
     # a chosen answer: an illegal candidate is rejected during search, so the packing that
     # wins was never allowed to be illegal in the first place.
     # A caller's extensions are *added to* the compiled policy rules, never substituted for
     # them. Replacing would let an operator lock silently drop a policy rule the
     # request asked for, which is the one thing a lock must not be able to do.
-    supplied = extensions or ExtensionRegistry()
-    extensions = ExtensionRegistry(
+    supplied = supplied or ExtensionRegistry()
+    return ExtensionRegistry(
         placement_constraints=(
             *PolicyRuleSet.from_dict(data.get("policy")).constraints(),
             *supplied.placement_constraints,
@@ -238,10 +329,6 @@ def pack_from_dict(data: dict, *,
         solvers=supplied.solvers,
         container_selector=supplied.container_selector,
     )
-    result = Packer(config, extensions).pack([_item(i, unit) for i in data["items"]], [_container(c, unit) for c in data["containers"]])
-    result = replace(result, catalog_versions_used=references)
-    output = data.get("output", {})
-    return result.to_dict(output.get("length_unit", unit), output.get("weight_unit", "g"))
 
 
 def _catalog_versions_used(raw: object) -> tuple[dict, ...]:

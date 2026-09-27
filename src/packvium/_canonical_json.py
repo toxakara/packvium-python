@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Optional
 
 #: The largest magnitude every engine holds exactly.
 MAX_EXACT_MAGNITUDE = 2**53 - 1
@@ -42,6 +42,29 @@ def canonical_json(value: Any) -> str:
     parts: List[str] = []
     _write(value, parts)
     return "".join(parts)
+
+
+def json_integer(value: Any) -> Optional[int]:
+    """The integer a JSON value is, judged by value as every engine can judge it.
+
+    `1.0` is `1`, because JavaScript cannot tell them apart once the text is parsed; `true`,
+    `"1"` and `1.5` are not integers, and neither is anything past 2^53 - 1, which JavaScript
+    no longer holds exactly.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    number = int(value)
+    return number if abs(number) <= MAX_EXACT_MAGNITUDE else None
+
+
+def json_spelling(value: Any) -> str:
+    """How a refusal quotes a value: its canonical JSON, the one spelling four engines share."""
+    try:
+        return canonical_json(value)
+    except CanonicalJsonError as error:
+        return "an out-of-range number" if error.code == "number_out_of_range" else "an unspellable value"
 
 
 def _write(value: Any, parts: List[str]) -> None:

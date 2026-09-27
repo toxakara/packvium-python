@@ -131,9 +131,33 @@ class IndependentSolutionValidator:
                 issues.append(ValidationIssue("missing_item", item_id))
         for item_id in sorted(seen - expected): issues.append(ValidationIssue("unknown_item", item_id))
         self._check_groups(containers, issues)
+        self._check_fixed_placements(request, containers, issues)
         if unpacked is not None:
             self._check_group_accounting(request, containers, issues)
         return ValidationReport(not issues, tuple(issues))
+
+    @staticmethod
+    def _check_fixed_placements(request: PackingRequest, containers: tuple[PackedContainer, ...],
+                                issues: list[ValidationIssue]) -> None:
+        """Every fixed placement is where the request put it, and nothing else claims to be.
+
+        Physics needs no rule: a fixed item is an ordinary placement, so every check above
+        already applied to it. Only whether it moved is new (docs/PLAN-REVISIONS.md).
+        """
+        requested = {
+            (entry.packed_container_id, entry.item_id, entry.position, entry.rotation)
+            for entry in request.fixed_placements
+        }
+        reported = {
+            (packed.id, placement.instance.item.id, placement.position, placement.rotation)
+            for packed in containers for placement in packed.placements if placement.fixed
+        }
+        present = {packed.id for packed in containers}
+        for key in sorted(requested - reported, key=_fixed_order):
+            code = "fixed_placement_moved" if key[0] in present else "fixed_container_missing"
+            issues.append(ValidationIssue(code, _fixed_detail(key)))
+        for key in sorted(reported - requested, key=_fixed_order):
+            issues.append(ValidationIssue("unexpected_fixed_placement", _fixed_detail(key)))
 
     @staticmethod
     def _collision_pairs(placements) -> list[tuple[int, int]]:
@@ -233,3 +257,13 @@ class IndependentSolutionValidator:
             count = len(placed.get(group, set()))
             if 0 < count < len(members):
                 issues.append(ValidationIssue("group_partial", f"{group}: {count}/{len(members)} packed"))
+
+
+def _fixed_order(key: tuple) -> tuple:
+    container_id, item_id, position, rotation = key
+    return (container_id, item_id, position.x, position.y, position.z, rotation.value)
+
+
+def _fixed_detail(key: tuple) -> str:
+    container_id, item_id, position, rotation = key
+    return f"{item_id} in {container_id} at ({position.x}, {position.y}, {position.z}) {rotation.value}"

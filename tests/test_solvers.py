@@ -22,7 +22,7 @@ from packvium.solvers import (MAX_MAXIMAL_SPACES, MINIMUM_SLICE_NS, ContainerSta
                                  SolverOrchestrator, TimeLimitReached, UnknownSolverError,
                                  default_constraints, find_candidates, group_batches,
                                  subtract_all, beam_pack, is_better_container_state,
-                                 _maximum_count_with_capacity)
+                                 _count_with_capacity)
 
 def generous() -> Deadline:
     """A fresh, effectively-unlimited deadline, started now.
@@ -1334,7 +1334,7 @@ def test_additive_cardinality_bound_is_an_admissible_relaxation():
                  for chosen in combinations(costs, size) if sum(chosen) <= capacity),
                 default=0,
             )
-            assert _maximum_count_with_capacity(costs, capacity) == exact
+            assert _count_with_capacity(sorted(costs), capacity) == exact
 
 
 def test_more_block_search_effort_cannot_worsen_the_objective():

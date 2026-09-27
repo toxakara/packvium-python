@@ -32,7 +32,7 @@ FORMAT = "packvium-operational-artifact/v1"
 #: The suite version of this builder, the same string in all four engines of one release.
 #: The engine's own name is deliberately not recorded: four correct builders naming themselves
 #: would emit four different documents. `make version-set` rewrites this line.
-SUITE_VERSION = "1.3.0"
+SUITE_VERSION = "1.4.0"
 
 #: The deterministic part of `result.algorithm`. `duration_ms` is wall-clock time and never
 #: enters an artifact.

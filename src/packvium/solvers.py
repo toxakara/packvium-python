@@ -240,6 +240,10 @@ class ContainerState:
         self._absorb([Point(0, 0, 0)])
         for box in list(self.occupied):
             self._absorb(self._exposed_points(box))
+        # Fixed items enter as real placements, so payload, support, top load and every
+        # other rule that reads `placements` holds for them with no rule of its own.
+        for placement in container.preloaded:
+            self.add(placement)
 
     def copy(self) -> "ContainerState":
         other = ContainerState.__new__(ContainerState)
@@ -314,15 +318,15 @@ class ContainerState:
         # engine could describe an interlocking pack it could never propose.
         if shape is None:
             x1, y1, z1, x2, y2, z2 = bound
-            retired = [key for key in self.points
-                       if x1 <= key[0] < x2 and y1 <= key[1] < y2 and z1 <= key[2] < z2]
-            for key in retired:
-                del self.points[key]
-            # `ordered_points` holds exactly the points of `points`, so the same test
-            # retires the same set there without rebuilding a key per point.
-            if retired:
-                self.ordered_points = [point for point in self.ordered_points
-                                       if not (x1 <= point.x < x2 and y1 <= point.y < y2 and z1 <= point.z < z2)]
+            new_ordered = []
+            points = self.points
+            for point in self.ordered_points:
+                px, py, pz = point.x, point.y, point.z
+                if x1 <= px < x2 and y1 <= py < y2 and z1 <= pz < z2:
+                    del points[(px, py, pz)]
+                else:
+                    new_ordered.append(point)
+            self.ordered_points = new_ordered
         self._absorb(self._exposed_points(box))
 
     def add_direct(self, placement: Placement) -> None:
@@ -363,15 +367,19 @@ class ContainerState:
             key = (x, y, z)
             if key in self.points: continue
             bucket = cells.get((x // cell_x, y // cell_y, z // cell_z), ())
-            if any(bx1 <= x < bx2 and by1 <= y < by2 and bz1 <= z < bz2
-                   for bx1, by1, bz1, bx2, by2, bz2 in map(bounds.__getitem__, bucket)): continue
+            inside = False
+            for position in bucket:
+                bx1, by1, bz1, bx2, by2, bz2 = bounds[position]
+                if bx1 <= x < bx2 and by1 <= y < by2 and bz1 <= z < bz2:
+                    inside = True
+                    break
+            if inside: continue
             self.points[key] = point
-            point_key = (z, y, x)
             low, high = 0, len(self.ordered_points)
             while low < high:
                 middle = (low + high) // 2
                 current = self.ordered_points[middle]
-                if (current.z, current.y, current.x) <= point_key: low = middle + 1
+                if current.z < z or (current.z == z and (current.y < y or (current.y == y and current.x <= x))): low = middle + 1
                 else: high = middle
             self.ordered_points.insert(low, point)
 
@@ -746,8 +754,8 @@ def _place_batch(state: ContainerState, batch: Sequence[ItemInstance], config: P
     yield working
 
 
-def _maximum_count_with_capacity(costs: Sequence[int], capacity: int) -> int:
-    """Optimistic cardinality bound for one additive resource.
+def _count_with_capacity(sorted_costs: Sequence[int], capacity: int) -> int:
+    """Optimistic cardinality bound for one additive resource, over ascending costs.
 
     Choosing the cheapest remaining units first can only *overestimate* how many
     geometrically feasible items fit.  It is therefore safe for ordering/pruning a
@@ -756,7 +764,7 @@ def _maximum_count_with_capacity(costs: Sequence[int], capacity: int) -> int:
     """
     used = 0
     count = 0
-    for cost in sorted(costs):
+    for cost in sorted_costs:
         if used + cost > capacity:
             break
         used += cost
@@ -764,10 +772,32 @@ def _maximum_count_with_capacity(costs: Sequence[int], capacity: int) -> int:
     return count
 
 
+@dataclass(frozen=True, slots=True)
+class PrecomputedFuture:
+    volumes: tuple[int, ...] | None
+    weights: tuple[int, ...] | None
+    count: int
+
+    @classmethod
+    def from_items(cls, future: Sequence[ItemInstance], has_max_payload: bool) -> "PrecomputedFuture":
+        if not future:
+            return _EMPTY_PRECOMPUTED_FUTURE
+        volumes = None
+        if not any(item.item.nesting_height is not None for item in future):
+            volumes = tuple(sorted(item.dimensions.volume for item in future))
+        weights = None
+        if has_max_payload:
+            weights = tuple(sorted(item.weight.ticks for item in future))
+        return cls(volumes=volumes, weights=weights, count=len(future))
+
+
+_EMPTY_PRECOMPUTED_FUTURE = PrecomputedFuture(volumes=None, weights=None, count=0)
+
+
 def _unpacked_lower_bound(
     state: ContainerState,
-    unplaced: Sequence[ItemInstance],
-    future: Sequence[ItemInstance],
+    unplaced: Sequence[ItemInstance] | int,
+    future: PrecomputedFuture = _EMPTY_PRECOMPUTED_FUTURE,
 ) -> int:
     """Admissible volume/weight lower bound on final unpacked cardinality.
 
@@ -777,37 +807,28 @@ def _unpacked_lower_bound(
     but sound bound is enough to keep a deliberate large-item skip alive when it can
     make room for several smaller future items.
     """
-    if not future:
-        return len(unplaced)
-    possible = len(future)
-    if not any(item.item.nesting_height is not None for item in future):
+    unplaced_count = unplaced if isinstance(unplaced, int) else len(unplaced)
+    if future.count == 0:
+        return unplaced_count
+    possible = future.count
+    if future.volumes is not None:
         free_volume = max(0, state.container.inner_dimensions.volume - state.used_volume_ticks)
-        possible = min(
-            possible,
-            _maximum_count_with_capacity(
-                [item.dimensions.volume for item in future], free_volume
-            ),
-        )
-    if state.container.max_payload is not None:
+        possible = min(possible, _count_with_capacity(future.volumes, free_volume))
+    if future.weights is not None:
         free_weight = max(0, state.container.max_payload.ticks - state.payload_ticks)
-        possible = min(
-            possible,
-            _maximum_count_with_capacity(
-                [item.weight.ticks for item in future], free_weight
-            ),
-        )
-    return len(unplaced) + len(future) - possible
+        possible = min(possible, _count_with_capacity(future.weights, free_weight))
+    return unplaced_count + future.count - possible
 
 
 def _node_key(
     node: tuple[ContainerState, tuple[ItemInstance, ...]],
-    future: Sequence[ItemInstance] = (),
+    future: PrecomputedFuture = _EMPTY_PRECOMPUTED_FUTURE,
 ) -> tuple:
     state, unplaced = node
     used = state.used_volume_ticks
     signature = "|".join(f"{p.instance.id}@{p.envelope_origin.x},{p.envelope_origin.y},{p.envelope_origin.z}"
                          for p in state.placements)
-    return (_unpacked_lower_bound(state, unplaced, future), len(unplaced),
+    return (_unpacked_lower_bound(state, len(unplaced), future), len(unplaced),
             -len(state.placements), state.max_z, -used, signature)
 
 
@@ -908,15 +929,19 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
             else:
                 expansions.append((state, (*unplaced, *batch)))
         future = tuple(item for later in batches[position + 1:] for item in later)
+        precomputed_future = PrecomputedFuture.from_items(future, container.max_payload is not None)
         for state, unplaced in expansions:
-            candidate = (state, (*unplaced, *future))
-            candidate_key = _node_key(candidate)
+            cand_unplaced_len = len(unplaced) + len(future)
+            signature = "|".join(f"{p.instance.id}@{p.envelope_origin.x},{p.envelope_origin.y},{p.envelope_origin.z}"
+                                 for p in state.placements)
+            candidate_key = (cand_unplaced_len, cand_unplaced_len,
+                             -len(state.placements), state.max_z, -state.used_volume_ticks, signature)
             if candidate_key < incumbent_key:
-                incumbent = candidate
+                incumbent = (state, (*unplaced, *future))
                 incumbent_key = candidate_key
         if not expansions:
             break
-        expansions.sort(key=lambda node: _node_key(node, future))
+        expansions.sort(key=lambda node: _node_key(node, precomputed_future))
         beam = expansions[:width]
         if exhausted:
             # Return the best complete interpretation seen at any earlier prefix, not
@@ -1037,7 +1062,7 @@ class GridSolver:
         return True
 
     def pack_one(self, container, sequence, items, config, stats, deadline):
-        if container.obstacles or not items or not self.supports(items):
+        if container.obstacles or container.preloaded or not items or not self.supports(items):
             # A mixed-type list would otherwise place every item using the first
             # item's dimensions -- silently wrong geometry, not merely suboptimal.
             return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
@@ -1275,7 +1300,10 @@ class MaximalSpaceSolver:
         constraints = default_constraints(config, self.constraints)
         spaces = subtract_all(
             [Space(Point(0, 0, 0), container.inner_dimensions)],
-            [box for obstacle in container.obstacles for box in obstacle.boxes],
+            [
+                *(box for obstacle in container.obstacles for box in obstacle.boxes),
+                *(placement.envelope_box for placement in container.preloaded),
+            ],
             stats,
         )
         unplaced: list[ItemInstance] = []
@@ -1396,7 +1424,8 @@ class HomogeneousBlockSolver:
         return SingleContainerSolution(best.state, best.unpacked, False, reached)
 
     def _supports(self, container, items, config) -> bool:
-        if self.constraints or container.obstacles or container.axles is not None:
+        if (self.constraints or container.obstacles or container.preloaded
+                or container.axles is not None):
             return False
         if (
             container.tag_limits
@@ -1754,7 +1783,7 @@ def _with_top_loads(placements: Sequence[Placement]) -> tuple[Placement, ...]:
     loads = top_loads(load_units(placements))
     return tuple(
         Placement(p.instance, p.position, p.rotation, p.dimensions, p.envelope_origin,
-                  p.envelope_dimensions, p.support_ratio, Weight(load))
+                  p.envelope_dimensions, p.support_ratio, Weight(load), p.fixed)
         for p, load in zip(placements, loads)
     )
 
@@ -1807,7 +1836,7 @@ class UnknownSolverError(ValueError):
     """`PackingConfig.solvers` named a solver this library does not implement."""
 
 
-def _run_concurrent_start(solver, order, containers, config, container_selector, effort_budget, absolute_deadline_ns):
+def _run_concurrent_start(solver, order, containers, config, container_selector, effort_budget, absolute_deadline_ns, preloaded=()):
     """One portfolio start's worker body, run in its own process.
 
     Module-level, not a bound method, so `ProcessPoolExecutor` can pickle it
@@ -1825,7 +1854,7 @@ def _run_concurrent_start(solver, order, containers, config, container_selector,
         budget = budget.with_effort(effort_budget, stats)
     orchestrator = SolverOrchestrator(container_selector=container_selector)
     packed, unpacked, exhaustive, reached, dominant_lattice = orchestrator._across_containers(
-        solver, order, containers, config, stats, budget
+        solver, order, containers, config, stats, budget, preloaded
     )
     return packed, unpacked, exhaustive, reached, dominant_lattice, stats
 
@@ -1921,14 +1950,20 @@ class SolverOrchestrator:
         refinement = (extreme[0], "best:beam", extreme[2])
         return [*greedy, *neighborhoods, refinement]
 
-    def solve(self, items, containers, config, deadline):
+    def solve(self, items, containers, config, deadline, preloaded=()):
+        """Search for placements of `items`.
+
+        `preloaded` are the containers a request's fixed placements name, each holding only
+        its fixed items, in the order they open (`fixed_placements.FixedLoad`). Every start
+        fills them first and keeps them, whatever else it does.
+        """
         starts = self._starts(items, config)
         effort_budget = config.effort_budget
         if effort_budget is not None and effort_budget.max_restarts is not None:
             starts = starts[:effort_budget.max_restarts]
         if self._eligible_for_concurrent_execution(deadline, config):
-            return self._solve_concurrent(items, containers, config, deadline, starts, effort_budget)
-        return self._solve_sequential(items, containers, config, deadline, starts, effort_budget)
+            return self._solve_concurrent(items, containers, config, deadline, starts, effort_budget, preloaded)
+        return self._solve_sequential(items, containers, config, deadline, starts, effort_budget, preloaded)
 
     def _eligible_for_concurrent_execution(self, deadline, config) -> bool:
         """Gate for the worker-process path.
@@ -1953,7 +1988,7 @@ class SolverOrchestrator:
             and isinstance(self.container_selector, DefaultContainerSelector)
         )
 
-    def _solve_sequential(self, items, containers, config, deadline, starts, effort_budget):
+    def _solve_sequential(self, items, containers, config, deadline, starts, effort_budget, preloaded=()):
         results = []
         completed_orders: dict[str, tuple] = {}
         records = [
@@ -2002,7 +2037,7 @@ class SolverOrchestrator:
                     container_plan_beam_width=1,
                     container_plan_node_limit=1,
                 )
-            packed, unpacked, exhaustive, reached, dominant_lattice = self._across_containers(solver, order, containers, start_config, stats, budget)
+            packed, unpacked, exhaustive, reached, dominant_lattice = self._across_containers(solver, order, containers, start_config, stats, budget, preloaded)
             effort_reached = budget.effort_exceeded
             wall_reached = reached and budget.remaining_ns <= 0
             if effort_reached:
@@ -2037,9 +2072,9 @@ class SolverOrchestrator:
             # every container this start packed actually went through the lattice.
             if dominant_lattice and not unpacked:
                 break
-        return self._finish_portfolio(items, containers, deadline, results, records)
+        return self._finish_portfolio(items, containers, deadline, results, records, preloaded)
 
-    def _solve_concurrent(self, items, containers, config, deadline, starts, effort_budget):
+    def _solve_concurrent(self, items, containers, config, deadline, starts, effort_budget, preloaded=()):
         """Runs every start after the first one concurrently, in separate processes.
 
         The first start always runs in-process, exactly as `_solve_sequential`
@@ -2074,7 +2109,7 @@ class SolverOrchestrator:
             return self._finish_portfolio(items, containers, deadline, [], [
                 StartRecord(f"{solver.name}:{order_name}", False, False, False)
                 for solver, order_name, _ in starts
-            ])
+            ], preloaded)
         # `ProcessPoolExecutor` checks the host's semaphore limits in its
         # constructor. Sandboxed and otherwise restricted runtimes may deny that
         # query even though importing multiprocessing succeeds. Concurrency is an
@@ -2086,7 +2121,7 @@ class SolverOrchestrator:
             probe = ProcessPoolExecutor(max_workers=1)
         except (NotImplementedError, OSError):
             return self._solve_sequential(
-                items, containers, config, deadline, starts, effort_budget
+                items, containers, config, deadline, starts, effort_budget, preloaded
             )
         else:
             probe.shutdown(wait=True)
@@ -2101,7 +2136,7 @@ class SolverOrchestrator:
         budget0 = deadline.slice(len(starts))
         if effort_budget is not None:
             budget0 = budget0.with_effort(effort_budget, stats0)
-        packed0, unpacked0, exhaustive0, reached0, dominant_lattice0 = self._across_containers(solver0, order0, containers, config, stats0, budget0)
+        packed0, unpacked0, exhaustive0, reached0, dominant_lattice0 = self._across_containers(solver0, order0, containers, config, stats0, budget0, preloaded)
         effort_reached0 = budget0.effort_exceeded
         wall_reached0 = reached0 and budget0.remaining_ns <= 0
         if effort_reached0:
@@ -2128,7 +2163,7 @@ class SolverOrchestrator:
                 futures = {
                     executor.submit(
                         _run_concurrent_start, solver, order, containers, config,
-                        container_selector, effort_budget, absolute_deadline_ns,
+                        container_selector, effort_budget, absolute_deadline_ns, preloaded,
                     ): position
                     for position, (solver, order_name, order) in remaining
                 }
@@ -2148,9 +2183,9 @@ class SolverOrchestrator:
                 records[position] = StartRecord(start_id, True, not reached, reached)
 
         results = [result for result in results if result is not None]
-        return self._finish_portfolio(items, containers, deadline, results, records)
+        return self._finish_portfolio(items, containers, deadline, results, records, preloaded)
 
-    def _finish_portfolio(self, items, containers, deadline, results, records):
+    def _finish_portfolio(self, items, containers, deadline, results, records, preloaded=()):
         global_deadline = deadline.expired
         records = [
             replace(record, global_deadline_reached=global_deadline)
@@ -2160,7 +2195,7 @@ class SolverOrchestrator:
             fallback_id = "portfolio:fallback"
             results = [RawSolution(
                 fallback_id,
-                (),
+                tuple(preloaded),
                 tuple(UnpackedItem(i, *self._unpacked_reason(i, containers, True)) for i in items),
                 SearchStats(),
                 True,
@@ -2284,23 +2319,69 @@ class SolverOrchestrator:
                 return True
         return False
 
-    def _across_containers(self, solver, items, containers, config, stats, deadline):
+    def _across_containers(self, solver, items, containers, config, stats, deadline, preloaded=()):
         beam = (
             config.container_plan_beam_width > 1
             and isinstance(self.container_selector, DefaultContainerSelector)
         )
         self._record_root_bound(solver, beam, items, containers, config, stats)
+        opened = self._open_preloaded(solver, preloaded, items, containers, config, stats, deadline)
         if beam:
             return self._across_containers_beam(
-                solver, items, containers, config, stats, deadline
+                solver, items, containers, config, stats, deadline, opened
             )
         return self._across_containers_greedy(
-            solver, items, containers, config, stats, deadline
+            solver, items, containers, config, stats, deadline, opened
         )
+
+    def _open_preloaded(self, solver, preloaded, items, containers, config, stats, deadline):
+        """Fill every container holding fixed items, first, and keep it whatever it gets.
+
+        Returns the plan every start continues from. A container that search cannot fill
+        -- the deadline has passed, or the solver raised it -- is kept with its fixed items
+        alone: dropping it would drop items the request says are already loaded.
+        """
+        plan = _ContainerPlan(
+            (), tuple(items), {c.id: c.quantity for c in containers},
+            {c.id: 0 for c in containers},
+        )
+        reached = False
+        for fixed in preloaded:
+            seeded = replace(fixed.container, preloaded=fixed.placements)
+            one = None
+            if not reached and not deadline.expired:
+                try:
+                    one = solver.pack_one(seeded, fixed.sequence, plan.remaining, config, stats, deadline)
+                except TimeLimitReached:
+                    pass
+            if one is None or one.time_limit_reached:
+                reached = True
+            state = one.state if one is not None else ContainerState(seeded, fixed.sequence)
+            packed_container, ids = self._packed_state(state)
+            inventory = dict(plan.inventory)
+            if inventory[seeded.id] is not None:
+                inventory[seeded.id] -= 1
+            sequences = dict(plan.sequences)
+            sequences[seeded.id] = fixed.sequence
+            plan = _ContainerPlan(
+                (*plan.packed, packed_container),
+                tuple(item for item in plan.remaining if item.id not in ids),
+                inventory,
+                sequences,
+                plan.exhaustive and one is not None and one.exhaustive,
+                plan.dominant_lattice and one is not None and one.dominant_lattice,
+            )
+        return plan, reached
 
     @staticmethod
     def _packed_state(state: ContainerState) -> tuple[PackedContainer, set[str]]:
-        container = state.container
+        # A result carries the request's container, not the seeded instance: anything that
+        # rebuilds a state from a packed container re-adds every placement itself, and a
+        # seeded container would add the fixed ones twice.
+        container = (
+            replace(state.container, preloaded=())
+            if state.container.preloaded else state.container
+        )
         if state.lattice_summary is not None:
             packed = PackedContainer(
                 container, state.sequence, (), state.lattice_summary, state.lattice_items
@@ -2396,7 +2477,7 @@ class SolverOrchestrator:
             stats.objective_lower_bound = None
 
 
-    def _across_containers_beam(self, solver, items, containers, config, stats, deadline):
+    def _across_containers_beam(self, solver, items, containers, config, stats, deadline, opened):
         """Bounded deterministic beam over partial multi-container plans.
 
         Each child commits one independently trial-packed container.  Closed
@@ -2408,14 +2489,10 @@ class SolverOrchestrator:
         maximum = config.max_containers if config.max_containers is not None else sum(
             c.quantity if c.quantity is not None else len(items) for c in containers
         )
-        initial = _ContainerPlan(
-            (), tuple(items), {c.id: c.quantity for c in containers},
-            {c.id: 0 for c in containers},
-        )
-        beam = [initial]
+        initial, reached = opened
+        beam = [] if reached else [initial]
         incumbent = initial
         plan_nodes = 0
-        reached = False
 
         while beam and plan_nodes < config.container_plan_node_limit:
             expansions: list[_ContainerPlan] = []
@@ -2509,12 +2586,14 @@ class SolverOrchestrator:
             incumbent.dominant_lattice,
         )
 
-    def _across_containers_greedy(self, solver, items, containers, config, stats, deadline):
-        remaining = list(items); packed = []; reached = False; exhaustive = True; dominant_lattice = True
-        inventory = {c.id: c.quantity for c in containers}; sequences = {c.id: 0 for c in containers}
+    def _across_containers_greedy(self, solver, items, containers, config, stats, deadline, opened):
+        start, reached = opened
+        remaining = list(start.remaining); packed = list(start.packed)
+        exhaustive = start.exhaustive; dominant_lattice = start.dominant_lattice
+        inventory = dict(start.inventory); sequences = dict(start.sequences)
         maximum = config.max_containers if config.max_containers is not None else sum(c.quantity if c.quantity is not None else len(items) for c in containers)
         ordered_containers = sorted(containers, key=lambda c: (c.cost_minor, c.inner_dimensions.volume, c.id))
-        while remaining and len(packed) < maximum:
+        while remaining and len(packed) < maximum and not reached:
             if deadline.expired: reached = True; break
             # `remaining` is immutable across one selection round, so the tuple the
             # per-template trials receive is built once per round, not once per
