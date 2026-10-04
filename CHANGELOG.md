@@ -4,6 +4,50 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0]
+
+Refusals you can name by type, and the replay promise of a result without building an
+artifact. A misspelt configuration key is now refused (see *Fixed*).
+
+### Added
+
+- **`UnsupportedFeatureError`, `UnknownSolverError`, `UnknownObjectiveError` and
+  `PolicyError` on `packvium`.** `pack_from_dict` already raised them; they are now importable
+  from the package root, so a refusal can be caught by type instead of by message.
+- **`packvium.artifacts.replay_level(result)`** — `"exact"` or `"not_guaranteed"`, the promise an
+  operational artifact of this result would make, without building the artifact.
+
+### Changed
+
+- **Faster beam and maximal-space search, same results.** The beam skips work on expansions
+  that cannot beat the best plan so far, and the maximal-space solver stops checking for
+  containing spaces once none can exist. Measured: beam requests 3–6% faster, `maximal_spaces`
+  up to 20% faster on large orders. Every result is byte-identical.
+
+### Fixed
+
+- **A block answer reports the support each item really has.** `HomogeneousBlockSolver` wrote
+  `support_ratio` 1.0 for every item, including those of a block set on a smaller one, which
+  overhang it. The bottom layer of each block now reports the share of its base that rests on
+  something. With `minimum_support_ratio` above zero the block solver is no longer tried at
+  all; its answer was built and then discarded by validation.
+- **A misspelt `configuration` key is refused.** A key the request schema does not declare in
+  `configuration` or its `effort_budget` (`profile` for `solver_profile`, `top_k` for
+  `alternatives`) was silently ignored, so the request ran on defaults. `pack_from_dict` now
+  raises `InvalidRequestError` with reason `not_allowed` and the key's pointer, for example
+  `/configuration/profile`.
+- **An unknown `objective` or access direction is a named request error.** `pack_from_dict`
+  raised `UnknownObjectiveError` / `InvalidDirectionError` with no reason or field; it now raises
+  `InvalidRequestError` with reason `not_allowed` and the value's pointer, like every other
+  refusal. The typed `Packer` API still raises `UnknownObjectiveError`.
+- **`Length` refuses a fractional float, as `Weight` already did.** `Length.mm(0.1)` silently
+  became 1600 ticks and `Length.mm(1e-9)` became 0; both now raise `TypeError`. An integral float
+  such as `100.0` is exact and still accepted.
+- **Compressible items are no longer laid out as rigid blocks.** `HomogeneousBlockSolver` now
+  hands them to the general solver, as `GridSolver` does.
+- **Refusal messages match `docs/ERRORS.md`**, e.g. a fixed placement with unknown keys says it
+  `cannot carry` them.
+
 ## [1.4.0]
 
 Replanning a job that has already started: items already loaded stay where they are, and every

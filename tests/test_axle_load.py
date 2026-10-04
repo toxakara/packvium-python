@@ -8,7 +8,7 @@ derived from the code under test.
 from __future__ import annotations
 
 from packvium import AxisAlignedBox, Axle, Dimensions, Length, Point, Weight
-from packvium.axle_load import axle_load_exceeded, axle_reactions
+from packvium.axle_load import axle_balanced_origins, axle_load_exceeded, axle_reactions
 from packvium.constraints import LoadUnit
 
 
@@ -83,3 +83,16 @@ def test_a_load_outside_the_axle_span_has_a_negative_opposite_reaction():
     assert denominator == 1600
     assert front < 0
     assert rear > 0
+
+
+def test_only_the_rear_axle_limit_yields_a_balanced_origin_when_the_front_is_unlimited():
+    # Rear reaction of 800 centred at c over axles 100/900 is 800 * (c - 100) / 800, so
+    # the rear limit of 400 is met exactly at c = 500: a 200-long item starts at 400.
+    axles = (Axle(Length(100)), Axle(Length(900), Weight(400)))
+    assert axle_balanced_origins(axles, [], 0, 0, 800, 200) == [400]
+
+
+def test_only_the_front_axle_limit_yields_a_balanced_origin_when_the_rear_is_unlimited():
+    # Front reaction is 800 * (900 - c) / 800; a front limit of 400 also lands at c = 500.
+    axles = (Axle(Length(100), Weight(400)), Axle(Length(900)))
+    assert axle_balanced_origins(axles, [], 0, 0, 800, 200) == [400]

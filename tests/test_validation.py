@@ -678,3 +678,8 @@ def test_the_report_names_the_offending_item():
     )
     assert not report.valid
     assert any("cube#1" in issue.detail and "cube#2" in issue.detail for issue in report.issues)
+
+
+def test_an_empty_packed_container_raises_no_issue():
+    box = Container.create("box", Dimensions.mm(100, 100, 100))
+    assert issues_for([item("a")], [box], [PackedContainer(box, 1, ())]) == []

@@ -9,12 +9,13 @@ placement it never verified is the failure mode that matters.
 from __future__ import annotations
 
 from collections import Counter
-from itertools import combinations
+from itertools import accumulate, combinations
 
 import pytest
 
 from packvium import (AxisAlignedBox, Container, Dimensions, EffortBudget, Item, Length,
                          Obstacle, PackedContainer, PackingConfig, Placement, Point, Rotation)
+from packvium.geometry import ShapeType
 from packvium.nesting import used_volume as nesting_used_volume
 from packvium.solvers import (MAX_MAXIMAL_SPACES, MINIMUM_SLICE_NS, ContainerState, Deadline,
                                  DeterministicRandom, ExactSmallSolver, ExtremePointSolver,
@@ -1157,6 +1158,27 @@ def test_lattice_summary_aggregates_match_brute_force_expansion(length, width, q
             == brute_force_com(inner, expanded))
 
 
+def _lattice(count=1, nx=1, ny=1, weight_ticks=0):
+    from packvium.lattice_summary import LatticeSummary
+    cube = Dimensions.mm(10, 10, 10)
+    return LatticeSummary("cube", Rotation.LWH, cube, cube, nx, ny, cube.height.ticks, 0, count, weight_ticks)
+
+
+def test_a_lattice_summary_must_describe_at_least_one_instance():
+    with pytest.raises(ValueError, match="at least one placed instance"):
+        _lattice(count=0)
+
+
+@pytest.mark.parametrize("nx, ny", [(0, 1), (1, 0)])
+def test_a_lattice_summary_needs_positive_capacity_on_both_floor_axes(nx, ny):
+    with pytest.raises(ValueError, match="positive per-axis capacity"):
+        _lattice(nx=nx, ny=ny)
+
+
+def test_a_weightless_lattice_has_no_centre_of_mass_offset():
+    assert _lattice(count=4, nx=2, ny=2).centre_of_mass_offset_ppm(1_000, 1_000) == 0
+
+
 # ------------------------------------------------------------------- exact search
 
 # ------------------------------------------------------- exact-search tie-break
@@ -1327,14 +1349,14 @@ def test_additive_cardinality_bound_is_an_admissible_relaxation():
     exactly the maximum cardinality admitted by the additive resource. Geometry and
     business constraints can only lower the real packing count from there.
     """
-    for costs in ((2, 3, 5), (1, 4, 4, 9), (3, 3, 3, 7, 8)):
+    for costs in ((2, 3, 5), (1, 4, 4, 9), (3, 3, 3, 7, 8), (0, 0, 2, 6)):
         for capacity in range(sum(costs) + 1):
             exact = max(
                 (len(chosen) for size in range(len(costs) + 1)
                  for chosen in combinations(costs, size) if sum(chosen) <= capacity),
                 default=0,
             )
-            assert _count_with_capacity(sorted(costs), capacity) == exact
+            assert _count_with_capacity(tuple(accumulate(sorted(costs))), capacity) == exact
 
 
 def test_more_block_search_effort_cannot_worsen_the_objective():
@@ -1368,4 +1390,24 @@ def test_block_search_falls_back_when_a_business_rule_can_distinguish_placements
     )
     assert len(solution.state.placements) == 1
     assert len(solution.unpacked) == 1
+    assert_physically_sound(solution.state)
+
+
+def test_block_search_falls_back_for_compressible_items():
+    box = Container.create("box", Dimensions.mm(100, 100, 200), quantity=1)
+    compressible_item = Item.create(
+        "sponge",
+        Dimensions.mm(100, 100, 100),
+        shape_type=ShapeType.COMPRESSIBLE,
+        compression_ratio_ppm=200_000,
+        max_compression_pressure_kpa=50,
+    )
+    order = tuple(instances("sponge", 100, 100, 100, quantity=2, shape_type=ShapeType.COMPRESSIBLE,
+                            compression_ratio_ppm=200_000, max_compression_pressure_kpa=50))
+    solver = HomogeneousBlockSolver()
+    assert not solver._supports(box, order, PackingConfig.quality())
+    solution = solver.pack_one(
+        box, 1, order, PackingConfig.quality(), SearchStats(), generous(),
+    )
+    assert len(solution.state.placements) == 2
     assert_physically_sound(solution.state)

@@ -187,7 +187,7 @@ def test_dimensional_weight_matches_the_textbook_inches_and_pounds_example():
 def test_dimensional_weight_is_exact_for_a_round_centimetres_and_kilograms_case():
     # 40 x 30 x 20 cm at a 5000 divisor is exactly 4.8 kg -- no rounding involved.
     result = dimensional_weight(Dimensions.of(40, 30, 20, "cm"), 5000, "cm", "kg")
-    assert result.ticks == Weight.of(4.8, "kg").ticks
+    assert result.ticks == Weight.of("4.8", "kg").ticks
 
 
 def test_dimensional_weight_scales_inversely_with_the_divisor():

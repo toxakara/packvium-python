@@ -18,6 +18,7 @@ import pytest
 
 from packvium.geometry import ALL_DIRECTIONS, Dimensions, InvalidDirectionError
 from packvium.models import Container
+from packvium.request_errors import InvalidRequestError
 from packvium.serialization import pack_from_dict
 from packvium.units import Length
 
@@ -78,11 +79,17 @@ def test_one_bad_direction_refuses_the_whole_list():
 # ------------------------------------------------------- the same rules through a request
 
 def _request(doors):
+    # Counted work, not a clock, decides where the search stops: under the default
+    # wall-clock limit a loaded host truncated one of two otherwise identical solves, and
+    # the comparisons below reported the host rather than the engine. The time limit is
+    # only a fuse, far above what one cube needs.
     container = {"id": "van",
                  "inner_dimensions": {"length": "200", "width": "100", "height": "100"}}
     if doors is not None:
         container["access_directions"] = doors
     return {"units": {"length": "mm"},
+            "configuration": {"effort_budget": {"max_search_nodes": 20000},
+                              "time_limit_ms": 60000},
             "items": [{"id": "cube", "quantity": 1,
                        "dimensions": {"length": "100", "width": "100", "height": "100"}}],
             "containers": [container]}
@@ -93,8 +100,10 @@ def test_a_request_reaches_the_same_validation_as_the_constructor():
     canonicalisation. `docs/STOP-ACCESSIBILITY.md` records that a rule no request can
     switch on is untested along the path it will be switched on through; this is that
     path."""
-    with pytest.raises(InvalidDirectionError):
+    with pytest.raises(InvalidRequestError) as exc_info:
         pack_from_dict(_request(["upwards"]))
+    assert exc_info.value.reason == "not_allowed"
+    assert exc_info.value.field == "/containers/0/access_directions/0"
 
 
 def _without_wall_clock(result: dict) -> dict:

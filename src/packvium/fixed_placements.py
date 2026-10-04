@@ -69,7 +69,7 @@ def _require_entry_shape(entry: Any, where: str, field: str, unit: str) -> None:
         raise _malformed(f"{where} is an object", field)
     unknown = sorted(set(entry) - set(_FIELDS))
     if unknown:
-        raise _malformed(f"{where} does not carry {json_spelling(unknown)}", field)
+        raise _malformed(f"{where} cannot carry {json_spelling(unknown)}", field)
     missing = [name for name in _REQUIRED if name not in entry]
     if missing:
         raise _malformed(f"{where} needs {json_spelling(missing)}", field)
@@ -105,7 +105,7 @@ def require_point_shape(point: Any, where: str, field: str,
         raise error(f"{where} is a point object", field)
     unknown = sorted(set(point) - set(_AXES))
     if unknown:
-        raise error(f"{where} does not carry {json_spelling(unknown)}", field)
+        raise error(f"{where} cannot carry {json_spelling(unknown)}", field)
     for axis in _AXES:
         if axis in point and (point[axis] is None or isinstance(point[axis], (bool, list))):
             raise error(f"{where}.{axis} is a measure", f"{field}/{axis}")

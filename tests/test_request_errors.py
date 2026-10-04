@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
 from packvium import EffortBudget, FixedPlacementError, InvalidRequestError, PackingConfig, pack_from_dict
 from packvium.units import Length, Weight
-from packvium.request_errors import REASONS, check_request, pointer
+from packvium.request_errors import CONFIGURATION_FIELDS, REASONS, check_request, pointer
 
 
 def request() -> dict:
@@ -78,6 +80,10 @@ def refusal(edit) -> InvalidRequestError:
      "missing_field", "/containers/0/obstacles/0/dimensions/height", "is required"),
     (lambda d: d["configuration"].update(solver_profile="fastest"), "not_allowed",
      "/configuration/solver_profile", 'must be one of ["fast","balanced","quality","exact_small"]'),
+    (lambda d: d["configuration"].update(top_k=2, profile="balanced"), "not_allowed",
+     "/configuration/profile", "is not a known field"),
+    (lambda d: d["configuration"].update(effort_budget={"max_nodes": 1}), "not_allowed",
+     "/configuration/effort_budget/max_nodes", "is not a known field"),
     (lambda d: d["configuration"].update(effort_budget={"max_restarts": 0}), "below_minimum",
      "/configuration/effort_budget/max_restarts", "must be at least 1"),
 ])
@@ -173,3 +179,20 @@ def test_an_integral_float_is_a_whole_measure_and_a_fraction_is_refused():
         Length.parse(1.5)
     with pytest.raises(TypeError):
         Weight.parse(1.5)
+
+
+def test_an_empty_tag_limits_object_is_accepted():
+    data = request()
+    data["containers"][0]["tag_limits"] = {}
+    check_request(data)
+
+
+def test_the_known_configuration_fields_are_the_schema_s():
+    path = Path(__file__).resolve().parents[2] / "conformance" / "schema" / "packing-request.schema.json"
+    # The schema sits beside this package in the workspace; a published copy does not carry it.
+    if not path.is_file():
+        pytest.skip("the request schema is not part of this package")
+    schema = json.loads(path.read_text())
+    configuration = schema["properties"]["configuration"]
+    assert configuration["additionalProperties"] is False
+    assert set(CONFIGURATION_FIELDS) == set(configuration["properties"])

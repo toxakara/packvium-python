@@ -157,6 +157,17 @@ def test_a_result_that_does_not_say_how_it_was_solved_is_not_promised_one_either
     assert provenance["replay"] == {"level": "not_guaranteed", "because": "provenance.solver"}
 
 
+
+def test_replay_level_is_the_promise_the_artifact_would_make():
+    """`replay_level` answers without building the artifact, by the same rule."""
+    from packvium.artifacts import replay_level
+
+    stopped = _result(algorithm=dict(_result()["algorithm"], time_limit_reached=True))
+    for result in (_result(), stopped, _result(algorithm=None)):
+        expected = build_operational_artifact(REQUEST, result)["provenance"]["replay"]["level"]
+        assert replay_level(result) == expected
+    assert replay_level(_result()) == "exact"
+
 # --------------------------------------------------------------------------------- refusals
 
 

@@ -9,20 +9,25 @@ boxes sharing at least one cell with it, not every box ever placed.
 Safety property the whole design leans on: a grid cell assignment only needs to be a
 superset of "boxes this query could possibly intersect" -- `query()` returns bound
 *indices*, and the caller (unchanged from before this module existed) still runs the
-exact 6-comparison AABB test on each one before trusting it. A bug here can only make
-the index slower (over-inclusive buckets) or, if under-inclusive, is caught immediately
-by the differential property tests in `test_spatial_index.py`, which compare every
-query against a naive O(n) scan across many random configurations. It can never by
-itself cause a false "no collision" silently, because the exact check is still the
-final word.
+exact 6-comparison AABB test on each one before trusting it. Over-inclusive buckets
+only make the index slower, but under-inclusive buckets can miss collisions: the
+exact check cannot recover an omitted candidate. Differential property tests in
+`test_spatial_index.py` compare queries against a naive O(n) scan, including cached
+queries after insertions and forks, to guard that completeness invariant.
 """
 
 from __future__ import annotations
 
 from itertools import chain
-from typing import Iterable, Sequence
+from typing import Iterable
 
 Bound = tuple[int, int, int, int, int, int]
+_QUERY_CACHE_LIMIT = 1024
+# Every live search state keeps the dictionary it was born with, so what an insertion
+# carries over multiplies by the beam. Carrying 128 kept the measured quality
+# tracemalloc peak near 1.4.0 while preserving most of the reuse; carrying 1024
+# raised that peak by 22–27%.
+_RETAINED_ANSWERS_LIMIT = 128
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -52,8 +57,9 @@ class SpatialIndex:
         # Query answers by cell range, valid for the current contents only. A candidate
         # scan asks about far more boxes than there are distinct cell ranges -- the grid
         # is coarse by design -- and the answer for a range is a pure function of the
-        # contents, so it is computed once per range per generation of the index.
-        self._answers: dict[tuple[int, int, int, int, int, int], Sequence[int]] = {}
+        # contents. Disjoint insertions preserve answers; overlapping insertions and
+        # the retention ceiling cause lazy recomputation.
+        self._answers: dict[tuple[int, int, int, int, int, int], tuple[int, ...]] = {}
 
     def copy(self) -> "SpatialIndex":
         """A structural fork: independent of the original from this point on.
@@ -87,15 +93,23 @@ class SpatialIndex:
                 for iz in range(iz1, iz2):
                     key = (ix, iy, iz)
                     cells[key] = cells.get(key, ()) + (index,)
-        self._answers = {}
+        # Forks share immutable answers. Replace this branch's cache, retaining only
+        # ranges disjoint from the cells changed by this insertion, the oldest first.
+        retained: dict[tuple[int, int, int, int, int, int], tuple[int, ...]] = {}
+        for key, answer in self._answers.items():
+            if (key[1] <= ix1 or ix2 <= key[0] or key[3] <= iy1 or iy2 <= key[2]
+                    or key[5] <= iz1 or iz2 <= key[4]):
+                retained[key] = answer
+                if len(retained) >= _RETAINED_ANSWERS_LIMIT: break
+        self._answers = retained
 
-    def query(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> Sequence[int]:
+    def query(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> tuple[int, ...]:
         """Bound indices sharing at least one cell with the given box, each at most once.
 
         Cells are visited in `(x, y, z)` order and an index keeps its first position, so
-        the sequence is a deterministic function of the index contents. Returned as a
-        sequence rather than a generator: this is the innermost call of the candidate
-        scan, and a bucket can be handed back as-is when the box touches only one.
+        the sequence is a deterministic function of the index contents. Returned as an
+        immutable tuple rather than a generator: this is the innermost call of the
+        candidate scan. Buckets and cached answers can be shared safely across forks.
         """
         cell_x, cell_y, cell_z = self.cell_x, self.cell_y, self.cell_z
         ix1, ix2 = x1 // cell_x, -(-max(x2, x1 + 1) // cell_x)
@@ -107,10 +121,13 @@ class SpatialIndex:
         answers = self._answers
         answer = answers.get(cell_range)
         if answer is not None: return answer
+        if len(answers) >= _QUERY_CACHE_LIMIT:
+            # Detach rather than clear: another search branch may share this cache.
+            self._answers = answers = {}
         answers[cell_range] = answer = self._collect(ix1, ix2, iy1, iy2, iz1, iz2)
         return answer
 
-    def _collect(self, ix1: int, ix2: int, iy1: int, iy2: int, iz1: int, iz2: int) -> Sequence[int]:
+    def _collect(self, ix1: int, ix2: int, iy1: int, iy2: int, iz1: int, iz2: int) -> tuple[int, ...]:
         cells = self.cells
         hits: list[tuple[int, ...]] = []
         for ix in range(ix1, ix2):
@@ -120,7 +137,7 @@ class SpatialIndex:
                     if bucket: hits.append(bucket)
         if not hits: return ()
         if len(hits) == 1: return hits[0]
-        return list(dict.fromkeys(chain.from_iterable(hits)))
+        return tuple(dict.fromkeys(chain.from_iterable(hits)))
 
 
 def build(bounds: Iterable[Bound], length_ticks: int, width_ticks: int, height_ticks: int) -> SpatialIndex:

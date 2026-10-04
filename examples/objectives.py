@@ -11,7 +11,7 @@ genuinely pick different containers, so the difference is visible rather than as
 
 The score is always a lexicographic vector of exact integers, never a float, and its first
 key is always `unpacked_count`: no objective will ever leave an item behind to save money.
-Ratios are parts per million. See docs/OBJECTIVE.md for the full key ordering.
+Ratios are parts per million.
 """
 
 from packvium import Container, Dimensions, Item, Packer, PackingConfig
@@ -110,7 +110,7 @@ print("open_dimension   ", solve(PackingConfig(objective="open_dimension_height"
 # ---------------------------------------------------------------------------------
 # `maximum_value` -- when not everything fits, leave the *cheap* things behind. Ranked by
 # value forgone, after unpacked count. Note the honest limitation: this orders by value,
-# it does not solve the knapsack problem to optimality. See docs/LIMITATIONS-AND-ROADMAP.md.
+# it does not solve the knapsack problem to optimality.
 # ---------------------------------------------------------------------------------
 # `quantity=1` is what makes this a choice at all: with an unlimited supply of boxes the
 # packer simply opens a second one and nothing is left behind.

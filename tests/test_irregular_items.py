@@ -369,3 +369,14 @@ def test_a_face_carrying_a_non_corner_vertex_is_wound_past_it():
                 normal = _cross(_subtract(second, apex), _subtract(third, apex))
                 residual = [residual[i] + normal[i] for i in range(3)]
     assert residual == [0, 0, 0]
+
+
+def test_the_face_walk_stops_after_one_step_per_vertex_even_when_it_never_returns():
+    """A face whose points do not wind around the given normal would walk in a cycle that
+    skips the start; the walk is bounded by the vertex count instead of looping forever."""
+    from packvium.hull import _ordered_face
+
+    face = [(-2, 2, 2), (2, 2, 0), (1, 2, -2), (-1, -1, 2)]
+    ordered = _ordered_face(face, (2, -1, -2))
+    assert ordered[0] == min(face)
+    assert len(ordered) == len(face) + 1

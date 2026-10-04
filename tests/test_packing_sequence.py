@@ -691,6 +691,12 @@ def test_composed_safe_loading_api_cannot_return_an_overloaded_order():
         safe_loading_order_for_placements(placements, container)
 
 
+def test_composed_safe_loading_api_returns_the_floor_up_order_for_a_sound_stack():
+    light = Item.create("light", Dimensions.mm(10, 10, 5), weight="1kg")
+    placements = [stacked_placement(light, 0, 0, 5), stacked_placement(light, 0, 0, 0)]
+    container = Container.create("c", Dimensions.mm(10, 10, 20))
+    assert safe_loading_order_for_placements(placements, container) == [1, 0]
+
 def test_a_malformed_business_rule_order_is_rejected_before_any_rule_check():
     item = Item.create("a", Dimensions.mm(10, 10, 5))
     placements = [stacked_placement(item, 0, 0, 0)]
@@ -809,3 +815,19 @@ def test_sequence_replay_error_to_dict_matches_the_cross_language_shape():
         "step": 1,
         "reason": "no allowed direction is clear of the remaining placements",
     }
+
+
+def test_reachability_serialises_its_evidence_in_ascending_index_order():
+    container = Dimensions.mm(30, 10, 10)
+    near, far = box(0, 0, 0, 10, 10, 10), box(10, 0, 0, 10, 10, 10)
+    entry = placement_reachability([near, far], container, directions=("-x",))[1]
+    assert entry.to_dict() == {
+        "index": 1, "reachable": False, "blocked_by_support": [],
+        "blocked_by_neighbors": [0], "blocked_by_route": [],
+    }
+
+
+def test_reachability_refuses_a_stop_list_of_the_wrong_length():
+    container = Dimensions.mm(20, 10, 10)
+    with pytest.raises(ValueError, match="one entry per placement"):
+        placement_reachability([box(0, 0, 0, 10, 10, 10)], container, stops=[0, 1])

@@ -335,3 +335,79 @@ def test_rebalance_applies_the_same_landed_cost_admission_as_pack():
     request_with_unused_container = PackingRequest((parcel,), (rated, untabled))
     with pytest.raises(UnknownObjectiveError, match="rate_table on every container; 'untabled'"):
         rebalance_weight(request_with_unused_container, result.containers, result.unpacked, valid)
+
+
+# ----------------------------------------------------------- moves declined or capped
+
+
+def _heavy_light_alone(alone_box=None):
+    """The hand-computed 6kg / 1kg scene above, optionally with the lone item in a
+    container type of its own so its free space can be controlled."""
+    heavy = item("heavy", 40, 40, 40, weight="5000 g")
+    light = item("light", 40, 40, 40, weight="1000 g")
+    alone = item("alone", 40, 40, 40, weight="1000 g")
+    box_type = container("box", 200, 200, 200)
+    other = alone_box or box_type
+    request = PackingRequest((heavy, light, alone), tuple({box_type.id: box_type, other.id: other}.values()))
+    packed = (
+        PackedContainer(box_type, 1, (_floor_placement(heavy, 1, 0, 0), _floor_placement(light, 1, 50, 0))),
+        PackedContainer(other, 1 if other is not box_type else 2, (_floor_placement(alone, 1, 0, 0),)),
+    )
+    return request, packed
+
+
+def test_the_move_budget_caps_how_many_moves_are_committed():
+    request, packed = _heavy_light_alone()
+    outcome = rebalance_weight(request, packed, (), PackingConfig(), max_moves=1)
+    assert [move.item_id for move in outcome.moves] == ["light#1"]
+
+
+def test_a_destination_with_no_room_left_receives_nothing():
+    request, packed = _heavy_light_alone(container("snug", 40, 40, 40))
+    outcome = rebalance_weight(request, packed, (), PackingConfig())
+    assert outcome.moves == ()
+    assert outcome.containers == packed
+
+
+def test_an_item_moved_onto_a_full_floor_is_stacked_and_stays_supported():
+    request, packed = _heavy_light_alone(container("tower", 40, 40, 80))
+    config = PackingConfig()
+    outcome = rebalance_weight(request, packed, (), config)
+
+    assert [move.item_id for move in outcome.moves] == ["light#1"]
+    tower = next(c for c in outcome.containers if c.id == "tower#1")
+    moved = next(p for p in tower.placements if p.instance.id == "light#1")
+    assert moved.position.z == 40 * 16_000
+    assert moved.support_ratio == 1.0
+    _assert_accounting_holds(request, outcome.containers, ())
+    _assert_valid(request, outcome.containers, (), config)
+
+
+def test_a_weightless_item_is_never_moved_since_it_cannot_change_the_spread():
+    heavy = item("heavy", 40, 40, 40, weight="5000 g")
+    feather = item("feather", 40, 40, 40)
+    alone = item("alone", 40, 40, 40, weight="1000 g")
+    box_type = container("box", 200, 200, 200)
+    request = PackingRequest((heavy, feather, alone), (box_type,))
+    packed = (
+        PackedContainer(box_type, 1, (_floor_placement(heavy, 1, 0, 0), _floor_placement(feather, 1, 50, 0))),
+        PackedContainer(box_type, 2, (_floor_placement(alone, 1, 0, 0),)),
+    )
+    outcome = rebalance_weight(request, packed, (), PackingConfig())
+    assert outcome.moves == ()
+
+
+def test_a_deadline_reached_mid_search_declines_the_move_instead_of_failing(monkeypatch):
+    """The rebalance deadline has no injectable clock, so this one test swaps in a
+    deadline whose clock expires right after the round has started: the candidate
+    search then raises `TimeLimitReached`, which must read as "no move", not an error."""
+    import packvium.rebalance as rebalance_module
+    from packvium.solvers import Deadline
+
+    readings = iter([0, 0])
+    monkeypatch.setattr(rebalance_module, "Deadline",
+                        lambda limit_ms: Deadline(limit_ms, clock=lambda: next(readings, 10**18)))
+    request, packed = _heavy_light_alone()
+    outcome = rebalance_weight(request, packed, (), PackingConfig())
+    assert outcome.moves == ()
+    assert outcome.containers == packed

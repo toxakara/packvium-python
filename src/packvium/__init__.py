@@ -8,7 +8,8 @@ from .explain import (
     explain_unpacked_item,
     explain_unpacked_items,
 )
-from .extensions import ContainerSelector, DefaultSolutionScorer, ExtensionRegistry, ItemOrderStrategy, SolutionScorer
+from .extensions import (ContainerSelector, DefaultSolutionScorer, ExtensionRegistry, ItemOrderStrategy, SolutionScorer,
+                         UnknownObjectiveError)
 from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, dimensional_weight
 from .fixed_placements import FixedPlacementError
 from .request_errors import InvalidRequestError
@@ -46,7 +47,9 @@ from .result import (
     StartRecord,
     aggregate_termination,
 )
-from .serialization import pack_from_dict
+from .policy import PolicyError
+from .serialization import UnsupportedFeatureError, pack_from_dict
+from .solvers import UnknownSolverError
 from .trace import TraceSink, use_trace
 from .units import Length, Rounding, Weight
 from .validation import IndependentSolutionValidator, ValidationIssue, ValidationReport
@@ -54,6 +57,7 @@ from .validation import IndependentSolutionValidator, ValidationIssue, Validatio
 __all__ = [
     "ALL_DIRECTIONS", "AlgorithmReport", "Axle", "AxisAlignedBox", "Container", "DefaultSolutionScorer", "Dimensions",
     "EffortBudget", "ExtensionRegistry", "FixedPlacement", "FixedPlacementError", "InvalidRequestError",
+    "PolicyError", "UnknownObjectiveError", "UnknownSolverError", "UnsupportedFeatureError",
     "IndependentSolutionValidator", "InvalidDirectionError", "Item", "ItemInstance", "LEVEL_PREFIXES", "Length",
     "LoadingDependencyGraph", "NestedPacker",
     "NestedPackingResult", "Obstacle", "PackedContainer", "Packer", "PackingConfig",

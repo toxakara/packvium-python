@@ -1694,3 +1694,19 @@ def test_the_two_stops_that_collapse_into_one_are_exactly_the_pair_the_bound_exc
     assert 2 ** 53 != 2 ** 53 + 1
     with pytest.raises(ValueError, match="non-negative safe integer"):
         Item.create("collapses", Dimensions.mm(10, 10, 10), stop_index=2 ** 53)
+
+
+def test_a_nesting_predecessor_is_listed_after_a_lower_indexed_face_supporter():
+    """The supporter list keeps the same placement-index order as the surface list: a
+    face that genuinely carries the candidate and was placed first stays ahead of the
+    predecessor inserted for it."""
+    crate = Item.create("crate", Dimensions.mm(10, 10, 10), quantity=2,
+                        nesting_height=Length.mm(5), minimum_support_ratio=1.0)
+    predecessor, candidate = crate.instances()
+    under, = Item.create("shelf", Dimensions.mm(5, 10, 5)).instances()
+    placements = (placed(under), placed(predecessor))
+    resting = context(candidate, z=Length.mm(5).ticks, placements=placements)
+
+    support = direct_support_view(placements, candidate, resting.envelope_box)
+
+    assert [entry.index for entry in support.supporters] == [0, 1]

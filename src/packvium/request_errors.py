@@ -28,6 +28,8 @@ REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "neg
            "invalid_unit", "duplicate_id", "not_allowed", "invalid_value")
 
 SOLVER_PROFILES = ("fast", "balanced", "quality", "exact_small")
+OBJECTIVES = ("default", "lowest_cost", "shipping_cost", "lowest_landed_cost", "open_dimension_height", "maximum_value")
+ACCESS_DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
 
 
 class InvalidRequestError(ValueError):
@@ -86,6 +88,14 @@ def _one_of(value: Any, field: str, allowed: Sequence[str]) -> None:
         raise InvalidRequestError("not_allowed", field, f"must be one of {json_spelling(list(allowed))}")
 
 
+def _known_fields(value: Mapping[str, Any], field: str, known: Iterable[str]) -> None:
+    """The schema closes this object: a key it does not name is refused, never ignored. The
+    first unknown key in code-point order is named, the order every engine can share."""
+    unknown = sorted(set(value) - set(known))
+    if unknown:
+        raise InvalidRequestError("not_allowed", pointer_join(field, unknown[0]), "is not a known field")
+
+
 def _object(value: Any, field: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise InvalidRequestError("wrong_type", field, "must be an object")
@@ -127,6 +137,14 @@ _CONFIGURATION_INTEGERS = (("time_limit_ms", 1), ("alternatives", 1), ("max_cont
                            ("dimensional_weight_divisor", 1))
 _EFFORT_LIMITS = ("max_candidates_evaluated", "max_placement_attempts", "max_search_nodes",
                   "max_restarts")
+#: Every key the request schema's `configuration` declares; it sets `additionalProperties: false`.
+CONFIGURATION_FIELDS = ("alternatives", "clearance", "container_plan_beam_width",
+                        "container_plan_node_limit", "dimensional_weight_divisor",
+                        "dimensional_weight_length_unit", "dimensional_weight_weight_unit",
+                        "effort_budget", "exact_item_limit", "max_candidate_points",
+                        "max_candidates_per_item", "max_containers", "minimum_support_ratio",
+                        "multi_start_orders", "objective", "require_placement_coordinates", "seed",
+                        "solver_profile", "solvers", "time_limit_ms")
 _SIDES = ("length", "width", "height")
 
 
@@ -162,8 +180,11 @@ def _check_configuration(raw: Any, unit: str) -> None:
     if raw is None:
         return
     configuration = _object(raw, "/configuration")
+    _known_fields(configuration, "/configuration", CONFIGURATION_FIELDS)
     _optional(configuration, "solver_profile", "/configuration",
               lambda v, f: _one_of(v, f, SOLVER_PROFILES))
+    _optional(configuration, "objective", "/configuration",
+              lambda v, f: _one_of(v, f, OBJECTIVES))
     for name, minimum in _CONFIGURATION_INTEGERS:
         _optional(configuration, name, "/configuration", lambda v, f, m=minimum: _integer(v, f, m))
     _optional(configuration, "minimum_support_ratio", "/configuration", _ratio)
@@ -171,6 +192,7 @@ def _check_configuration(raw: Any, unit: str) -> None:
     effort = configuration.get("effort_budget")
     if effort is not None:
         budget = _object(effort, "/configuration/effort_budget")
+        _known_fields(budget, "/configuration/effort_budget", _EFFORT_LIMITS)
         for name in _EFFORT_LIMITS:
             _optional(budget, name, "/configuration/effort_budget", lambda v, f: _integer(v, f, 1))
 
@@ -202,9 +224,16 @@ def _check_container(raw: Any, where: str, unit: str) -> None:
     _optional(container, "max_items", where, lambda v, f: _integer(v, f, 1))
     _optional(container, "cost_minor", where, lambda v, f: _integer(v, f, 0))
     _optional(container, "void_fill_reserve_ratio", where, _ratio)
+    _optional(container, "access_directions", where, _access_directions)
     _optional(container, "tag_limits", where, _tag_limits)
     _optional(container, "rate_table", where, _rate_table)
     _optional(container, "obstacles", where, lambda v, f: _obstacles(v, f, unit))
+
+
+def _access_directions(raw: Any, where: str) -> None:
+    values = _list(raw, where)
+    for index, value in enumerate(values):
+        _one_of(value, pointer_join(where, index), ACCESS_DIRECTIONS)
 
 
 def _dimensions(raw: Any, where: str, unit: str) -> None:

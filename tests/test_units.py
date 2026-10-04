@@ -138,7 +138,21 @@ def test_float_input_is_rejected():
     with pytest.raises(TypeError):
         Length.parse(1.2)
     with pytest.raises(TypeError):
+        Length.of(1.2)
+    with pytest.raises(TypeError):
+        Length.mm(1.2)
+    with pytest.raises(TypeError):
         Weight.parse(1.2)
+    with pytest.raises(TypeError):
+        Weight.of(1.2)
+    with pytest.raises(TypeError):
+        Weight.of(1.2, "g")
+
+
+def test_an_integral_float_is_exact_and_accepted():
+    """`100.0` is what JavaScript sends for `100`, and it has lost nothing."""
+    assert Length.of(100.0) == Length.of(100)
+    assert Weight.of(2.0, "kg") == Weight.of(2, "kg")
 
 
 def test_unsupported_units_are_rejected():
