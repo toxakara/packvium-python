@@ -3,10 +3,14 @@
 Deterministic 3D cartonization and rectangular bin packing. Pure Python, **no runtime
 dependencies**, exact integer geometry.
 
+Use it to pick the smallest carton for an order, build a pallet, load a shipping container,
+or load a truck within its axle ratings and delivery-stop order. Every answer comes back as
+coordinates and rotations for each item, with a reason for anything that did not fit.
+
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.4.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.5.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -25,19 +29,23 @@ result = Packer(PackingConfig.balanced()).pack(
     containers=[Container.create("box", Dimensions.mm("400", "300", "250"))],
 )
 
-print(result.status)                      # feasible
+print(result.status.value)                # feasible
 for container in result.containers:
     for placement in container.placements:
-        print(placement.item_id, placement.position, placement.orientation)
+        print(placement.instance.id, placement.position, placement.rotation.value)
 ```
 
-Fractional inches are exact, not approximated:
+The same request as JSON, through the function every Packvium engine shares, or through the
+command line, which reads a request on standard input:
 
 ```python
-Dimensions.inches("12 3/8", "8 1/2", "3/4")
-```
+from packvium import pack_from_dict
 
-There is also a CLI that reads a JSON request on standard input:
+result = pack_from_dict({
+    "items": [{"id": "book", "quantity": 4, "dimensions": {"length": "210", "width": "140", "height": "30"}}],
+    "containers": [{"id": "box", "inner_dimensions": {"length": "400", "width": "300", "height": "250"}}],
+})
+```
 
 ```bash
 echo '{"items":[{"id":"box","quantity":8,"dimensions":{"length":"50","width":"50","height":"50"}}],
@@ -45,10 +53,84 @@ echo '{"items":[{"id":"box","quantity":8,"dimensions":{"length":"50","width":"50
   | python -m packvium
 ```
 
+## Units
+
+Lengths are stored in ticks of 1/16000 mm and weights in ticks of 1/8 µg, as integers.
+Inputs are integers or decimal strings with a unit (`mm`, `cm`, `m`, `in`, `ft`; `mg`, `g`,
+`kg`, `oz`, `lb`), and fractional inches are exact, not approximated:
+
+```python
+Dimensions.inches("12 3/8", "8 1/2", "3/4")
+Item.create("mug", Dimensions.mm("100", "100", "120"), "12 oz")
+```
+
+A JSON request refuses a float measure rather than rounding it: send `"160.5"`, not
+`160.5`. See
+[docs/UNITS-AND-NUMERICS.md](https://github.com/toxakara/packvium-python/blob/main/docs/UNITS-AND-NUMERICS.md).
+
+## Getting the same answer every time
+
+The search runs several starts and keeps the best. By default a wall clock decides when it
+stops (`time_limit_ms`, one second), so a search the clock cuts short keeps whatever it had
+reached, and a busy machine can reach less. The same request can then give a different
+answer on a different run.
+
+For an answer you can store, compare or replay, bound the search by counted work instead,
+and keep the time limit only as a generous fuse:
+
+```python
+from packvium import EffortBudget, PackingConfig
+
+config = PackingConfig.balanced(
+    time_limit_ms=60_000,
+    effort_budget=EffortBudget(max_candidates_evaluated=50_000),
+)
+# JSON: "configuration": {"time_limit_ms": 60000, "effort_budget": {"max_candidates_evaluated": 50000}}
+```
+
+The result says what stopped the search: `result.termination.code` is `complete`,
+`effort_limit` (reproducible), or `time_limit` (not reproducible).
+`packvium.artifacts.replay_level(result.to_dict())` gives the same verdict as `exact` or
+`not_guaranteed`. `reproducibility.py` shows four simulated machines giving four
+different answers under a clock, and one answer under a budget.
+
+## Solver profiles
+
+`solver_profile` (JSON) or the matching `PackingConfig` constructor picks how hard the search
+tries:
+
+| Profile | What it runs |
+| --- | --- |
+| `fast` | One ordering, one solver. No runners-up. |
+| `balanced` (default) | Several solvers over several item orderings, keeping up to two runners-up. |
+| `quality` | More solvers and orderings, a beam over container choices, and exact search for small orders. Slower. |
+| `exact_small` | Bounded exact search when the order has at most `exact_item_limit` items (7, counting quantity); otherwise the same search as `balanced`. |
+
+`PackingConfig.fast()`, `.balanced()`, `.quality()` and `.exact_small()` default to time
+limits of 0.2, 1, 5 and 10 seconds; a JSON request defaults to 1 second whatever the
+profile. An `effort_budget` makes any of them reproducible.
+
+## Trucks, axles and delivery routes
+
+A container can describe a vehicle, not only a box:
+
+- `axles`: `[front, rear]`, each a position along the length and a `max_load`. Every
+  placement is checked against both ratings using the gross load, tare included, and the
+  result reports the exact `axle_reactions`.
+- `access_directions`: the walls cargo leaves through, such as `["+x"]` for rear doors.
+- `stop_index` on an item: the stop it is delivered at, `0` first. Nothing due later may
+  sit on top of something due earlier, or, when `access_directions` is set, block its
+  last way out.
+
+After the solve, `safe_route_removal_order` gives an unloading order stop by stop,
+`replay_loading_order` checks the reverse as a loading order, and `placement_reachability`
+says what can be reached when the doors open. An item the axle ratings cannot carry is
+reported as `no_feasible_placement`, not as an axle problem. See `trucking.py`.
+
 ## Errors
 
-A request that no engine may answer raises `packvium.InvalidRequestError`, a `ValueError`, before
-anything is solved. It names the problem instead of describing it:
+A request that no engine may answer raises `packvium.InvalidRequestError`, a `ValueError`,
+before anything is solved. It names the problem instead of describing it:
 
 ```python
 from packvium import InvalidRequestError, pack_from_dict
@@ -62,30 +144,43 @@ except InvalidRequestError as error:
     str(error)     # "invalid_request: /items/0/quantity: must be at least 1"
 ```
 
-`reason` is one of `missing_field`, `wrong_type`, `below_minimum`, `above_maximum`, `negative_measure`, `invalid_unit`, `duplicate_id`, `not_allowed` or `invalid_value`. `FixedPlacementError` is a subclass, with code
-`invalid_fixed_placement` and reason `malformed` or `cannot_hold`.
-The message is the same in every Packvium engine. Branch on `reason` and `field`; show the
-message to a person. A request that is valid but does not fit completely is not an error: the
-result lists what was left out, and why, in `unpacked_items`.
+`reason` is one of `missing_field`, `wrong_type`, `below_minimum`, `above_maximum`,
+`negative_measure`, `invalid_unit`, `duplicate_id`, `not_allowed` or `invalid_value`.
+`FixedPlacementError` is a subclass, with code `invalid_fixed_placement` and reason
+`malformed` or `cannot_hold`. The message is the same in every Packvium engine. Branch on
+`reason` and `field`; show the message to a person.
+
+An unknown `objective` or `access_directions` value in a request is refused with
+reason `not_allowed` and the JSON Pointer of the bad value (direct domain model constructors
+raise `UnknownObjectiveError` or `InvalidDirectionError`). A request that is
+valid but does not fit completely is not an error: the result lists what was left out, and
+why, in `unpacked_items`. `errors.py` turns all of these into HTTP responses.
 
 ## Examples
 
-Runnable, in [`examples/`](https://github.com/toxakara/packvium-python/tree/main/examples). Each one is a single file you can read top to bottom
-and execute without a project around it. Every one of them is executed by the test suite
-on each release, so none of them can quietly stop working.
+Runnable, in [`examples/`](https://github.com/toxakara/packvium-python/tree/main/examples),
+and included in the source distribution. Each one is a single file you can read top to
+bottom. Every one of them is executed by the test suite on each release, so none of them
+can quietly stop working.
 
 New here? Read `basic.py`, then `objectives.py` — between them they cover what most
 callers need. `units.py` and `serialization.py` explain the two design choices that
 surprise people. `extensions.py` is last on purpose: reach for it only after the fields
-in `constraints.py` have failed you.
+in `constraints.py` and `limits.py` have failed you.
 
 | File | What it shows |
 | --- | --- |
 | [`basic.py`](https://github.com/toxakara/packvium-python/blob/main/examples/basic.py) | The smallest useful call: items in, placements out — and the three details in it that are easy to miss. |
 | [`objectives.py`](https://github.com/toxakara/packvium-python/blob/main/examples/objectives.py) | All six objectives on scenes where they genuinely disagree, including the rate card that makes the heavier shipment the cheaper one. |
 | [`constraints.py`](https://github.com/toxakara/packvium-python/blob/main/examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused. |
+| [`limits.py`](https://github.com/toxakara/packvium-python/blob/main/examples/limits.py) | A courier fleet: a van with a fridge unit and wheel arches as obstacles, an item cap per bike, one dangerous-goods item per van, frozen goods only in a refrigerated vehicle, and a cap on vehicles. |
 | [`units.py`](https://github.com/toxakara/packvium-python/blob/main/examples/units.py) | Why there are no floats anywhere: fractional inches, exact ticks, and the one-tick difference between a fit and a refusal. |
 | [`serialization.py`](https://github.com/toxakara/packvium-python/blob/main/examples/serialization.py) | The same request as JSON, the result in full, and exactly which mistakes are refused and which are silently ignored. |
+| [`errors.py`](https://github.com/toxakara/packvium-python/blob/main/examples/errors.py) | A web handler: refused requests turned into a 422 with a pointer and a message a person can act on, fixed placements that cannot hold, and a partial fit that is not an error. |
+| [`reproducibility.py`](https://github.com/toxakara/packvium-python/blob/main/examples/reproducibility.py) | Why a clock-limited search answers differently on a busy machine, how an effort budget fixes it, and how to read `termination`. |
+| [`trucking.py`](https://github.com/toxakara/packvium-python/blob/main/examples/trucking.py) | A three-stop delivery van within its axle ratings: loading and unloading order, what the driver can reach at each stop, and the same goods packed without a route. |
+| [`fixed_placements.py`](https://github.com/toxakara/packvium-python/blob/main/examples/fixed_placements.py) | A trailer that arrives partly loaded: new pallets packed around the ones already on board, and a record of what is on board that cannot be true. |
+| [`rebalancing.py`](https://github.com/toxakara/packvium-python/blob/main/examples/rebalancing.py) | Two pallets of very different weight evened out after packing, one validated move at a time. |
 | [`shapes.py`](https://github.com/toxakara/packvium-python/blob/main/examples/shapes.py) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, and a cushion that compresses under load until the crush limit refuses it. |
 | [`nested.py`](https://github.com/toxakara/packvium-python/blob/main/examples/nested.py) | Units into cartons, cartons onto a pallet, in one call. |
 | [`commerce.py`](https://github.com/toxakara/packvium-python/blob/main/examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
@@ -95,9 +190,14 @@ in `constraints.py` have failed you.
 | [`intelligence.py`](https://github.com/toxakara/packvium-python/blob/main/examples/intelligence.py) | Prove a carton change is worth publishing: two scenarios compared order by order, a proposal that refuses to exist on thin evidence, and a replay against held-out history where a cheaper packing your validator rejects still counts as a regression. |
 | [`extensions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/extensions.py) | A rule the schema has no field for — and an honest account of what you give up by writing one. |
 
+With `packvium` installed, run any of them from a copy of the `examples/` directory:
+
 ```bash
-PYTHONPATH=src python3 examples/objectives.py
+python3 examples/trucking.py
 ```
+
+From a checkout of the repository without installing, point Python at the source tree
+instead: `PYTHONPATH=src python3 examples/trucking.py`.
 
 ## What it does
 
@@ -105,14 +205,17 @@ PYTHONPATH=src python3 examples/objectives.py
   No coordinate is ever a float, so no placement decision depends on rounding.
 - **Real constraints.** Weight and payload limits, permitted rotations, keep-upright,
   floor-only, non-stackable, top-load limits, minimum support ratio, tag incompatibility,
-  clearance and rectangular obstacles.
+  eligible container tags, per-container item and tag limits, clearance, obstacles, two-axle
+  load limits and multi-stop route order.
 - **A solver portfolio, not one algorithm.** Regular-grid, layer, extreme-point,
   maximal-space and bounded exact search, selected by problem shape and profile.
 - **Answers you can check.** Every solution is re-validated by logic independent of the
   search. Unplaced items come back with a reason code, not silently missing.
-- **Deterministic.** The same input and seed produce the same result, always.
+- **Deterministic when you ask for it.** The same request with an `effort_budget` gives the
+  same result on every run and machine. A search stopped by `time_limit_ms` keeps what it
+  reached, which can differ between runs; `termination` says which happened.
 - **Multi-container and nested.** Split across containers, or pack containers into
-  containers.
+  containers. `rebalance_weight` evens out the payload across containers afterwards.
 - **Extensible.** Register your own constraints, item orderings, candidate scorers,
   container selectors or complete solvers.
 - **Work orders, not just coordinates.** `packvium.execution` turns a validated result
@@ -142,6 +245,7 @@ PYTHONPATH=src python3 examples/objectives.py
 | --- | --- |
 | [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) | What is promised and what is not. Start here. |
 | [docs/PUBLIC-API.md](https://github.com/toxakara/packvium-python/blob/main/docs/PUBLIC-API.md) | Inputs, outputs and status semantics. |
+| [docs/COMMERCE-API.md](https://github.com/toxakara/packvium-python/blob/main/docs/COMMERCE-API.md) | Carrier rating, eligibility rules and catalog versions. |
 | [docs/UNITS-AND-NUMERICS.md](https://github.com/toxakara/packvium-python/blob/main/docs/UNITS-AND-NUMERICS.md) | Units, accepted input forms, rounding policy. |
 
 ## Requirements
@@ -171,6 +275,23 @@ Documentation, the constraint reference and the benchmarks are at
 
 See [CONTRIBUTING.md](https://github.com/toxakara/packvium-python/blob/main/CONTRIBUTING.md). Security reports go through the process in
 [SECURITY.md](https://github.com/toxakara/packvium-python/blob/main/SECURITY.md), not public issues.
+
+## Citation
+
+If Packvium supports your research, cite it as software. GitHub's **Cite this repository**
+button reads [`CITATION.cff`](https://github.com/toxakara/packvium-python/blob/main/CITATION.cff), and
+[`codemeta.json`](https://github.com/toxakara/packvium-python/blob/main/codemeta.json) carries the same record in
+CodeMeta form.
+
+```bibtex
+@software{packvium_python,
+  author  = {{Packvium contributors}},
+  title   = {Packvium for Python},
+  version = {1.5.0},
+  license = {MIT},
+  url     = {https://packvium.com}
+}
+```
 
 ## License
 

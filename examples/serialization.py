@@ -15,15 +15,14 @@ Two consequences worth knowing:
 - lengths and weights travel as *decimal strings*, never as floats, so "12 3/8 in"
   survives the trip intact (see units.py for why that matters);
 - a field this engine has deliberately not implemented yet is refused by name, never
-  quietly ignored -- but a key the parser simply does not recognise *is* ignored. The
-  difference matters, and the last section shows both -- the refusal through the guard's
-  own test hook, because this engine has caught up and now refuses nothing of its own.
+  quietly ignored -- but a key the parser simply does not recognise on an item *is*
+  ignored. The difference matters, and the last section shows both.
 """
 
 import json
 
 from packvium import pack_from_dict
-from packvium.serialization import UNSUPPORTED_FIELDS, UnsupportedFeatureError, reject_unsupported
+from packvium.serialization import UNSUPPORTED_FIELDS, UnsupportedFeatureError
 
 # ---------------------------------------------------------------------------------
 # A request is a plain dict. This one is the whole vocabulary in miniature: units,
@@ -36,16 +35,14 @@ request = {
         "dimensional_weight_divisor": 5000,
         "dimensional_weight_length_unit": "cm",
         "dimensional_weight_weight_unit": "kg",
-        "profile": "balanced",
+        "solver_profile": "balanced",
         "seed": 42,
-        "top_k": 2,
-        # An example must not change answer merely because the machine is busy. `top_k`
-        # asks the portfolio for runners-up, and how many it finds is bounded by the
-        # *wall clock* unless a budget says otherwise -- so without this line two runs on
-        # a loaded host can print a different number of alternatives, which is
-        # exactly. gave every conformance fixture an explicit budget for this
-        # reason; the examples were not part of that sweep. The value is a safety fuse,
-        # not a target: nothing here comes close to it.
+        # Up to two complete answers: the winner and one runner-up.
+        "alternatives": 2,
+        # A wall clock is a fact about the machine, not about the request: how many
+        # runners-up a clock-bounded search finds depends on how busy the host is. The
+        # value is a safety fuse far above what this solve needs, so it never decides the
+        # answer. reproducibility.py shows what happens when it does.
         "time_limit_ms": 60_000,
     },
     "items": [
@@ -100,9 +97,10 @@ print("one placement, in full:")
 print(json.dumps(first, indent=2)[:400], "...")
 
 # ---------------------------------------------------------------------------------
-# `top_k` asks for runners-up. They are real alternative arrangements, already scored
-# and already validated -- useful when you want to show a human a choice rather than a
-# verdict.
+# `alternatives` asks for runners-up. They are real alternative arrangements, already
+# scored and already validated -- useful when you want to show a human a choice rather
+# than a verdict. The count includes the winner, so `2` means at most one runner-up, and
+# an empty list is normal: a search that found nothing else worth ranking says so.
 # ---------------------------------------------------------------------------------
 # Two alternatives can share a score and still be different arrangements -- equal cost,
 # different geometry. Compare their placements, not their scores, when showing a choice.
@@ -116,11 +114,9 @@ for alternative in result.get("alternatives") or ():
 # What is refused, and what is not. Worth knowing exactly, because the two look alike
 # from the outside.
 #
-# A key the parser does not recognise is *ignored*. Misspell `keep_upright` and you get
-# a silently unrotated mug, not an error -- the strictness lives in the request JSON
-# Schema, which sets `additionalProperties: false` and ships with the project rather
-# than with this package. Validate against it if you want typo protection; the library
-# alone will not give you any. See docs/SERIALIZATION.md.
+# A key the parser does not recognise on an item is *ignored*. Misspell `keep_upright`
+# and you get a silently rotatable mug, not an error. If typos in item fields matter to
+# you, check keys against the field list in PUBLIC-API.md before calling the engine.
 # ---------------------------------------------------------------------------------
 print()
 typo = json.loads(json.dumps(request))
@@ -137,30 +133,23 @@ try:
 except ValueError as refusal:
     print("unknown objective:", str(refusal)[:100])
 
-# And a field this engine has named as not-yet-implemented is refused explicitly, so a
-# request written for a newer engine fails loudly instead of being half-honoured. The list
-# below is the engine's own constant, and it is empty: implemented `convex_hull`
-# and `compressible`, the last reserved names left on it, so this engine now serves every
-# field and every `shape_type` value the schema defines.
+# And a field the schema reserves but this engine has not implemented yet is refused
+# by name, so a request written for a newer engine fails loudly instead of being
+# half-honoured. The list is the engine's own constant.
 print("fields this engine refuses by name:",
       {scope: fields for scope, fields in UNSUPPORTED_FIELDS.items() if fields} or "none")
 
-# Caught up is the right state and a poor demonstration, so the guard takes its lists as
-# parameters -- the same hook its own tests use. Passing the value retired shows
-# the refusal a caller still gets from an engine that is behind, and shows it naming the
-# *value* rather than the field: `rigid_cuboid` is the default and is implemented, so a
-# caller who spells the default out must be served, not refused.
-behind = json.loads(json.dumps(request))
-behind["items"][0]["shape_type"] = "convex_hull"
+ahead = json.loads(json.dumps(request))
+ahead["containers"][0]["pallet_overhang_limit"] = {"length": "50", "width": "50"}
 try:
-    reject_unsupported(behind, shape_types=("convex_hull",))
+    pack_from_dict(ahead)
 except UnsupportedFeatureError as refusal:
-    print("  what one looks like, from an engine that is not:", str(refusal)[:110])
+    print("  sending one anyway:", str(refusal)[:100])
 
 # ---------------------------------------------------------------------------------
 # The same document drives the command line, which reads a request on stdin and writes
-# a result on stdout -- which is how the cross-language conformance harness talks to
-# every engine, and how you would call this from a language with no binding yet:
+# a result on stdout -- which is how the engines are checked against each other, and how
+# you would call this from a language with no binding yet:
 #
 #     echo '<request json>' | python3 -m packvium
 #

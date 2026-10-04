@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from packvium import (AxisAlignedBox, Axle, Container, Dimensions, Item, Length, Obstacle,
+from packvium import (AxisAlignedBox, Axle, Container, Dimensions, FixedPlacement, Item, Length, Obstacle,
                          PackedContainer, PackingRequest, Placement, Point, Rotation, Weight)
 
 
@@ -272,3 +272,33 @@ def test_a_weight_above_the_last_bracket_names_the_bracket_it_passed():
 
     with pytest.raises(UnratedWeightError, match="100 g"):
         RateTable((100,), (10,)).charge_minor(101)
+
+
+@pytest.mark.parametrize("ratio", [-0.1, 1.5])
+def test_a_void_fill_reserve_ratio_outside_zero_to_one_is_refused(ratio):
+    with pytest.raises(ValueError, match="void_fill_reserve_ratio"):
+        Container.create("box", Dimensions.mm(10, 10, 10), void_fill_reserve_ratio=ratio)
+
+
+def test_a_tag_limit_below_one_is_refused():
+    with pytest.raises(ValueError, match="tag_limits"):
+        Container.create("box", Dimensions.mm(10, 10, 10), tag_limits={"fragile": 0})
+
+
+def test_a_container_max_items_below_one_is_refused():
+    with pytest.raises(ValueError, match="max_items"):
+        Container.create("box", Dimensions.mm(10, 10, 10), max_items=0)
+
+
+def test_expanding_a_container_packed_without_a_lattice_returns_its_own_placements():
+    box = Container.create("box", Dimensions.mm(10, 10, 10))
+    instance, = Item.create("a", Dimensions.mm(10, 10, 10)).instances()
+    origin = Point(0, 0, 0)
+    placement = Placement(instance, origin, Rotation.LWH, instance.dimensions, origin, instance.dimensions)
+    packed = PackedContainer(box, 1, (placement,))
+    assert packed.expand_placements() == (placement,)
+
+
+def test_a_fixed_placement_counts_container_instances_from_one():
+    with pytest.raises(ValueError, match="counts from 1"):
+        FixedPlacement("a", "box", Point(0, 0, 0), Rotation.LWH, container_instance=0)

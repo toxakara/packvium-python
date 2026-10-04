@@ -333,3 +333,39 @@ def test_geometry_outranks_policy_in_the_reported_reason() -> None:
     assert [item["reason"] for item in result["unpacked_items"]] == [
         "no_compatible_container_dimensions"
     ]
+
+
+def test_an_older_version_declared_after_a_newer_one_does_not_replace_it() -> None:
+    newer = {"id": "r", "version": 2, "effective_at": 0, "priority": 0,
+             "separate_tags": {"tag": "a", "from_tag": "b"}}
+    older = {**newer, "version": 1, "separate_tags": {"tag": "a", "from_tag": "c"}}
+    resolved = PolicyRuleSet.from_dict({"as_of": 0, "rules": [newer, older]}).rules
+    assert [(rule.id, rule.version) for rule in resolved] == [("r", 2)]
+
+
+def test_a_segregation_rule_and_a_tag_cap_are_both_enforced_in_one_container() -> None:
+    request = copy.deepcopy(REQUEST)
+    request["items"][0]["quantity"] = 3
+    request["policy"]["rules"].append({
+        "id": "hazmat-cap", "version": 1, "effective_at": AS_OF, "priority": 50,
+        "limit_tag_per_container": {"tag": "hazmat", "max": 2},
+    })
+    result = pack_from_dict(request)
+    assert result["summary"]["unpacked_item_count"] == 0
+    for packed in result["containers"]:
+        types = [placement["item_type"] for placement in packed["placements"]]
+        assert types.count("drum") <= 2
+        assert not ("drum" in types and "carton" in types)
+
+
+def test_an_item_left_behind_for_its_size_is_not_blamed_on_a_satisfiable_tag_rule() -> None:
+    request = copy.deepcopy(REQUEST)
+    request["items"][1]["dimensions"] = {"length": "400", "width": "400", "height": "400"}
+    request["containers"][0]["tags"] = ["reefer"]
+    request["policy"]["rules"] = [{
+        "id": "cold-chain", "version": 1, "effective_at": AS_OF, "priority": 10,
+        "require_container_tag": {"item_tag": "food", "container_tag": "reefer"},
+    }]
+    unpacked, = pack_from_dict(request)["unpacked_items"]
+    assert unpacked["item_type"] == "carton"
+    assert unpacked["reason"] != "policy_rule"

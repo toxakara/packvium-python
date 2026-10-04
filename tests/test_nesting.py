@@ -62,3 +62,15 @@ def test_items_without_nesting_height_are_summed_plainly():
     a = placement("a", 0, 0, 0, 100)
     b = placement("a", 100, 0, 0, 100)
     assert used_volume([a, b]) == 2 * 100 ** 3
+
+
+def test_two_nestable_items_at_the_same_height_are_not_a_nested_pair():
+    """Identical footprint and height is a collision, not one item sunk into another."""
+    item = Item.create("crate", Dimensions(Length(100), Length(100), Length(100)), Weight(0),
+                       quantity=2, nesting_height=Length(40))
+    first, second = item.instances()
+    position = Point(0, 0, 0)
+    dims = item.dimensions
+    one = Placement(first, position, Rotation.LWH, dims, position, dims)
+    other = Placement(second, position, Rotation.LWH, dims, position, dims)
+    assert not is_valid_nesting(one, other)

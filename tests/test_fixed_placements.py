@@ -241,7 +241,7 @@ def test_rebalancing_never_moves_a_fixed_item():
 @pytest.mark.parametrize("placements, detail", [
     ("x", "fixed_placements is a list"),
     ([5], "fixed_placements[0] is an object"),
-    ([fixed(note="strapped")], 'fixed_placements[0] does not carry ["note"]'),
+    ([fixed(note="strapped")], 'fixed_placements[0] cannot carry ["note"]'),
     ([{"item_type": "cube", "container_type": "box"}], 'fixed_placements[0] needs ["orientation"]'),
     ([fixed(item_type="")], "fixed_placements[0].item_type is a non-empty string"),
     ([fixed(container_type=5)], "fixed_placements[0].container_type is a non-empty string"),
@@ -252,7 +252,7 @@ def test_rebalancing_never_moves_a_fixed_item():
     ([fixed(instance=2**53)], "fixed_placements[0].container_instance counts from 1"),
     ([fixed(position=["100", "0", "0"])], "fixed_placements[0].position is a point object"),
     ([fixed(position=None)], "fixed_placements[0].position is a point object"),
-    ([fixed(position={"w": "5"})], 'fixed_placements[0].position does not carry ["w"]'),
+    ([fixed(position={"w": "5"})], 'fixed_placements[0].position cannot carry ["w"]'),
     ([fixed(position={"y": True})], "fixed_placements[0].position.y is a measure"),
 ])
 def test_a_fixed_placement_that_is_not_the_schemas_shape_is_refused_not_coerced(placements, detail):

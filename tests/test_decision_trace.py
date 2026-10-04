@@ -118,3 +118,15 @@ def test_a_packer_level_trace_takes_precedence_over_an_ambient_context():
         Packer(config, trace=packer_events.append).pack(items, containers)
     assert packer_events == GOLDEN
     assert ambient_events == []
+
+
+def test_emitting_with_no_active_sink_is_a_no_op():
+    from packvium import trace
+    assert not trace.active()
+    trace.emit({"type": "filter"})
+
+
+def test_leaving_a_trace_scope_that_was_never_entered_changes_nothing():
+    from packvium import trace
+    use_trace(lambda event: None).__exit__(None, None, None)
+    assert not trace.active()

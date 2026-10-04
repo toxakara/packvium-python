@@ -25,6 +25,7 @@ __all__ = [
     "OperationalArtifactError",
     "build_operational_artifact",
     "canonical_artifact_json",
+    "replay_level",
 ]
 
 FORMAT = "packvium-operational-artifact/v1"
@@ -32,7 +33,7 @@ FORMAT = "packvium-operational-artifact/v1"
 #: The suite version of this builder, the same string in all four engines of one release.
 #: The engine's own name is deliberately not recorded: four correct builders naming themselves
 #: would emit four different documents. `make version-set` rewrites this line.
-SUITE_VERSION = "1.4.0"
+SUITE_VERSION = "1.5.0"
 
 #: The deterministic part of `result.algorithm`. `duration_ms` is wall-clock time and never
 #: enters an artifact.
@@ -147,6 +148,12 @@ def _solver(algorithm: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(algorithm[flag], bool):
             raise OperationalArtifactError("invalid_result", f"result.algorithm.{flag} is not a boolean")
     return {field: algorithm[field] for field in SOLVER_FIELDS}
+
+
+def replay_level(result: Mapping[str, Any]) -> str:
+    """`exact` or `not_guaranteed`: the replay promise an artifact of this result would make,
+    without building the artifact. The hosted API answers it as `Packvium-Replay`."""
+    return str(_replay(_solver(result.get("algorithm")))["level"])
 
 
 def _replay(solver: Optional[Mapping[str, Any]]) -> Dict[str, Any]:

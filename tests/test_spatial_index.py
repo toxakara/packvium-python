@@ -9,6 +9,7 @@ checks downstream, but one that misses a real collision would let two items over
 
 from __future__ import annotations
 
+import itertools
 import random
 
 import pytest
@@ -119,6 +120,98 @@ def test_multi_bucket_collection_preserves_first_appearance():
     index = SpatialIndex(80, 80, 80)
     index.cells[(0, 0, 0)] = (3, 1)
     index.cells[(1, 0, 0)] = (1, 2, 3)
-    assert index.query(0, 0, 0, 20, 1, 1) == [3, 1, 2]
+    assert list(index.query(0, 0, 0, 20, 1, 1)) == [3, 1, 2]
     assert index.query(0, 0, 0, 1, 1, 1) is index.cells[(0, 0, 0)]
     assert index.query(70, 70, 70, 80, 80, 80) == ()
+
+
+def test_query_results_cannot_corrupt_the_index_or_a_fork():
+    index = SpatialIndex(80, 80, 80)
+    index.add(0, (0, 0, 0, 20, 20, 20))
+    box = (0, 0, 0, 20, 20, 20)
+    answer = index.query(*box)
+    clone = index.copy()
+    try:
+        answer[0] = 999
+    except TypeError:
+        pass
+    assert list(index.query(*box)) == [0]
+    assert list(clone.query(*box)) == [0]
+    clone.add(1, (0, 0, 0, 5, 5, 5))
+    assert list(clone.query(*box)) == [0, 1]
+    assert list(index.query(*box)) == [0]
+
+
+def test_insert_reuses_distant_queries_and_invalidates_overlapping_queries():
+    class CountingIndex(SpatialIndex):
+        collections = 0
+
+        def _collect(self, *cell_range):
+            self.collections += 1
+            return super()._collect(*cell_range)
+
+    index = CountingIndex(80, 80, 80)
+    index.add(0, (0, 0, 0, 20, 20, 20))
+    near = (0, 0, 0, 20, 20, 20)
+    distant = (60, 60, 60, 80, 80, 80)
+    assert list(index.query(*near)) == [0]
+    assert list(index.query(*distant)) == []
+    index.add(1, (60, 60, 60, 70, 70, 70))
+    assert list(index.query(*near)) == [0]
+    assert index.collections == 2
+    assert list(index.query(*distant)) == [1]
+    assert index.collections == 3
+
+
+def test_query_cache_has_bounded_retention_even_without_insertions():
+    index = SpatialIndex(80, 80, 80)
+    index.add(0, (0, 0, 0, 20, 20, 20))
+    for x in range(1100):
+        index.query(x * 10, 0, 0, x * 10 + 20, 1, 1)
+    assert len(index._answers) <= 1024
+    assert list(index.query(0, 0, 0, 20, 20, 20)) == [0]
+
+
+def test_insertion_carries_over_a_bounded_number_of_answers():
+    index = SpatialIndex(80, 80, 80)
+    first = (0, 0, 0, 20, 20, 20)
+    index.add(0, first)
+    spans = [(low * 10, high * 10) for low in range(4) for high in range(low + 1, 5)]
+    queries = []
+    for (x1, x2), (y1, y2), (z1, z2) in itertools.product(spans, repeat=3):
+        query = (x1, y1, z1, x2, y2, z2)
+        queries.append(query)
+        index.query(*query)
+    assert len(index._answers) > 128
+    fork = index.copy()
+    inserted = (70, 70, 70, 80, 80, 80)
+    fork_inserted = (10, 10, 10, 30, 30, 30)
+    index.add(1, inserted)
+    fork.add(1, fork_inserted)
+    assert len(index._answers) == 128
+    assert len(fork._answers) == 128
+    fresh = build([first, inserted], 80, 80, 80)
+    fresh_fork = build([first, fork_inserted], 80, 80, 80)
+    for query in [*queries, inserted, fork_inserted]:
+        assert index.query(*query) == fresh.query(*query)
+        assert fork.query(*query) == fresh_fork.query(*query)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_cached_queries_survive_insertions_and_divergent_forks(seed):
+    rng = random.Random(seed)
+    bounds = []
+    index = SpatialIndex(100, 100, 100)
+    queries = [random_bound(rng, 100) for _ in range(30)]
+    queries.extend([(0, 0, 0, 100, 100, 100), (-10, -10, -10, 20, 20, 20)])
+    for _ in range(20):
+        parent = index.copy()
+        parent_answers = [tuple(parent.query(*query)) for query in queries]
+        bound = random_bound(rng, 100)
+        index.add(len(bounds), bound)
+        bounds.append(bound)
+        fresh = build(bounds, 100, 100, 100)
+        for query, parent_answer in zip(queries, parent_answers):
+            assert tuple(parent.query(*query)) == parent_answer
+            assert tuple(index.query(*query)) == tuple(fresh.query(*query))
+            assert naive_overlaps(bounds, query) <= set(index.query(*query))

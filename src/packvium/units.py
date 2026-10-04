@@ -15,6 +15,10 @@ class Rounding(str, Enum):
 
 
 def _fraction(value: int | str | Decimal | Fraction) -> Fraction:
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise TypeError("float measure input is intentionally rejected; use a decimal string")
+        value = int(value)
     if isinstance(value, Fraction):
         return value
     if isinstance(value, int):

@@ -22,6 +22,7 @@ from packvium import (
     aggregate_termination,
     pack_from_dict,
 )
+from packvium.result import derive_result_facts
 
 
 def mm(length, width, height) -> dict:
@@ -448,3 +449,31 @@ def test_alternatives_do_not_nest_indefinitely():
         configuration={"solver_profile": "quality", "time_limit_ms": 2000},
     ))
     assert all(alternative["alternatives"] == [] for alternative in result["alternatives"])
+
+
+def test_a_result_fact_refuses_an_empty_code():
+    with pytest.raises(ValueError, match="must not be empty"):
+        ResultFact("")
+
+
+@pytest.mark.parametrize("raw", [{}, {"code": ""}, {"code": 7}])
+def test_a_result_fact_read_from_the_wire_requires_a_non_empty_string_code(raw):
+    with pytest.raises(ValueError, match="non-empty string code"):
+        ResultFact.from_dict(raw)
+
+
+def test_termination_cannot_be_aggregated_from_no_starts():
+    with pytest.raises(ValueError, match="at least one start"):
+        aggregate_termination(())
+
+
+@pytest.mark.parametrize("selected", [(False, False), (True, True)])
+def test_termination_requires_exactly_one_selected_start(selected):
+    records = tuple(StartRecord(f"s{i}", True, True, False, selected=flag) for i, flag in enumerate(selected))
+    with pytest.raises(ValueError, match="exactly one selected"):
+        aggregate_termination(records)
+
+
+def test_an_infeasible_status_is_reported_as_proven_infeasible():
+    feasibility, termination, optimality = derive_result_facts(PackingStatus.INFEASIBLE, False, False)
+    assert (feasibility.code, termination.code, optimality.code) == ("infeasible", "complete", "proven_infeasible")

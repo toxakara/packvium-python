@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
+from bisect import bisect_right
 from dataclasses import replace
 import heapq
+from itertools import accumulate
 
 from ._compat import dataclass
 from time import monotonic_ns
@@ -754,26 +756,23 @@ def _place_batch(state: ContainerState, batch: Sequence[ItemInstance], config: P
     yield working
 
 
-def _count_with_capacity(sorted_costs: Sequence[int], capacity: int) -> int:
-    """Optimistic cardinality bound for one additive resource, over ascending costs.
+def _count_with_capacity(cumulative_costs: Sequence[int], capacity: int) -> int:
+    """Optimistic cardinality bound for one additive resource, over the prefix sums of
+    ascending costs.
 
     Choosing the cheapest remaining units first can only *overestimate* how many
     geometrically feasible items fit.  It is therefore safe for ordering/pruning a
     beam that minimises unpacked-item count; geometry, support and incompatibility can
-    make the real answer worse, never better.
+    make the real answer worse, never better.  Costs are non-negative, so the prefix
+    sums never decrease and the cheapest-first count is one binary search: `O(log f)`
+    per node instead of `O(f)`.
     """
-    used = 0
-    count = 0
-    for cost in sorted_costs:
-        if used + cost > capacity:
-            break
-        used += cost
-        count += 1
-    return count
+    return bisect_right(cumulative_costs, capacity)
 
 
 @dataclass(frozen=True, slots=True)
 class PrecomputedFuture:
+    """Prefix sums of the future items' ascending volumes and weights, built once per step."""
     volumes: tuple[int, ...] | None
     weights: tuple[int, ...] | None
     count: int
@@ -784,10 +783,10 @@ class PrecomputedFuture:
             return _EMPTY_PRECOMPUTED_FUTURE
         volumes = None
         if not any(item.item.nesting_height is not None for item in future):
-            volumes = tuple(sorted(item.dimensions.volume for item in future))
+            volumes = tuple(accumulate(sorted(item.dimensions.volume for item in future)))
         weights = None
         if has_max_payload:
-            weights = tuple(sorted(item.weight.ticks for item in future))
+            weights = tuple(accumulate(sorted(item.weight.ticks for item in future)))
         return cls(volumes=volumes, weights=weights, count=len(future))
 
 
@@ -932,6 +931,10 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
         precomputed_future = PrecomputedFuture.from_items(future, container.max_payload is not None)
         for state, unplaced in expansions:
             cand_unplaced_len = len(unplaced) + len(future)
+            # More unplaced items loses on the key's first component whatever follows, so
+            # the signature -- the costly part -- is built only for a candidate that can win.
+            if cand_unplaced_len > incumbent_key[0]:
+                continue
             signature = "|".join(f"{p.instance.id}@{p.envelope_origin.x},{p.envelope_origin.y},{p.envelope_origin.z}"
                                  for p in state.placements)
             candidate_key = (cand_unplaced_len, cand_unplaced_len,
@@ -1268,19 +1271,28 @@ def subtract_all(
                 space.origin.y + space.dimensions.width.ticks,
                 space.origin.z + space.dimensions.height.ticks)
                for space, _ in kept]
-    result: list[Space] = []
-    for index, (space, is_new) in enumerate(kept):
-        if is_new:
-            x1, y1, z1, x2, y2, z2 = extents[index]
-            if any(other[0] <= x1 and other[1] <= y1 and other[2] <= z1
-                   and x2 <= other[3] and y2 <= other[4] and z2 <= other[5]
-                   for position, other in enumerate(extents) if position != index):
-                continue
-        result.append(space)
+    result = [space for index, (space, is_new) in enumerate(kept)
+              if not (is_new and _is_contained(extents, index))]
     if len(result) > MAX_MAXIMAL_SPACES:
         result = sorted(result, key=lambda s: -s.dimensions.volume)[:MAX_MAXIMAL_SPACES]
         result.sort(key=lambda s: (s.origin.z, s.origin.y, s.origin.x))
     return result
+
+
+def _is_contained(extents: Sequence[tuple[int, int, int, int, int, int]], index: int) -> bool:
+    """Whether another extent contains `extents[index]`, for extents ordered by origin z.
+
+    A container starts at or below what it contains, so the scan stops at the first
+    extent that starts higher: `O(prefix)` instead of `O(s)`, with no index to build.
+    """
+    x1, y1, z1, x2, y2, z2 = extents[index]
+    for position, other in enumerate(extents):
+        if other[2] > z1:
+            return False
+        if (position != index and other[0] <= x1 and other[1] <= y1
+                and x2 <= other[3] and y2 <= other[4] and z2 <= other[5]):
+            return True
+    return False
 
 
 class MaximalSpaceSolver:
@@ -1385,10 +1397,11 @@ class HomogeneousBlockSolver:
     both cardinality-first and occupied-volume-first orderings and returns the better
     canonical objective vector.
 
-    A block is used only for the plain-box subset for which every generated member has
-    full support and no per-placement business rule can distinguish it.  Requests
-    outside that subset fall back to ``ExtremePointSolver`` rather than weakening a
-    constraint.  Candidate enumeration is O(B*S*T*R*X*Y) time and O(S+n) space, where
+    A block is used only for the plain-box subset no per-placement business rule can
+    distinguish, and only when no support is required: a block set on a smaller one
+    overhangs it, so the members of its bottom layer report the support they really
+    have.  Requests outside that subset fall back to ``ExtremePointSolver`` rather than
+    weakening a constraint.  Candidate enumeration is O(B*S*T*R*X*Y) time and O(S+n) space, where
     B is the number of committed blocks, S the capped maximal-space count, T item
     types, R unique rotations, and X/Y the grid extents.  Both the wall-clock/effort
     deadline and ``container_plan_node_limit`` bound the product explicitly.
@@ -1425,7 +1438,7 @@ class HomogeneousBlockSolver:
 
     def _supports(self, container, items, config) -> bool:
         if (self.constraints or container.obstacles or container.preloaded
-                or container.axles is not None):
+                or container.axles is not None or config.minimum_support_ratio > 0):
             return False
         if (
             container.tag_limits
@@ -1434,7 +1447,8 @@ class HomogeneousBlockSolver:
         ):
             return False
         return all(
-            item.item.group is None
+            item.item.shape_type is ShapeType.RIGID_CUBOID
+            and item.item.group is None
             and not item.item.tags
             and not item.item.incompatible_tags
             and not item.item.eligible_container_tags
@@ -1448,6 +1462,15 @@ class HomogeneousBlockSolver:
             and item.item.stop_index is None
             for item in items
         )
+
+    @staticmethod
+    def _member_support(state: ContainerState, instance: ItemInstance, point: Point,
+                        envelope: Dimensions) -> float:
+        """The share of a member's base that rests on the floor or on a box beneath it."""
+        if point.z == 0:
+            return 1.0
+        support = direct_support_view(state.placements, instance, AxisAlignedBox(point, envelope))
+        return support.supporting_area / envelope.base_area
 
     @staticmethod
     def _solution_key(solution: SingleContainerSolution) -> tuple:
@@ -1565,7 +1588,11 @@ class HomogeneousBlockSolver:
                         state.add_direct(
                             Placement(
                                 chosen[index], position, best.rotation, best.physical,
-                                point, best.envelope, 1.0,
+                                point, best.envelope,
+                                # Above its bottom layer a member rests on an identical
+                                # footprint; the bottom layer rests on whatever is there.
+                                self._member_support(state, chosen[index], point, best.envelope)
+                                if z == 0 else 1.0,
                             )
                         )
                         index += 1
@@ -2292,8 +2319,6 @@ class SolverOrchestrator:
         """
         constraints = default_constraints(config, self.custom_constraints)
         support_constraints = tuple(c for c in constraints if isinstance(c, SupportConstraint))
-        if not support_constraints:
-            return False
         # The built-in support specification is a strict no-op for this item when it
         # has neither a contact rule nor an effective minimum ratio. Avoid rebuilding
         # every placement and running two candidate searches merely to rediscover that
@@ -2421,10 +2446,10 @@ class SolverOrchestrator:
             return 0
         lower = 0
         if not any(item.item.nesting_height is not None for item in plan.remaining):
+            # Dimensions are strictly positive, so every container has volume to divide by.
             maximum_volume = max(c.inner_dimensions.volume for c in available)
-            if maximum_volume > 0:
-                total_volume = sum(item.dimensions.volume for item in plan.remaining)
-                lower = max(lower, (total_volume + maximum_volume - 1) // maximum_volume)
+            total_volume = sum(item.dimensions.volume for item in plan.remaining)
+            lower = max(lower, (total_volume + maximum_volume - 1) // maximum_volume)
         finite_payloads = [
             c.max_payload.ticks for c in available if c.max_payload is not None
         ]
@@ -2498,10 +2523,8 @@ class SolverOrchestrator:
             expansions: list[_ContainerPlan] = []
             for plan in beam:
                 if not plan.remaining or len(plan.packed) >= maximum:
-                    if self._score_plan(plan.packed, plan.remaining, config) < self._score_plan(
-                        incumbent.packed, incumbent.remaining, config
-                    ):
-                        incumbent = plan
+                    # Already weighed against the incumbent when it was created (below),
+                    # and the incumbent only ever improves, so it cannot win now.
                     continue
                 for container in ordered:
                     if plan_nodes >= config.container_plan_node_limit:
