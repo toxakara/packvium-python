@@ -10,7 +10,7 @@ from ._compat import dataclass
 from time import monotonic_ns
 from typing import Callable, Iterable, Protocol, Sequence, cast
 
-from .axle_load import axle_balanced_origins
+from .axle_load import axle_admits_alone, axle_balanced_origins
 from .config import PackingConfig
 from .effort import EffortBudget
 # `_grams` rather than a local ceil-div: the round-up from ticks to whole grams is the
@@ -22,13 +22,14 @@ from .constraints import (AxleLoadConstraint, CompatibilityConstraint, Constrain
                           StopAccessibilityConstraint, SupportConstraint,
                           TagCountConstraint, TopLoadConstraint, active_constraints, direct_support_view,
                           load_units, top_loads, usable_volume)
-from . import bounds, hull
+from . import bounds, hull, made_to_measure
 from .geometry import (AxisAlignedBox, Dimensions, Point, Rotation, ShapeType,
                        dimensional_weight)
+from .flat_bag import as_dimensions, fits_alone
 from .lattice_summary import LatticeSummary
 from .models import (Container, ItemInstance, PackedContainer, Placement, UnpackedItem,
-                     hull_collision_is_exact, is_stack_sensitive)
-from .nesting import (is_valid_nesting, occupied_volume,
+                     carries_itself, hull_collision_is_exact, is_stack_sensitive)
+from .nesting import (is_valid_nesting, item_occupied_volume, occupied_volume,
                       used_volume as nesting_used_volume, used_volume_delta)
 from .result import SolverMetrics, StartRecord
 from .spatial_index import SpatialIndex
@@ -129,6 +130,15 @@ class Deadline:
             stats=self._stats,
         )
 
+    def _search_node_ceiling(self, stats: "SearchStats") -> int | None:
+        """The `stats.search_nodes_expanded` at which the attached budget stops a search
+        counting nodes on `stats`, or `None` when counting there can never trip it --
+        no budget, no node bound, or a budget that reads another `SearchStats`."""
+        budget = self._effort_budget
+        if budget is None or budget.max_search_nodes is None or self._stats is not stats:
+            return None
+        return budget.max_search_nodes
+
     def with_effort(self, effort_budget: "EffortBudget | None", stats: "SearchStats") -> "Deadline":
         """Bind an effort budget to this start's own stats, keeping the same time bound."""
         return Deadline(0, limit_ns=self.remaining_ns, clock=self._clock, effort_budget=effort_budget, stats=stats)
@@ -208,7 +218,7 @@ class ContainerState:
     """
 
     __slots__ = ("container", "sequence", "placements", "points", "ordered_points", "payload_ticks", "used_volume_ticks",
-                 "stack_sensitive", "route_sensitive", "compression_sensitive", "max_z", "occupied", "bounds", "index", "hull_shapes",
+                 "stack_sensitive", "route_sensitive", "compression_sensitive", "max_x", "max_y", "max_z", "occupied", "bounds", "index", "hull_shapes",
                  "lattice_summary", "lattice_items")
 
     def __init__(self, container: Container, sequence: int):
@@ -220,7 +230,8 @@ class ContainerState:
         self.stack_sensitive = False
         self.route_sensitive = False
         self.compression_sensitive = False
-        self.max_z = 0
+        # Largest envelope x2, y2 and z2 so far: a flat bag's running extents.
+        self.max_x = self.max_y = self.max_z = 0
         # Set instead of appending to `placements` when GridSolver's quantity-
         # compression fast path applies -- see `lattice_summary.py`.
         self.lattice_summary: "LatticeSummary | None" = None
@@ -259,7 +270,7 @@ class ContainerState:
         other.stack_sensitive = self.stack_sensitive
         other.route_sensitive = self.route_sensitive
         other.compression_sensitive = self.compression_sensitive
-        other.max_z = self.max_z
+        other.max_x, other.max_y, other.max_z = self.max_x, self.max_y, self.max_z
         other.occupied = list(self.occupied)
         other.bounds = list(self.bounds)
         other.hull_shapes = list(self.hull_shapes)
@@ -305,9 +316,9 @@ class ContainerState:
         self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
         self.route_sensitive = self.route_sensitive or item.stop_index is not None
         self.compression_sensitive = compression_sensitive
-        if box.z2 > self.max_z: self.max_z = box.z2
         self.occupied.append(box)
         bound = _extent(box)
+        self._extend_extent(bound[3], bound[4], bound[5])
         self.index.add(len(self.bounds), bound)
         self.bounds.append(bound)
         shape = placement.hull_shape
@@ -353,8 +364,12 @@ class ContainerState:
         self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
         self.route_sensitive = self.route_sensitive or item.stop_index is not None
         self.compression_sensitive = compression_sensitive
-        if box.z2 > self.max_z:
-            self.max_z = box.z2
+        self._extend_extent(box.x2, box.y2, box.z2)
+
+    def _extend_extent(self, x2: int, y2: int, z2: int) -> None:
+        if x2 > self.max_x: self.max_x = x2
+        if y2 > self.max_y: self.max_y = y2
+        if z2 > self.max_z: self.max_z = z2
 
     def _absorb(self, points: Iterable[Point]) -> None:
         dims = self.container.inner_dimensions
@@ -466,7 +481,8 @@ def default_constraints(config: PackingConfig, custom: Sequence[PlacementConstra
 
 def _candidate_score(state: ContainerState, point: Point, dims: Dimensions) -> tuple[int, ...]:
     inner = state.container.inner_dimensions
-    new_height = max(state.max_z, point.z + dims.height.ticks)
+    top = point.z + dims.height.ticks
+    new_height = state.max_z if state.max_z > top else top
     rx = inner.length.ticks - (point.x + dims.length.ticks)
     ry = inner.width.ticks - (point.y + dims.width.ticks)
     rz = inner.height.ticks - (point.z + dims.height.ticks)
@@ -532,6 +548,10 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
         if state.used_volume_ticks + item.dimensions.volume > usable_volume(container): return []
     inner = container.inner_dimensions
     limit_x, limit_y, limit_z = inner.length.ticks, inner.width.ticks, inner.height.ticks
+    # A flat bag also needs a + c <= L and b + c <= W over the running extents grown by the
+    # candidate: O(1), and the extents only grow, so no admitted verdict flips.
+    bag = container.is_flat_bag
+    bag_x, bag_y, bag_z = state.max_x, state.max_y, state.max_z
     clearance = config.clearance.ticks
     # Envelope and extents depend only on the rotation, so they are built once instead
     # of once per (point, rotation) pair.
@@ -571,6 +591,12 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     # stays in regardless: `support_checks` counts every time the chain reaches it.
     active = [(constraint, isinstance(constraint, SupportConstraint))
               for constraint in active_constraints(constraints, container, item, stack_sensitive, route_sensitive)]
+    # A built-in support rule that cannot apply to this item allows every position, so a
+    # chain of nothing else would only count: each position adds one support check per
+    # rule, and no context is built for it. Exact types, as in `active_constraints`.
+    inert_chain = all(type(constraint) is SupportConstraint and not constraint.applies_to(item)
+                      for constraint, _ in active)
+    inert_support_checks = len(active)
     tracing = trace.active()
     if points is None:
         if item.item.nesting_height is None:
@@ -587,14 +613,27 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     best: Candidate | None = None
     retained: list[tuple[tuple[int, ...], int, Candidate]] = []
     bounded = max_candidates is not None and max_candidates > 1
+    # Counters a deadline never reads are kept in locals and added once per point: every
+    # (point, rotation) pair is one attempt, and `collision_checks` is flushed before the
+    # next `deadline.check()` -- the only call here that can raise -- so a stop leaves
+    # every counter exactly where the per-pair increments left it.
+    form_count = len(forms)
+    query = index.query
+    collision_checks = 0
     for point in ordered:
+        stats.collision_checks += collision_checks
+        collision_checks = 0
         deadline.check()
         stats.candidate_points_considered += 1
+        stats.placements_attempted += form_count
         x1, y1, z1 = point.x, point.y, point.z
         for rotation, physical, envelope, dx, dy, dz, shape in forms:
-            stats.placements_attempted += 1
             x2, y2, z2 = x1 + dx, y1 + dy, z1 + dz
-            if x2 > limit_x or y2 > limit_y or z2 > limit_z:
+            # Conditional expressions rather than `max()`: the builtin call made this test
+            # four times dearer per bag candidate (75 ns against 309 ns, CPython 3.11).
+            if x2 > limit_x or y2 > limit_y or z2 > limit_z or (
+                    bag and ((x2 if x2 > bag_x else bag_x) + (thickness := z2 if z2 > bag_z else bag_z) > limit_x
+                             or (y2 if y2 > bag_y else bag_y) + thickness > limit_y)):
                 if tracing:
                     trace.emit({"type": "filter", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "reason": "boundary"})
                 continue
@@ -603,9 +642,9 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                 position = Point(x1 + clearance, y1 + clearance, z1 + clearance)
                 tentative = Placement(item, position, rotation, physical, point, envelope)
             blocked = False
-            for candidate_index in index.query(x1, y1, z1, x2, y2, z2):
+            for candidate_index in query(x1, y1, z1, x2, y2, z2):
                 bx1, by1, bz1, bx2, by2, bz2 = bounds[candidate_index]
-                stats.collision_checks += 1
+                collision_checks += 1
                 if x1 < bx2 and bx1 < x2 and y1 < by2 and by1 < y2 and z1 < bz2 and bz1 < z2:
                     placement_index = candidate_index - placement_offset
                     if tentative is not None and placement_index >= 0 and is_valid_nesting(placed[placement_index], tentative):
@@ -625,19 +664,21 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                 if tracing:
                     trace.emit({"type": "filter", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "reason": "collision"})
                 continue
-            context = ConstraintContext(container, placed, item, point, rotation, physical, envelope, stack_sensitive, route_sensitive)
-            rejected = False
-            for constraint, counts_support in active:
-                if counts_support:
-                    stats.support_checks += 1
-                result = constraint.evaluate(context)
-                if not result.allowed:
-                    if tracing:
-                        trace.emit({"type": "placement_rejection", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "constraint": type(constraint).__name__, "code": result.code})
-                    rejected = True
-                    break
-            if rejected: continue
-            score = _candidate_score(state, point, envelope)
+            if inert_chain:
+                stats.support_checks += inert_support_checks
+            else:
+                context = ConstraintContext(container, placed, item, point, rotation, physical, envelope, stack_sensitive, route_sensitive)
+                rejected = False
+                for constraint, counts_support in active:
+                    if counts_support:
+                        stats.support_checks += 1
+                    result = constraint.evaluate(context)
+                    if not result.allowed:
+                        if tracing:
+                            trace.emit({"type": "placement_rejection", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "constraint": type(constraint).__name__, "code": result.code})
+                        rejected = True
+                        break
+                if rejected: continue
             position = tentative.position if tentative is not None else None
             if reserve_check:
                 if position is None:
@@ -664,14 +705,31 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                 if projected_volume > usable:
                     continue
             stats.candidates_evaluated += 1
+            score: tuple[int, ...] | None = None
             if tracing:
+                score = _candidate_score(state, point, envelope)
                 trace.emit({"type": "score", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "score": list(score)})
             # Keep every check, counter and trace event, but materialize only candidates
-            # that survive selection. Equal scores keep the earlier enumeration entry.
-            if max_candidates == 1 and best is not None and score >= best.score:
-                continue
-            if bounded and len(retained) == max_candidates and score >= retained[0][2].score:
-                continue
+            # that survive selection. Equal scores keep the earlier enumeration entry. A
+            # score leads with the point's z, so a candidate above the one it has to beat
+            # loses on that field alone and its score is never built.
+            if max_candidates == 1 and best is not None:
+                if z1 > best.score[0]:
+                    continue
+                if score is None:
+                    score = _candidate_score(state, point, envelope)
+                if score >= best.score:
+                    continue
+            elif bounded and len(retained) == max_candidates:
+                worst = retained[0][2].score
+                if z1 > worst[0]:
+                    continue
+                if score is None:
+                    score = _candidate_score(state, point, envelope)
+                if score >= worst:
+                    continue
+            if score is None:
+                score = _candidate_score(state, point, envelope)
             if position is None:
                 position = Point(x1 + clearance, y1 + clearance, z1 + clearance)
             candidate = Candidate(point, position, rotation, physical, envelope, score)
@@ -686,6 +744,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                 else:
                     heapq.heapreplace(retained, entry)
             else: candidates.append(candidate)
+    stats.collision_checks += collision_checks
     if max_candidates == 1: return [] if best is None else [best]
     if bounded:
         return [entry[2] for entry in sorted(retained, reverse=True)]
@@ -783,7 +842,9 @@ class PrecomputedFuture:
             return _EMPTY_PRECOMPUTED_FUTURE
         volumes = None
         if not any(item.item.nesting_height is not None for item in future):
-            volumes = tuple(accumulate(sorted(item.dimensions.volume for item in future)))
+            # Occupied, not declared: the free space these are compared with is occupied
+            # volume, and two wedges each declaring the whole crate both fit in it.
+            volumes = tuple(accumulate(sorted(item_occupied_volume(item) for item in future)))
         weights = None
         if has_max_payload:
             weights = tuple(accumulate(sorted(item.weight.ticks for item in future)))
@@ -794,14 +855,15 @@ _EMPTY_PRECOMPUTED_FUTURE = PrecomputedFuture(volumes=None, weights=None, count=
 
 
 def _unpacked_lower_bound(
-    state: ContainerState,
+    state: "ContainerState | _BeamChild",
     unplaced: Sequence[ItemInstance] | int,
     future: PrecomputedFuture = _EMPTY_PRECOMPUTED_FUTURE,
 ) -> int:
     """Admissible volume/weight lower bound on final unpacked cardinality.
 
     The bound deliberately ignores geometry and treats every future item as freely
-    selectable.  For nesting, nominal volumes are not additive, so the volume half is
+    selectable, each counting the volume it occupies (a hull its solid, not its box).
+    For nesting, nominal volumes are not additive, so the volume half is
     disabled rather than making an unsafe claim; weight remains additive.  This weak
     but sound bound is enough to keep a deliberate large-item skip alive when it can
     make room for several smaller future items.
@@ -819,16 +881,114 @@ def _unpacked_lower_bound(
     return unplaced_count + future.count - possible
 
 
+def _ranks_by_volume(config: PackingConfig) -> bool:
+    """Whether the request's objective fills volume before it counts pieces."""
+    return config.objective == "maximum_volume"
+
+
+def _reachable_volume(state: "ContainerState | _BeamChild", future: PrecomputedFuture) -> int:
+    """An upper bound on the volume this node can still end with.
+
+    What is placed, plus the future items' total volume capped by the free space. For
+    nesting, nominal volumes are not additive, so the free space alone is the bound.
+    """
+    used = state.used_volume_ticks
+    if future.count == 0:
+        return used
+    free = max(0, state.container.inner_dimensions.volume - used)
+    return used + (free if future.volumes is None else min(free, future.volumes[-1]))
+
+
+def _placement_signature(state: ContainerState) -> str:
+    """The beam's final tie-break: every placement's id and envelope origin, in order."""
+    return "|".join(f"{p.instance.id}@{p.envelope_origin.x},{p.envelope_origin.y},{p.envelope_origin.z}"
+                    for p in state.placements)
+
+
+def _rank_key(ranked: "ContainerState | _BeamChild", placed: int, signature: str,
+              unplaced: int, future: PrecomputedFuture, by_volume: bool) -> tuple:
+    used = ranked.used_volume_ticks
+    if by_volume:
+        return (-_reachable_volume(ranked, future), -used, unplaced, ranked.max_z, signature)
+    return (_unpacked_lower_bound(ranked, unplaced, future), unplaced, -placed, ranked.max_z, -used, signature)
+
+
 def _node_key(
     node: tuple[ContainerState, tuple[ItemInstance, ...]],
     future: PrecomputedFuture = _EMPTY_PRECOMPUTED_FUTURE,
+    by_volume: bool = False,
 ) -> tuple:
     state, unplaced = node
-    used = state.used_volume_ticks
-    signature = "|".join(f"{p.instance.id}@{p.envelope_origin.x},{p.envelope_origin.y},{p.envelope_origin.z}"
-                         for p in state.placements)
-    return (_unpacked_lower_bound(state, len(unplaced), future), len(unplaced),
-            -len(state.placements), state.max_z, -used, signature)
+    return _rank_key(state, len(state.placements), _placement_signature(state), len(unplaced),
+                     future, by_volume)
+
+
+@dataclass(slots=True)
+class _BeamChild:
+    """One expansion of a wide beam, known by the fields its node key reads.
+
+    Most expansions are ranked and dropped. A child that places one candidate is therefore
+    described by its parent and that candidate, and its state -- a copy of the parent plus
+    the placement and its support scan -- is built only if the beam keeps it or it becomes
+    the incumbent. Every field equals what the built state would report (see `pending`),
+    so ranking a description and ranking the state give the same key.
+    """
+
+    container: Container
+    used_volume_ticks: int
+    payload_ticks: int
+    max_z: int
+    placed: int
+    signature: str
+    parent: ContainerState | None = None
+    item: ItemInstance | None = None
+    candidate: Candidate | None = None
+    state: ContainerState | None = None
+
+    @classmethod
+    def built(cls, state: ContainerState, signature: str) -> "_BeamChild":
+        return cls(state.container, state.used_volume_ticks, state.payload_ticks, state.max_z,
+                   len(state.placements), signature, state=state)
+
+    @classmethod
+    def pending(cls, parent: ContainerState, signature: str, item: ItemInstance,
+                candidate: Candidate) -> "_BeamChild":
+        """`parent` extended by `candidate`, described without being built.
+
+        `ContainerState.add` adds `used_volume_delta` (which reads no support ratio), the
+        item's weight, one placement, and raises `max_z` to the envelope's top; the
+        signature gains one entry. A compression-sensitive state recomputes its volume
+        under the new loads, so that child is simply built.
+        """
+        tail = f"{item.id}@{candidate.point.x},{candidate.point.y},{candidate.point.z}"
+        child_signature = f"{signature}|{tail}" if parent.placements else tail
+        if parent.compression_sensitive or item.item.shape_type is ShapeType.COMPRESSIBLE:
+            return cls.built(_extended(parent, item, candidate), child_signature)
+        placement = Placement(item, candidate.position, candidate.rotation, candidate.dimensions,
+                              candidate.point, candidate.envelope_dimensions)
+        top = candidate.point.z + candidate.envelope_dimensions.height.ticks
+        return cls(parent.container,
+                   parent.used_volume_ticks + used_volume_delta(parent.placements, placement),
+                   parent.payload_ticks + item.weight.ticks,
+                   top if top > parent.max_z else parent.max_z,
+                   len(parent.placements) + 1, child_signature, parent, item, candidate)
+
+    def materialized(self) -> ContainerState:
+        if self.state is None:
+            assert self.parent is not None and self.item is not None and self.candidate is not None
+            self.state = _extended(self.parent, self.item, self.candidate)
+        return self.state
+
+
+def _beam_children(state: ContainerState, signature: str, batch: Sequence[ItemInstance],
+                   config: PackingConfig, constraints: Sequence[PlacementConstraint],
+                   stats: SearchStats, deadline: Deadline, width: int) -> list[_BeamChild]:
+    """`_place_batch`'s children, with a single item's left unbuilt (see `_BeamChild`)."""
+    if len(batch) == 1:
+        return [_BeamChild.pending(state, signature, batch[0], candidate)
+                for candidate in find_candidates(state, batch[0], config, constraints, stats, deadline, width)]
+    return [_BeamChild.built(child, _placement_signature(child))
+            for child in _place_batch(state, batch, config, constraints, stats, deadline, width)]
 
 
 def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance], config: PackingConfig, constraints: Sequence[PlacementConstraint], stats: SearchStats, deadline: Deadline) -> SingleContainerSolution:
@@ -839,6 +999,7 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
     """
     branch_width = max(1, config.max_candidates_per_item)
     width = max(1, config.container_plan_beam_width)
+    by_volume = _ranks_by_volume(config)
     if width == 1:
         # Preserve the historical fast/balanced path exactly.  The quality-only
         # anytime seed below intentionally performs a second rollout so a bounded
@@ -867,7 +1028,7 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
                     expansions.extend((child, unplaced) for child in children)
                 else:
                     expansions.append((state, (*unplaced, *batch)))
-            expansions.sort(key=_node_key)
+            expansions.sort(key=lambda node: _node_key(node, by_volume=by_volume))
             beam = expansions[:branch_width]
             if exhausted:
                 state, unplaced = beam[0]
@@ -903,9 +1064,9 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
         else:
             greedy_unplaced = (*greedy_unplaced, *batch)
     incumbent: tuple[ContainerState, tuple[ItemInstance, ...]] = (greedy, greedy_unplaced)
-    incumbent_key = _node_key(incumbent)
+    incumbent_key = _node_key(incumbent, by_volume=by_volume)
     for position, batch in enumerate(batches):
-        expansions: list[tuple[ContainerState, tuple[ItemInstance, ...]]] = []
+        expansions: list[tuple[_BeamChild, tuple[ItemInstance, ...]]] = []
         exhausted = False
         for state, unplaced in beam:
             if node_limit is not None and nodes >= node_limit:
@@ -913,8 +1074,9 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
                 break
             nodes += 1
             stats.search_nodes_expanded += 1
+            signature = _placement_signature(state)
             try:
-                children = list(_place_batch(state, batch, config, constraints, stats, deadline, branch_width))
+                children = _beam_children(state, signature, batch, config, constraints, stats, deadline, branch_width)
             except TimeLimitReached:
                 exhausted = True
                 children = []
@@ -924,28 +1086,30 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
                 # awkward large item may exclude several smaller later items.  Keeping
                 # an explicit skip child turns the candidate beam into an anytime
                 # knapsack search instead of a collection of irrevocable greedy paths.
-                expansions.append((state, (*unplaced, *batch)))
+                expansions.append((_BeamChild.built(state, signature), (*unplaced, *batch)))
             else:
-                expansions.append((state, (*unplaced, *batch)))
+                expansions.append((_BeamChild.built(state, signature), (*unplaced, *batch)))
         future = tuple(item for later in batches[position + 1:] for item in later)
         precomputed_future = PrecomputedFuture.from_items(future, container.max_payload is not None)
-        for state, unplaced in expansions:
+        for child, unplaced in expansions:
             cand_unplaced_len = len(unplaced) + len(future)
-            # More unplaced items loses on the key's first component whatever follows, so
-            # the signature -- the costly part -- is built only for a candidate that can win.
-            if cand_unplaced_len > incumbent_key[0]:
+            # A worse leading component loses whatever follows.
+            leading = -child.used_volume_ticks if by_volume else cand_unplaced_len
+            if leading > incumbent_key[0]:
                 continue
-            signature = "|".join(f"{p.instance.id}@{p.envelope_origin.x},{p.envelope_origin.y},{p.envelope_origin.z}"
-                                 for p in state.placements)
-            candidate_key = (cand_unplaced_len, cand_unplaced_len,
-                             -len(state.placements), state.max_z, -state.used_volume_ticks, signature)
+            if by_volume:
+                candidate_key = (leading, leading, cand_unplaced_len, child.max_z, child.signature)
+            else:
+                candidate_key = (cand_unplaced_len, cand_unplaced_len,
+                                 -child.placed, child.max_z, -child.used_volume_ticks, child.signature)
             if candidate_key < incumbent_key:
-                incumbent = (state, (*unplaced, *future))
+                incumbent = (child.materialized(), (*unplaced, *future))
                 incumbent_key = candidate_key
         if not expansions:
             break
-        expansions.sort(key=lambda node: _node_key(node, precomputed_future))
-        beam = expansions[:width]
+        expansions.sort(key=lambda node: _rank_key(node[0], node[0].placed, node[0].signature,
+                                                   len(node[1]), precomputed_future, by_volume))
+        beam = [(child.materialized(), unplaced) for child, unplaced in expansions[:width]]
         if exhausted:
             # Return the best complete interpretation seen at any earlier prefix, not
             # whichever partial node happened to lead the beam when the bound fired.
@@ -953,8 +1117,8 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
             # only retain or improve this incumbent.
             state, unplaced = incumbent
             return SingleContainerSolution(state, unplaced, False, deadline.expired)
-    completed = min(beam, key=_node_key) if beam else incumbent
-    state, unplaced = completed if _node_key(completed) <= incumbent_key else incumbent
+    completed = min(beam, key=lambda node: _node_key(node, by_volume=by_volume)) if beam else incumbent
+    state, unplaced = completed if _node_key(completed, by_volume=by_volume) <= incumbent_key else incumbent
     return SingleContainerSolution(state, unplaced)
 
 
@@ -1036,6 +1200,10 @@ def _lattice_profile(item) -> tuple:
         # unlimited item, or stop 0 with stop 1, produces a tiling neither one allows.
         item.max_stacked_items,
         item.stop_index,
+        # A lattice joins same-type items only, so two types may share one exactly when
+        # they share the stacking rule as well.
+        item.stacking_group,
+        item.accepts_stacking_groups,
     )
 
 
@@ -1076,6 +1244,10 @@ class GridSolver:
             return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
         if container.void_fill_reserve_ratio > 0:
             return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
+        if container.is_flat_bag:
+            # The lattice counts cells against the rigid frame alone; a bag's girth rule
+            # couples the axes, which the per-candidate check applies exactly.
+            return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
         if container.max_stack_density is not None:
             # The single-layer heuristic below only ever reasons about one item
             # resting on one other, never the cumulative load a tall column presses
@@ -1101,7 +1273,9 @@ class GridSolver:
         # an exact nesting predecessor. That satisfies ratio=1, covered and single;
         # multiple is satisfiable only on the floor and therefore caps the lattice to
         # one layer instead of delegating the otherwise exact grid.
-        single_layer = (prototype.must_be_on_floor or not prototype.stackable
+        # Every lattice edge joins two items of this type, so the stacking-group rule
+        # holds for the whole lattice exactly when the type carries itself.
+        single_layer = (prototype.must_be_on_floor or not carries_itself(prototype)
                         or prototype.ground_contact_rule == "multiple")
         # How much less than the full height each layer above the first consumes:
         # zero (the ordinary lattice) unless the item declares it sinks into an
@@ -1385,6 +1559,36 @@ class _HomogeneousBlock:
         )
 
 
+#: Distinct group shapes one block solve remembers. The memo only saves arithmetic, so a
+#: full one is simply not added to; the br7 frontier requests meet 770-1240.
+_LATTICE_MEMO_LIMIT = 4096
+
+
+def _lattice(columns: int, rows: int, layers: int, capacity: int) -> tuple[int, int, int, int, int]:
+    """One (space, type, rotation) group's `(nx, ny)` enumeration, summarised.
+
+    Returns how many nodes it has and its first largest count in `(nx, ny)` order with
+    that count's `(nx, ny, nz)` (all zero when no node has a layer). Its nodes are `nx`
+    in `1..columns` and `ny` in `1..min(rows, capacity // nx)`, counted whether or not
+    `nz` is positive; `columns` already folds in the capacity. Within a group every key
+    field but the lead is equal, and the lead improves strictly with the count in both
+    modes (fill and volume are proportional to it), so this first largest count is the
+    only node that can win. The answer depends on these four integers alone -- not on
+    where the space is or which type fills it -- which is what lets it be memoised.
+    O(columns * rows) time, O(1) space.
+    """
+    nodes = count = best_nx = best_ny = best_nz = 0
+    for nx in range(1, columns + 1):
+        maximum_ny = min(rows, capacity // nx)
+        nodes += maximum_ny
+        for ny in range(1, maximum_ny + 1):
+            nz = min(layers, capacity // (nx * ny))
+            if nz > 0 and nx * ny * nz > count:
+                count = nx * ny * nz
+                best_nx, best_ny, best_nz = nx, ny, nz
+    return nodes, count, best_nx, best_ny, best_nz
+
+
 class HomogeneousBlockSolver:
     """Pack deterministic, solid single-type blocks into maximal free spaces.
 
@@ -1409,26 +1613,38 @@ class HomogeneousBlockSolver:
 
     name = "homogeneous_blocks"
     order_insensitive = True
+    MODES = ("count", "volume")
 
-    def __init__(self, constraints: Sequence[PlacementConstraint] = ()):
+    def __init__(self, constraints: Sequence[PlacementConstraint] = (), *,
+                 modes: tuple[str, ...] = MODES, node_limit: int | None = None):
         self.constraints = tuple(constraints)
+        self.modes = modes
+        # `fast` and `balanced` leave `container_plan_node_limit` at one, which would stop
+        # the lattice enumeration before its first block; their start carries its own bound.
+        self.node_limit = node_limit
 
     def pack_one(self, container, sequence, items, config, stats, deadline):
         if not self._supports(container, items, config):
             return ExtremePointSolver(self.constraints).pack_one(
                 container, sequence, items, config, stats, deadline
             )
+        if self.node_limit is not None:
+            config = replace(config, container_plan_node_limit=self.node_limit)
         best: SingleContainerSolution | None = None
         reached = False
-        for mode in ("count", "volume"):
+        # Group enumerations are pure arithmetic, so `balanced`'s second mode and every
+        # later round reuse them (see `_lattice`).
+        lattices: dict[tuple[int, int, int, int], tuple[int, int, int, int, int]] = {}
+        for mode in self.modes:
             if deadline.expired:
                 reached = True
                 break
             solution = self._pack_mode(
-                container, sequence, items, config, stats, deadline, mode
+                container, sequence, items, config, stats, deadline, mode, lattices
             )
             reached = reached or solution.time_limit_reached
-            if best is None or self._solution_key(solution) < self._solution_key(best):
+            by_volume = _ranks_by_volume(config)
+            if best is None or self._solution_key(solution, by_volume) < self._solution_key(best, by_volume):
                 best = solution
         if best is None:
             return SingleContainerSolution(
@@ -1438,7 +1654,8 @@ class HomogeneousBlockSolver:
 
     def _supports(self, container, items, config) -> bool:
         if (self.constraints or container.obstacles or container.preloaded
-                or container.axles is not None or config.minimum_support_ratio > 0):
+                or container.axles is not None or config.minimum_support_ratio > 0
+                or container.is_flat_bag):
             return False
         if (
             container.tag_limits
@@ -1460,6 +1677,9 @@ class HomogeneousBlockSolver:
             and item.item.ground_contact_rule in (None, "free")
             and item.item.nesting_height is None
             and item.item.stop_index is None
+            # Block-on-block contacts would need a second implementation of the
+            # stacking-group rule; the general solver already walks every edge.
+            and not item.item.accepts_stacking_groups
             for item in items
         )
 
@@ -1473,131 +1693,71 @@ class HomogeneousBlockSolver:
         return support.supporting_area / envelope.base_area
 
     @staticmethod
-    def _solution_key(solution: SingleContainerSolution) -> tuple:
+    def _solution_key(solution: SingleContainerSolution, by_volume: bool = False) -> tuple:
         state = solution.state
         signature = tuple(
             (p.instance.id, p.envelope_origin.x, p.envelope_origin.y, p.envelope_origin.z)
             for p in state.placements
         )
+        if by_volume:
+            return (-state.used_volume_ticks, len(solution.unpacked), state.max_z, signature)
         return (len(solution.unpacked), -state.used_volume_ticks, state.max_z, signature)
 
-    def _pack_mode(self, container, sequence, items, config, stats, deadline, mode):
+    @staticmethod
+    def _better_block(best, mode, space, space_volume, item_id, rotation, physical, envelope,
+                      nx, ny, nz, count):
+        """`best`, or this group's winning block when its key ranks strictly ahead."""
+        used_volume = count * physical.volume
+        space_fill_ppm = used_volume * 1_000_000 // space_volume
+        if mode == "count":
+            lead = (-count, -space_fill_ppm, -used_volume)
+        else:
+            lead = (-used_volume, -space_fill_ppm, -count)
+        score = (*lead, space.origin.z, space.origin.y, space.origin.x, item_id, rotation.value,
+                 nx, ny, nz)
+        if best is not None and not score < best.score:
+            return best
+        return _HomogeneousBlock(space, item_id, rotation, physical, envelope,
+                                 nx, ny, nz, count, used_volume, score)
+
+    @staticmethod
+    def _forms(prototype: ItemInstance, config: PackingConfig) -> tuple[tuple, ...]:
+        """Each unique rotation of a type with its envelope extents and physical volume."""
+        forms = []
+        for rotation, physical in prototype.dimensions.unique_rotations(prototype.item.allowed_rotations):
+            envelope = physical.expand(config.clearance) if config.clearance.ticks else physical
+            forms.append((rotation, physical, envelope, envelope.length.ticks,
+                          envelope.width.ticks, envelope.height.ticks, physical.volume))
+        return tuple(forms)
+
+    @staticmethod
+    def _capacity(container: Container, state: ContainerState, available: list[ItemInstance]) -> int:
+        """How many of a type one block may still take: stock, item limit and payload."""
+        capacity = len(available)
+        if container.max_items is not None:
+            capacity = min(capacity, container.max_items - state.placement_count)
+        weight = available[0].weight.ticks
+        if container.max_payload is not None and weight > 0:
+            capacity = min(capacity, (container.max_payload.ticks - state.payload_ticks) // weight)
+        return capacity
+
+    def _pack_mode(self, container, sequence, items, config, stats, deadline, mode, lattices):
         state = ContainerState(container, sequence)
         spaces = [Space(Point(0, 0, 0), container.inner_dimensions)]
         remaining: dict[str, list[ItemInstance]] = {}
         for instance in items:
             remaining.setdefault(instance.item.id, []).append(instance)
+        forms = {item_id: self._forms(available[0], config) for item_id, available in remaining.items()}
         nodes = 0
         reached = False
         while spaces and any(remaining.values()):
-            best: _HomogeneousBlock | None = None
-            for space in spaces:
-                space_volume = space.dimensions.volume
-                for item_id in sorted(remaining):
-                    available = remaining[item_id]
-                    if not available:
-                        continue
-                    prototype = available[0]
-                    capacity = len(available)
-                    if container.max_items is not None:
-                        capacity = min(capacity, container.max_items - state.placement_count)
-                    if container.max_payload is not None and prototype.weight.ticks > 0:
-                        capacity = min(
-                            capacity,
-                            (container.max_payload.ticks - state.payload_ticks)
-                            // prototype.weight.ticks,
-                        )
-                    if capacity <= 0:
-                        continue
-                    for rotation, physical in prototype.dimensions.unique_rotations(
-                        prototype.item.allowed_rotations
-                    ):
-                        envelope = (
-                            physical.expand(config.clearance)
-                            if config.clearance.ticks
-                            else physical
-                        )
-                        maximum_x = space.dimensions.length.ticks // envelope.length.ticks
-                        maximum_y = space.dimensions.width.ticks // envelope.width.ticks
-                        maximum_z = space.dimensions.height.ticks // envelope.height.ticks
-                        for nx in range(1, min(maximum_x, capacity) + 1):
-                            maximum_ny = min(maximum_y, capacity // nx)
-                            for ny in range(1, maximum_ny + 1):
-                                if (
-                                    nodes >= config.container_plan_node_limit
-                                    or deadline.expired
-                                ):
-                                    reached = True
-                                    break
-                                nodes += 1
-                                stats.search_nodes_expanded += 1
-                                nz = min(maximum_z, capacity // (nx * ny))
-                                if nz <= 0:
-                                    continue
-                                count = nx * ny * nz
-                                used_volume = count * physical.volume
-                                space_fill_ppm = used_volume * 1_000_000 // space_volume
-                                if mode == "count":
-                                    lead = (-count, -space_fill_ppm, -used_volume)
-                                else:
-                                    lead = (-used_volume, -space_fill_ppm, -count)
-                                score = (
-                                    *lead,
-                                    space.origin.z,
-                                    space.origin.y,
-                                    space.origin.x,
-                                    item_id,
-                                    rotation.value,
-                                    nx,
-                                    ny,
-                                    nz,
-                                )
-                                candidate = _HomogeneousBlock(
-                                    space, item_id, rotation, physical, envelope,
-                                    nx, ny, nz, count, used_volume, score,
-                                )
-                                if best is None or candidate.score < best.score:
-                                    best = candidate
-                            if reached:
-                                break
-                        if reached:
-                            break
-                    if reached:
-                        break
-                if reached:
-                    break
+            best, nodes, reached = self._next_block(
+                container, state, spaces, remaining, forms, config, stats, deadline, mode,
+                lattices, nodes,
+            )
             if best is None or reached:
                 break
-            chosen = remaining[best.item_id][:best.count]
-            del remaining[best.item_id][:best.count]
-            clearance = config.clearance.ticks
-            index = 0
-            for z in range(best.nz):
-                for y in range(best.ny):
-                    for x in range(best.nx):
-                        point = Point(
-                            best.space.origin.x + x * best.envelope.length.ticks,
-                            best.space.origin.y + y * best.envelope.width.ticks,
-                            best.space.origin.z + z * best.envelope.height.ticks,
-                        )
-                        position = Point(
-                            point.x + clearance,
-                            point.y + clearance,
-                            point.z + clearance,
-                        )
-                        state.add_direct(
-                            Placement(
-                                chosen[index], position, best.rotation, best.physical,
-                                point, best.envelope,
-                                # Above its bottom layer a member rests on an identical
-                                # footprint; the bottom layer rests on whatever is there.
-                                self._member_support(state, chosen[index], point, best.envelope)
-                                if z == 0 else 1.0,
-                            )
-                        )
-                        index += 1
-                        stats.candidates_evaluated += 1
-                        stats.placements_attempted += 1
+            self._commit(state, best, remaining, config, stats)
             spaces = subtract_all(spaces, [best.box], stats)
         unpacked = tuple(
             instance
@@ -1605,6 +1765,97 @@ class HomogeneousBlockSolver:
             for instance in remaining[item_id]
         )
         return SingleContainerSolution(state, unpacked, False, reached or deadline.expired)
+
+    def _next_block(self, container, state, spaces, remaining, forms, config, stats, deadline,
+                    mode, lattices, nodes):
+        """One round's winning block, the mode's node count after it, and whether a limit
+        stopped the round (which then commits nothing)."""
+        node_limit = config.container_plan_node_limit
+        node_ceiling = deadline._search_node_ceiling(stats)
+        by_count = mode == "count"
+        best: _HomogeneousBlock | None = None
+        # Capacity reads only the committed state, so it is fixed for the whole round.
+        types = []
+        for item_id in sorted(remaining):
+            if remaining[item_id] and (capacity := self._capacity(container, state, remaining[item_id])) > 0:
+                types.append((item_id, capacity, forms[item_id]))
+        for space in spaces:
+            space_dimensions = space.dimensions
+            length = space_dimensions.length.ticks
+            width = space_dimensions.width.ticks
+            height = space_dimensions.height.ticks
+            space_volume = space_dimensions.volume
+            for item_id, capacity, type_forms in types:
+                for rotation, physical, envelope, step_x, step_y, step_z, volume in type_forms:
+                    columns = min(length // step_x, capacity)
+                    rows = width // step_y
+                    if not columns or not rows:
+                        continue
+                    # The group's nodes are counted at once, so the stop that the per-node
+                    # loop made is reproduced here: its first node polls the deadline as
+                    # that loop did, and a counted limit falling inside the group is
+                    # charged exactly the nodes that loop would have expanded before
+                    # stopping. Only a wall-clock expiry inside a group is seen at the next
+                    # group instead, and any stop discards the whole round anyway.
+                    if nodes >= node_limit or deadline.expired:
+                        return best, nodes, True
+                    key = (columns, rows, height // step_z, capacity)
+                    lattice = lattices.get(key)
+                    if lattice is None:
+                        lattice = _lattice(*key)
+                        if len(lattices) < _LATTICE_MEMO_LIMIT:
+                            lattices[key] = lattice
+                    group_nodes, count, nx, ny, nz = lattice
+                    budget = node_limit - nodes
+                    if node_ceiling is not None:
+                        budget = min(budget, node_ceiling - stats.search_nodes_expanded)
+                    if group_nodes > budget:
+                        stats.search_nodes_expanded += budget
+                        return best, nodes + budget, True
+                    nodes += group_nodes
+                    stats.search_nodes_expanded += group_nodes
+                    # The key's first field is `-count` or `-used_volume`; a group that
+                    # loses on it loses on the key, so its key is never built.
+                    if count and (best is None
+                                  or (-count if by_count else -count * volume) <= best.score[0]):
+                        best = self._better_block(
+                            best, mode, space, space_volume, item_id, rotation, physical,
+                            envelope, nx, ny, nz, count,
+                        )
+        return best, nodes, False
+
+    def _commit(self, state, best, remaining, config, stats) -> None:
+        """Place every member of the chosen block, bottom layer first."""
+        chosen = remaining[best.item_id][:best.count]
+        del remaining[best.item_id][:best.count]
+        clearance = config.clearance.ticks
+        index = 0
+        for z in range(best.nz):
+            for y in range(best.ny):
+                for x in range(best.nx):
+                    point = Point(
+                        best.space.origin.x + x * best.envelope.length.ticks,
+                        best.space.origin.y + y * best.envelope.width.ticks,
+                        best.space.origin.z + z * best.envelope.height.ticks,
+                    )
+                    position = Point(
+                        point.x + clearance,
+                        point.y + clearance,
+                        point.z + clearance,
+                    )
+                    state.add_direct(
+                        Placement(
+                            chosen[index], position, best.rotation, best.physical,
+                            point, best.envelope,
+                            # Above its bottom layer a member rests on an identical
+                            # footprint; the bottom layer rests on whatever is there.
+                            self._member_support(state, chosen[index], point, best.envelope)
+                            if z == 0 else 1.0,
+                        )
+                    )
+                    index += 1
+                    stats.candidates_evaluated += 1
+                    stats.placements_attempted += 1
 
 
 def _placed_volume(state: ContainerState) -> int:
@@ -1664,6 +1915,7 @@ class ExactSmallSolver:
             suffix_volumes[index] = batch_volumes[index] + suffix_volumes[index + 1]
         best = ContainerState(container, sequence)
         best_volume = 0
+        by_volume = _ranks_by_volume(config)
 
         def state_rank(state: ContainerState, state_volume: int) -> tuple[int, ...]:
             """The exact solver's incumbent order for this one container.
@@ -1671,18 +1923,15 @@ class ExactSmallSolver:
             Landed cost precedes unused volume in the public objective. A promotional
             bracket may make a heavier equal-count subset cheaper, so the historical
             count/volume rank was wrong for this objective (second review).
+            `maximum_volume` fills volume before it counts pieces, so there the two swap.
             """
             count = len(state.placements)
+            if by_volume:
+                return (-state_volume, -count)
             if config.objective != "lowest_landed_cost":
                 return (-count, -state_volume)
-            dimensions = container.outer_dimensions or container.inner_dimensions
-            dim_weight = dimensional_weight(
-                dimensions,
-                config.dimensional_weight_divisor,
-                config.dimensional_weight_length_unit,
-                config.dimensional_weight_weight_unit,
-            )
-            billed_ticks = max(container.tare_weight.ticks + state.payload_ticks, dim_weight.ticks)
+            billed_ticks = max(container.tare_weight.ticks + state.payload_ticks,
+                               _billed_dimensional_weight(state, config))
             table = container.rate_table
             charge = None if table is None else table.charge_minor_or_none(_grams(billed_ticks))
             return (-count, UNPRICEABLE_MINOR if charge is None else charge, -state_volume)
@@ -1704,9 +1953,16 @@ class ExactSmallSolver:
             if index >= len(batches): return
             potential_count = state_count + reachable
             best_count = len(best.placements)
-            if potential_count < best_count:
+            if by_volume:
+                # Fewer pieces can still be more volume, so only the volume bound cuts;
+                # an equal bound wins only on a strictly larger count.
+                reachable_volume = state_volume + suffix_volumes[index]
+                if reachable_volume < best_volume or (
+                        reachable_volume == best_volume and potential_count <= best_count):
+                    return
+            elif potential_count < best_count:
                 return
-            if (config.objective != "lowest_landed_cost"
+            elif (config.objective != "lowest_landed_cost"
                     and potential_count == best_count
                     and state_volume + suffix_volumes[index] <= best_volume):
                 return
@@ -1815,6 +2071,36 @@ def _with_top_loads(placements: Sequence[Placement]) -> tuple[Placement, ...]:
     )
 
 
+def _fits_alone(container: Container, dimensions: Dimensions) -> bool:
+    """Whether one box of these dimensions fits this container empty: the frame, and for a
+    flat bag the girth rule too, so a bag too thin for an item proves it unplaceable."""
+    if container.is_flat_bag:
+        return fits_alone(container.inner_dimensions, dimensions)
+    return dimensions.fits_inside(container.inner_dimensions)
+
+
+def _billed_dimensional_weight(state: ContainerState, config: PackingConfig) -> int:
+    """The dimensional weight, in weight ticks, a carrier bills for this container as filled.
+
+    A flat bag is billed on its running extents, the parcel a carrier measures; an empty bag
+    has no parcel yet and bills nothing by volume. A rigid container is billed on its
+    declared outer size, else its inner size. O(1).
+    """
+    container = state.container
+    if container.is_flat_bag:
+        if not state.placements:
+            return 0
+        dimensions = as_dimensions((state.max_x, state.max_y, state.max_z))
+    else:
+        dimensions = container.outer_dimensions or container.inner_dimensions
+    return dimensional_weight(
+        dimensions,
+        config.dimensional_weight_divisor,
+        config.dimensional_weight_length_unit,
+        config.dimensional_weight_weight_unit,
+    ).ticks
+
+
 def _used_volume_with_current_loads(placements: Sequence[Placement]) -> int:
     """Physical volume after this scene's support loads have been propagated.
 
@@ -1827,6 +2113,18 @@ def _used_volume_with_current_loads(placements: Sequence[Placement]) -> int:
     search nodes is stated in docs/ALGORITHMS-AND-COMPLEXITY.md.
     """
     return nesting_used_volume(_with_top_loads(placements))
+
+
+def _fabricated(declared: Container, one: SingleContainerSolution) -> SingleContainerSolution:
+    """A rung trial as the box cut for it: the achieved extent of its placements, envelope
+    far faces with clearance, rounded up onto the machine grid (D14). O(p)."""
+    state = one.state.copy()
+    achieved = (0, 0, 0)
+    for placement in state.placements:
+        box = placement.envelope_box
+        achieved = (max(achieved[0], box.x2), max(achieved[1], box.y2), max(achieved[2], box.z2))
+    state.container = made_to_measure.fabricate(declared, achieved)
+    return replace(one, state=state, exhaustive=False, dominant_lattice=False)
 
 
 class DefaultContainerSelector:
@@ -1847,6 +2145,46 @@ class _ContainerPlan:
     exhaustive: bool = True
     dominant_lattice: bool = True
 
+
+def _runs_greedy(order_name: str) -> bool:
+    """Whether a start keeps one candidate per item: the greedy orderings and their
+    late-type neighbourhoods. A `:beam` refinement of a winning neighbourhood still
+    carries `:late_` in its name, yet it is the one start meant to search wide."""
+    if order_name.endswith(":beam"):
+        return False
+    return order_name.endswith(":greedy") or ":late_" in order_name
+
+
+#: Beam width and candidates per item for the `best:beam` refinement of a winning late-type
+#: ordering (`...:late_<type>:beam`). Since that refinement searches wide, and at the
+#: profile's 16 it cost 5-25 s and about 33 MB per request without changing the final answer
+#: on any of the 43 OR-Library instances (of 67) that reach it; at 4 the answer is identical
+#: on 43/43 for 21% of the time (98 s against 472 s), and the br5 `quality` frontier went from
+#: 49.4 s back to 30.8 s against 1.5.0's 26.4 s. Other refinements keep the profile's width.
+LATE_TYPE_REFINEMENT_WIDTH = 4
+
+
+def _start_config(order_name: str, config: PackingConfig) -> PackingConfig:
+    """The configuration one portfolio start searches with."""
+    if _runs_greedy(order_name):
+        return replace(
+            config,
+            max_candidates_per_item=1,
+            container_plan_beam_width=1,
+            container_plan_node_limit=1,
+        )
+    if order_name.endswith(":beam") and ":late_" in order_name:
+        return replace(
+            config,
+            max_candidates_per_item=min(config.max_candidates_per_item, LATE_TYPE_REFINEMENT_WIDTH),
+            container_plan_beam_width=min(config.container_plan_beam_width, LATE_TYPE_REFINEMENT_WIDTH),
+        )
+    return config
+
+
+#: Lattice nodes the block start added to `fast` and `balanced` may enumerate per mode --
+#: the bound `quality` gives the same solver through `container_plan_node_limit`.
+BLOCK_START_NODE_LIMIT = 100_000
 
 #: Solver names a caller may pass in `PackingConfig.solvers`, in the order they will run.
 SOLVER_FACTORIES = {
@@ -1919,18 +2257,19 @@ class SolverOrchestrator:
     def _orders(self, items, config):
         # Every strategy is keyed behind `ordering_lead`, which carries priority and,
         # under `maximum_value`, the item's own value.
-        strategies = []
-        if config.profile.value == "quality":
-            strategies.extend([
-                ("small_edge", lambda i: (i.dimensions.max_edge, i.dimensions.volume, i.id)),
-                ("small_volume", lambda i: (i.dimensions.volume, i.dimensions.max_edge, i.id)),
-            ])
-        strategies.extend([
+        small_first = [
+            ("small_edge", lambda i: (i.dimensions.max_edge, i.dimensions.volume, i.id)),
+            ("small_volume", lambda i: (i.dimensions.volume, i.dimensions.max_edge, i.id)),
+        ] if config.profile.value == "quality" else []
+        large_first = [
             ("volume", lambda i: (-i.dimensions.volume, -i.dimensions.max_edge, -i.weight.ticks, i.id)),
             ("base_area", lambda i: (-i.dimensions.base_area, -i.dimensions.volume, i.id)),
             ("weight", lambda i: (-i.weight.ticks, -i.dimensions.volume, i.id)),
             ("constrained", lambda i: (len(i.item.allowed_rotations), -i.item.minimum_support_ratio, -i.dimensions.volume, i.id)),
-        ])
+        ]
+        # Small items first places the most pieces; large items first fills the most space.
+        # The objective decides which family gets the early, fully funded starts.
+        strategies = [*large_first, *small_first] if _ranks_by_volume(config) else [*small_first, *large_first]
         limit = 1 if config.profile.value == "fast" else config.multi_start_orders
         out = []; seen = set()
         for name, key in strategies:
@@ -1948,13 +2287,42 @@ class SolverOrchestrator:
             if signature not in seen: out.append((f"seeded_{len(out)}", order)); seen.add(signature)
         return out
 
-    def _starts(self, items, config):
+    def _block_start(self, items, config, containers):
+        """The block start `fast` and `balanced` add to their own, or `None`.
+
+        Single-type blocks fill a carton load in milliseconds where a per-item search
+        spends its whole budget, so the low-latency profiles run them as one more start
+        and let the score decide. Only where the lattice can express the whole request:
+        a start that fell back to the per-item solver would repeat one already in the
+        portfolio. One item type is `GridSolver`'s case, and it is exact there.
+        """
+        if config.profile.value not in ("fast", "balanced") or config.solvers:
+            return None
+        if self.custom_solvers or self.custom_constraints or len({i.item.id for i in items}) < 2:
+            return None
+        # A lattice takes whichever type fills best; it cannot honour a caller's say over
+        # which item goes first, so it stays out when the items do not all lead alike.
+        if len({ordering_lead(i, config) for i in items}) > 1:
+            return None
+        modes = HomogeneousBlockSolver.MODES
+        if config.profile.value == "fast":
+            # One enumeration, the one the objective ranks by: `fast` is latency-bound.
+            modes = ("volume",) if _ranks_by_volume(config) else ("count",)
+        solver = HomogeneousBlockSolver(modes=modes, node_limit=BLOCK_START_NODE_LIMIT)
+        if not containers or not all(solver._supports(c, items, config) for c in containers):
+            return None
+        return solver
+
+    def _starts(self, items, config, containers=()):
         orders = self._orders(items, config)
         starts = []
         for solver in self._solvers(items, config):
             # A lattice ignores item order, so repeating it per ordering only burns budget.
             chosen = orders[:1] if getattr(solver, "order_insensitive", False) else orders
             starts.extend((solver, name, order) for name, order in chosen)
+        # Last, so a restart budget drops it first and the profile's own starts keep theirs.
+        if orders and (blocks := self._block_start(items, config, containers)) is not None:
+            starts.append((blocks, *orders[0]))
         if config.container_plan_beam_width <= 1 or config.profile.value != "quality":
             return starts
         greedy = [
@@ -1984,13 +2352,38 @@ class SolverOrchestrator:
         its fixed items, in the order they open (`fixed_placements.FixedLoad`). Every start
         fills them first and keeps them, whatever else it does.
         """
-        starts = self._starts(items, config)
+        starts = self._starts(items, config, containers)
         effort_budget = config.effort_budget
         if effort_budget is not None and effort_budget.max_restarts is not None:
             starts = starts[:effort_budget.max_restarts]
         if self._eligible_for_concurrent_execution(deadline, config):
-            return self._solve_concurrent(items, containers, config, deadline, starts, effort_budget, preloaded)
-        return self._solve_sequential(items, containers, config, deadline, starts, effort_budget, preloaded)
+            run = self._solve_concurrent(items, containers, config, deadline, starts, effort_budget, preloaded)
+        else:
+            run = self._solve_sequential(items, containers, config, deadline, starts, effort_budget, preloaded)
+        return self._without_a_block_start_that_only_ties(run, starts, config)
+
+    @staticmethod
+    def _without_a_block_start_that_only_ties(run, starts, config):
+        """Drop the added block start's answer unless it strictly beats the profile's own.
+
+        The start is there to improve an answer, not to replace an equal one: on a tie
+        the ranking falls to the solver name, which would hand the result to a lattice
+        that knows nothing of the orderings the profile's own starts honour.
+        """
+        if not starts or getattr(starts[-1][0], "node_limit", None) is None:
+            return run
+        from .extensions import resolve_objective_scorer
+        scorer = resolve_objective_scorer(config.objective, config)
+        added = f"{starts[-1][0].name}:{starts[-1][1]}"
+        own = [scorer.score(solution) for solution in run.solutions if solution.solver_name != added]
+        if not own:
+            return run
+        best_own = min(own)
+        kept = tuple(
+            solution for solution in run.solutions
+            if solution.solver_name != added or scorer.score(solution) < best_own
+        )
+        return PortfolioRun(kept, run.starts)
 
     def _eligible_for_concurrent_execution(self, deadline, config) -> bool:
         """Gate for the worker-process path.
@@ -2056,14 +2449,7 @@ class SolverOrchestrator:
             budget = deadline.slice(len(starts) - position)
             if effort_budget is not None:
                 budget = budget.with_effort(effort_budget, stats)
-            start_config = config
-            if order_name.endswith(":greedy") or ":late_" in order_name:
-                start_config = replace(
-                    config,
-                    max_candidates_per_item=1,
-                    container_plan_beam_width=1,
-                    container_plan_node_limit=1,
-                )
+            start_config = _start_config(order_name, config)
             packed, unpacked, exhaustive, reached, dominant_lattice = self._across_containers(solver, order, containers, start_config, stats, budget, preloaded)
             effort_reached = budget.effort_exceeded
             wall_reached = reached and budget.remaining_ns <= 0
@@ -2239,7 +2625,7 @@ class SolverOrchestrator:
     def _unpacked_reason(self, instance, containers, reached):
         dimension_fit = any(
             any(
-                dimensions.fits_inside(container.inner_dimensions)
+                _fits_alone(container, dimensions)
                 for _, dimensions in instance.dimensions.unique_rotations(
                     instance.item.allowed_rotations
                 )
@@ -2254,7 +2640,7 @@ class SolverOrchestrator:
         # act on.
         fits_with_any_rotation = any(
             any(
-                dimensions.fits_inside(container.inner_dimensions)
+                _fits_alone(container, dimensions)
                 for _, dimensions in instance.dimensions.unique_rotations(Rotation.all())
             )
             for container in containers
@@ -2300,6 +2686,72 @@ class SolverOrchestrator:
         if instance.item.group:
             return "group_cannot_fit_together", ()
         return "no_feasible_placement", ()
+
+    @staticmethod
+    def _opened_by_type(packed) -> dict[str, int]:
+        """How many containers of each template a layout opened. O(P), once per layout."""
+        opened: dict[str, int] = {}
+        for packed_container in packed:
+            key = packed_container.container.id
+            opened[key] = opened.get(key, 0) + 1
+        return opened
+
+    @staticmethod
+    def _limit_reason(instance, containers, opened, config) -> str | None:
+        """The container limit that left `instance` out, for the `no_feasible_placement`
+        fallback, or None when no limit explains it.
+
+        Only containers that admit the item on every structural count -- a fitting
+        rotation, its weight, its eligibility tags -- are asked. When an axle refuses the
+        item alone in every one of them, the axle is the reason. Otherwise, when every one
+        that would take it alone is out of stock, or `max_containers` is reached, the
+        reason is the inventory: `max_items`, cumulative `max_payload`, `tag_limits`, the
+        stop-accessibility rule and an axle's share of a full load can only refuse an item
+        a fresh container would take, so they surface here too. `opened` is
+        `_opened_by_type` of the final layout. O(C*R) for C templates and R rotations;
+        deterministic, since it reads only the request and that layout.
+        """
+        item = instance.item
+        envelopes = tuple(
+            dimensions.expand(config.clearance)
+            for _, dimensions in instance.dimensions.unique_rotations(item.allowed_rotations)
+        )
+
+        def compatible(container) -> bool:
+            return (
+                any(_fits_alone(container, envelope) for envelope in envelopes)
+                and (container.max_payload is None
+                     or instance.weight.ticks <= container.max_payload.ticks)
+                and (not item.eligible_container_tags
+                     or bool(item.eligible_container_tags & container.tags))
+            )
+
+        def admits_alone(container) -> bool:
+            if container.axles is None:
+                return True
+            return any(
+                _fits_alone(container, envelope) and axle_admits_alone(
+                    container.axles, container.tare_weight.ticks,
+                    container.inner_dimensions.length.ticks, instance.weight.ticks,
+                    envelope.length.ticks,
+                )
+                for envelope in envelopes
+            )
+
+        candidates = [container for container in containers if compatible(container)]
+        if not candidates:
+            return None
+        admitting = [container for container in candidates if admits_alone(container)]
+        if not admitting:
+            return "axle_overloaded"
+        if config.max_containers is not None and sum(opened.values()) >= config.max_containers:
+            return "container_inventory_exhausted"
+        if all(
+            container.quantity is not None and opened.get(container.id, 0) >= container.quantity
+            for container in admitting
+        ):
+            return "container_inventory_exhausted"
+        return None
 
     def _support_is_the_blocker(self, instance, packed, config):
         """Post-hoc diagnosis for the `no_feasible_placement` fallback:
@@ -2434,7 +2886,8 @@ class SolverOrchestrator:
         """Admissible volume/weight lower bound for unopened containers.
 
         The largest still-available capacity is granted to every future container,
-        which can only underestimate how many are required.  Nominal volume is not
+        which can only underestimate how many are required.  A hull counts its own
+        solid, as the beam and exact floors do.  Nominal volume is not
         additive for nesting, so that half is disabled in that case; payload remains
         exact and additive.
         """
@@ -2448,7 +2901,7 @@ class SolverOrchestrator:
         if not any(item.item.nesting_height is not None for item in plan.remaining):
             # Dimensions are strictly positive, so every container has volume to divide by.
             maximum_volume = max(c.inner_dimensions.volume for c in available)
-            total_volume = sum(item.dimensions.volume for item in plan.remaining)
+            total_volume = sum(item_occupied_volume(item) for item in plan.remaining)
             lower = max(lower, (total_volume + maximum_volume - 1) // maximum_volume)
         finite_payloads = [
             c.max_payload.ticks for c in available if c.max_payload is not None
@@ -2491,6 +2944,10 @@ class SolverOrchestrator:
         if not (beam or getattr(solver, "name", None) == "exact_small"):
             return
         if config.objective != "default":
+            return
+        # Its unused-volume and height keys are ratios against a declared size, and a
+        # made-to-measure box has none until it is cut: the bound would not be admissible.
+        if any(container.made_to_measure is not None for container in containers):
             return
         try:
             stats.objective_lower_bound = bounds.compute(items, containers).as_tuple()
@@ -2535,15 +2992,18 @@ class SolverOrchestrator:
                     available = plan.inventory[container.id]
                     if available is not None and available <= 0:
                         continue
-                    plan_nodes += 1
                     try:
-                        one = solver.pack_one(
-                            container, plan.sequences[container.id] + 1,
+                        one, trials = self._trial(
+                            solver, container, plan.sequences[container.id] + 1,
                             plan.remaining, config, stats, deadline,
                         )
                     except TimeLimitReached:
+                        plan_nodes += 1
                         reached = True
                         break
+                    # Each rung is one single-container solve, so the node limit keeps
+                    # bounding the work of a made-to-measure chain.
+                    plan_nodes += trials
                     reached = reached or one.time_limit_reached
                     if one.state.placement_count == 0:
                         continue
@@ -2593,12 +3053,15 @@ class SolverOrchestrator:
             )[:config.container_plan_beam_width]
 
         unpacked = []
+        opened = self._opened_by_type(incumbent.packed)
         for instance in incumbent.remaining:
             reason, details = self._unpacked_reason(instance, containers, reached)
             if reason == "no_feasible_placement" and self._support_is_the_blocker(
                 instance, incumbent.packed, config
             ):
                 reason = "insufficient_support"
+            if reason == "no_feasible_placement":
+                reason = self._limit_reason(instance, containers, opened, config) or reason
             unpacked.append(UnpackedItem(instance, reason, details))
         proven = (
             incumbent.exhaustive and not reached and not unpacked
@@ -2608,6 +3071,109 @@ class SolverOrchestrator:
             incumbent.packed, tuple(unpacked), proven, reached,
             incumbent.dominant_lattice,
         )
+
+    def _trial(self, solver, container, sequence, items, config, stats, deadline):
+        """One container's trial for a round, and how many single-container solves it spent.
+
+        A declared container is one solve. A made-to-measure one runs the rung chain and
+        returns its trial already fabricated (docs/MADE-TO-MEASURE-CONTAINERS.md).
+        """
+        if container.made_to_measure is None:
+            return solver.pack_one(container, sequence, items, config, stats, deadline), 1
+        return self._made_to_measure_trial(solver, container, sequence, items, config, stats, deadline)
+
+    def _made_to_measure_trial(self, solver, container, sequence, items, config, stats, deadline):
+        """Try each solving envelope in ascending order and keep the first that places every
+        item; failing that, the trial this round's own key prefers, the smaller rung on a tie.
+
+        At most four solves, two trial states alive. A compact lattice cannot describe a box
+        cut to the achieved extent, so the rung solves always report coordinates (D12), and
+        a rung choice is a heuristic, so the trial is never exhaustive (D13).
+        """
+        edges = made_to_measure.instance_edges((item.dimensions for item in items), config.clearance.ticks)
+        rungs = made_to_measure.solving_envelopes(
+            container.made_to_measure, made_to_measure.as_triple(container.inner_dimensions), edges)
+        rung_config = config if config.require_placement_coordinates else replace(
+            config, require_placement_coordinates=True)
+        best = best_key = last = None
+        stopped = False
+        trials = 0
+        for rung in rungs:
+            try:
+                one = solver.pack_one(made_to_measure.with_envelope(container, rung), sequence, items,
+                                      rung_config, stats, deadline)
+            except TimeLimitReached:
+                if best is None:
+                    raise
+                stopped = True
+                break
+            trials += 1
+            stopped = one.time_limit_reached
+            last = one
+            if one.state.placement_count:
+                trial = _fabricated(container, one)
+                if one.state.placement_count == len(items):
+                    return trial, trials
+                key = self._round_score(trial, items, config)
+                if best is None or key < best_key:
+                    best, best_key = trial, key
+            if stopped or deadline.expired:
+                stopped = True
+                break
+        chosen = best if best is not None else last
+        return replace(chosen, time_limit_reached=chosen.time_limit_reached or stopped), trials
+
+    def _round_score(self, one, round_items, config) -> tuple:
+        """The greedy round's key for one trial, read from the container the trial built.
+
+        A made-to-measure trial carries its fabricated box, so the key prices the box that
+        ships, never the machine maximum the loop declared. The trial chain ranks
+        an incomplete round's rungs by this same key.
+        """
+        container = one.state.container
+        if (
+            config.objective in ("shipping_cost", "lowest_landed_cost")
+            and config.dimensional_weight_divisor is not None
+        ):
+            dim_weight = _billed_dimensional_weight(one.state, config)
+            # `payload_ticks` and `placement_count` are lattice-aware: the
+            # compact path carries no per-item placements, so summing
+            # `state.placements` here priced a quantity-compressed trial as
+            # tare alone and let an unpriceable container win the round.
+            gross = container.tare_weight.ticks + one.state.payload_ticks
+            billed = max(gross, dim_weight)
+            placed = one.state.placement_count
+            if config.objective == "shipping_cost":
+                score = (-placed, billed, container.id)
+            else:
+                # Landed cost ranks the round by the money the finished score will
+                # charge, not by the grams it is derived from. This loop commits
+                # the trial verbatim, so its billed weight is already final and the
+                # tariff can be read now; a bracket step or a minimum charge makes
+                # the cheaper shipment the heavier one, and a trial the tariff
+                # cannot price is unshippable rather than merely dear, so it sorts
+                # behind every priceable alternative. Keys after the charge
+                # mirror Rust's, so the two engines pick the same container.
+                charge = (
+                    container.rate_table.charge_minor_or_none(_grams(billed))
+                    if container.rate_table is not None
+                    else None
+                )
+                containers_needed = -(-len(round_items) // max(placed, 1))
+                score = (
+                    UNPRICEABLE_MINOR if charge is None else charge,
+                    containers_needed,
+                    -placed,
+                    container.id,
+                )
+        elif _ranks_by_volume(config) and isinstance(self.container_selector, DefaultContainerSelector):
+            # The round keeps the trial that loaded the most volume, not the one
+            # that seated the most pieces. A caller's own selector is left alone.
+            used = one.state.used_volume_ticks
+            score = (-used, container.cost_minor, container.inner_dimensions.volume - used, container.id)
+        else:
+            score = self.container_selector.score(container, one)
+        return score
 
     def _across_containers_greedy(self, solver, items, containers, config, stats, deadline, opened):
         start, reached = opened
@@ -2627,7 +3193,7 @@ class SolverOrchestrator:
             for container in ordered_containers:
                 if inventory[container.id] is not None and inventory[container.id] <= 0: continue
                 try:
-                    one = solver.pack_one(container, sequences[container.id] + 1, round_items, config, stats, deadline)
+                    one, _ = self._trial(solver, container, sequences[container.id] + 1, round_items, config, stats, deadline)
                 except TimeLimitReached:
                     reached = True
                     break
@@ -2637,49 +3203,7 @@ class SolverOrchestrator:
                     if reached:
                         break
                     continue
-                if (
-                    config.objective in ("shipping_cost", "lowest_landed_cost")
-                    and config.dimensional_weight_divisor is not None
-                ):
-                    dimensions = container.outer_dimensions or container.inner_dimensions
-                    dim_weight = dimensional_weight(
-                        dimensions,
-                        config.dimensional_weight_divisor,
-                        config.dimensional_weight_length_unit,
-                        config.dimensional_weight_weight_unit,
-                    ).ticks
-                    # `payload_ticks` and `placement_count` are lattice-aware: the
-                    # compact path carries no per-item placements, so summing
-                    # `state.placements` here priced a quantity-compressed trial as
-                    # tare alone and let an unpriceable container win the round.
-                    gross = container.tare_weight.ticks + one.state.payload_ticks
-                    billed = max(gross, dim_weight)
-                    placed = one.state.placement_count
-                    if config.objective == "shipping_cost":
-                        score = (-placed, billed, container.id)
-                    else:
-                        # Landed cost ranks the round by the money the finished score will
-                        # charge, not by the grams it is derived from. This loop commits
-                        # the trial verbatim, so its billed weight is already final and the
-                        # tariff can be read now; a bracket step or a minimum charge makes
-                        # the cheaper shipment the heavier one, and a trial the tariff
-                        # cannot price is unshippable rather than merely dear, so it sorts
-                        # behind every priceable alternative. Keys after the charge
-                        # mirror Rust's, so the two engines pick the same container.
-                        charge = (
-                            container.rate_table.charge_minor_or_none(_grams(billed))
-                            if container.rate_table is not None
-                            else None
-                        )
-                        containers_needed = -(-len(round_items) // max(placed, 1))
-                        score = (
-                            UNPRICEABLE_MINOR if charge is None else charge,
-                            containers_needed,
-                            -placed,
-                            container.id,
-                        )
-                else:
-                    score = self.container_selector.score(container, one)
+                score = self._round_score(one, round_items, config)
                 if best_score is None or score < best_score:
                     best_score, best = score, one
                 if reached:
@@ -2696,10 +3220,13 @@ class SolverOrchestrator:
             remaining = [i for i in remaining if i.id not in ids]
             if reached: break
         unpacked = []
+        opened = self._opened_by_type(packed)
         for instance in remaining:
             reason, details = self._unpacked_reason(instance, containers, reached)
             if reason == "no_feasible_placement" and self._support_is_the_blocker(instance, packed, config):
                 reason = "insufficient_support"
+            if reason == "no_feasible_placement":
+                reason = self._limit_reason(instance, containers, opened, config) or reason
             unpacked.append(UnpackedItem(instance, reason, details))
         # Optimality may only be claimed when an exhaustive search filled a single
         # container -- the cheapest one, since containers are tried in cost order.

@@ -4,10 +4,10 @@ from typing import TYPE_CHECKING, Sequence
 
 from . import hull
 from .compression import applied_pressure, effective_height_ticks
-from .geometry import ShapeType
+from .geometry import Rotation, ShapeType
 
 if TYPE_CHECKING:
-    from .models import Placement
+    from .models import ItemInstance, Placement
 
 
 def is_valid_nesting(a: "Placement", b: "Placement") -> bool:
@@ -91,6 +91,21 @@ def occupied_volume(placement: "Placement") -> int:
         dimensions.height.ticks, item.compression_ratio_ppm,
         item.max_compression_pressure_kpa, pressure,
     )
+
+
+def item_occupied_volume(instance: "ItemInstance") -> int:
+    """The volume `occupied_volume` counts for this item before it is placed, in any orientation.
+
+    A hull occupies its authored solid, and a proper rotation keeps that volume, so one
+    orientation answers for all six through the memoised shape: `O(1)` after the first call.
+    A compressible item keeps its declared box: collision and support use the uncompressed
+    box, so placed boxes never share space and their declared volumes stay additive.
+    """
+    item = instance.item
+    if item.shape_type is ShapeType.CONVEX_HULL:
+        assert item.hull_vertices is not None
+        return hull.shape_for(item.hull_vertices, Rotation.LWH.value).volume
+    return instance.dimensions.volume
 
 
 def used_volume(placements: Sequence["Placement"]) -> int:

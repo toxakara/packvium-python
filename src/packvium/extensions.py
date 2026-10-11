@@ -120,7 +120,7 @@ class ShippingCostSolutionScorer:
         unpacked_count, container_count, _cost, unused, height = default
         billable = 0
         for c in containers:
-            dimensions = c.container.outer_dimensions or c.container.inner_dimensions
+            dimensions = c.billed_dimensions
             dim_weight = dimensional_weight(dimensions, self.divisor, self.length_unit, self.weight_unit)
             billable += max(c.gross_weight.ticks, dim_weight.ticks)
         return (unpacked_count, billable, container_count, unused, height)
@@ -164,7 +164,7 @@ class LandedCostSolutionScorer(ShippingCostSolutionScorer):
                     f"the lowest_landed_cost objective requires a rate_table on every "
                     f"container; {c.container.id!r} has none"
                 )
-            dimensions = c.container.outer_dimensions or c.container.inner_dimensions
+            dimensions = c.billed_dimensions
             dim_weight = dimensional_weight(dimensions, self.divisor, self.length_unit, self.weight_unit)
             billed_ticks = max(c.gross_weight.ticks, dim_weight.ticks)
             charge = table.charge_minor_or_none(_grams(billed_ticks))
@@ -198,7 +198,7 @@ def unpriceable_container(
         return None
     for c in containers:
         table = c.container.rate_table
-        dimensions = c.container.outer_dimensions or c.container.inner_dimensions
+        dimensions = c.billed_dimensions
         dim_weight = dimensional_weight(
             dimensions,
             config.dimensional_weight_divisor,
@@ -291,6 +291,45 @@ class MaximumValueSolutionScorer:
         return (unpacked_count, value_forgone, container_count, cost, unused)
 
 
+class MaximumVolumeSolutionScorer:
+    """Ranks by the share of the requested item volume left unpacked, ahead of how many
+    items that is.
+
+    The knapsack reading of a load that cannot all fit: fill the space, rather than place
+    the most pieces. `default` prefers many small items to one large one, because it
+    counts pieces; this objective prefers whichever leaves less volume behind.
+
+    `unpacked_volume_ppm` is `ceil(unpacked volume x 10^6 / requested volume)`, in nominal
+    item volume. Rounded up, so an incomplete answer never scores zero: a complete answer
+    still beats every incomplete one, which is the guarantee `unpacked_count` gives the
+    other objectives by leading them. A ratio rather than the raw volume because cubic
+    ticks overflow a 64-bit integer for an ordinary freight container.
+
+    O(n) additional work for `n` item instances -- one integer field read each.
+    """
+
+    SCALE = DefaultSolutionScorer.SCALE
+
+    def score(self, solution: "RawSolution") -> tuple[int, ...]:
+        return self.score_containers(solution.containers, solution.unpacked)
+
+    @classmethod
+    def score_containers(
+        cls, containers: Sequence["PackedContainer"], unpacked: Sequence["UnpackedItem"]
+    ) -> tuple[int, ...]:
+        default = DefaultSolutionScorer.score_containers(containers, unpacked)
+        unpacked_count, container_count, cost, unused, _height = default
+        unpacked_volume = sum(u.instance.dimensions.volume for u in unpacked)
+        packed_volume = sum(
+            instance.dimensions.volume
+            for c in containers
+            for instance in (c.lattice_items or tuple(p.instance for p in c.placements))
+        )
+        requested = unpacked_volume + packed_volume
+        unpacked_ppm = -(-unpacked_volume * cls.SCALE // requested) if requested else 0
+        return (unpacked_ppm, unpacked_count, container_count, cost, unused)
+
+
 #: Named objectives a caller may select through `PackingConfig.objective`. Each factory
 #: takes the active `PackingConfig` (possibly `None`, for callers that score without
 #: one) so a parametrized objective like `shipping_cost` can pull its own inputs from
@@ -306,6 +345,7 @@ OBJECTIVE_SCORERS: dict[str, "Callable[[PackingConfig | None], SolutionScorer]"]
     "lowest_landed_cost": LandedCostSolutionScorer.from_config,
     "open_dimension_height": lambda config: OpenDimensionSolutionScorer(),
     "maximum_value": lambda config: MaximumValueSolutionScorer(),
+    "maximum_volume": lambda config: MaximumVolumeSolutionScorer(),
 }
 
 

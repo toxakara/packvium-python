@@ -142,14 +142,15 @@ def test_query_results_cannot_corrupt_the_index_or_a_fork():
     assert list(index.query(*box)) == [0]
 
 
+class CountingIndex(SpatialIndex):
+    collections = 0
+
+    def _collect(self, *cell_range):
+        self.collections += 1
+        return super()._collect(*cell_range)
+
+
 def test_insert_reuses_distant_queries_and_invalidates_overlapping_queries():
-    class CountingIndex(SpatialIndex):
-        collections = 0
-
-        def _collect(self, *cell_range):
-            self.collections += 1
-            return super()._collect(*cell_range)
-
     index = CountingIndex(80, 80, 80)
     index.add(0, (0, 0, 0, 20, 20, 20))
     near = (0, 0, 0, 20, 20, 20)
@@ -172,8 +173,8 @@ def test_query_cache_has_bounded_retention_even_without_insertions():
     assert list(index.query(0, 0, 0, 20, 20, 20)) == [0]
 
 
-def test_insertion_carries_over_a_bounded_number_of_answers():
-    index = SpatialIndex(80, 80, 80)
+def test_insertion_inherits_disjoint_answers_instead_of_copying_them():
+    index = CountingIndex(80, 80, 80)
     first = (0, 0, 0, 20, 20, 20)
     index.add(0, first)
     spans = [(low * 10, high * 10) for low in range(4) for high in range(low + 1, 5)]
@@ -188,13 +189,33 @@ def test_insertion_carries_over_a_bounded_number_of_answers():
     fork_inserted = (10, 10, 10, 30, 30, 30)
     index.add(1, inserted)
     fork.add(1, fork_inserted)
-    assert len(index._answers) == 128
-    assert len(fork._answers) == 128
+    # An insertion copies nothing: a branch that is never queried again costs no answers.
+    assert index._answers == {} and fork._answers == {}
+    collected = index.collections
     fresh = build([first, inserted], 80, 80, 80)
     fresh_fork = build([first, fork_inserted], 80, 80, 80)
     for query in [*queries, inserted, fork_inserted]:
         assert index.query(*query) == fresh.query(*query)
         assert fork.query(*query) == fresh_fork.query(*query)
+    # Every earlier range is disjoint from the far corner, so each was inherited rather
+    # than collected again; only the two ranges around the insertions were new.
+    assert index.collections - collected <= 2
+
+
+def test_an_index_inherits_from_one_generation_only():
+    index = SpatialIndex(80, 80, 80)
+    index.add(0, (0, 0, 0, 10, 10, 10))
+    index.query(0, 0, 0, 30, 30, 30)
+    original = index._answers
+    index.add(1, (70, 70, 70, 80, 80, 80))
+    assert index._inherited is original
+    index.query(0, 0, 0, 30, 30, 30)
+    after_first = index._answers
+    index.add(2, (70, 0, 0, 80, 10, 10))
+    # The dictionary before the first insertion is no longer reachable from this index,
+    # so live states hold at most their own answers and their parent's.
+    assert index._inherited is after_first and index._inherited is not original
+    assert index.query(0, 0, 0, 30, 30, 30) == (0,)
 
 
 @pytest.mark.parametrize("seed", range(10))

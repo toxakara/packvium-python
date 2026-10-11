@@ -8,7 +8,8 @@ derived from the code under test.
 from __future__ import annotations
 
 from packvium import AxisAlignedBox, Axle, Dimensions, Length, Point, Weight
-from packvium.axle_load import axle_balanced_origins, axle_load_exceeded, axle_reactions
+from packvium.axle_load import (axle_admits_alone, axle_balanced_origins, axle_load_exceeded,
+                                axle_reactions)
 from packvium.constraints import LoadUnit
 
 
@@ -96,3 +97,30 @@ def test_only_the_front_axle_limit_yields_a_balanced_origin_when_the_rear_is_unl
     # Front reaction is 800 * (900 - c) / 800; a front limit of 400 also lands at c = 500.
     axles = (Axle(Length(100), Weight(400)), Axle(Length(900)))
     assert axle_balanced_origins(axles, [], 0, 0, 800, 200) == [400]
+
+
+def test_an_item_alone_is_admitted_exactly_where_both_axles_hold():
+    # Axles at 0 and 100, limits 400 front / 700 rear, a 1000-tick item centred at c.
+    # The front carries 1000 * (100 - c) / 100 <= 400, so c >= 60; the rear carries
+    # 1000 * c / 100 <= 700, so c <= 70. A 10-long box holds at origins 55..65; a
+    # 100-long one has the single centre 50, outside that window.
+    axles = (Axle(Length(0), Weight(400)), Axle(Length(100), Weight(700)))
+    assert axle_admits_alone(axles, 0, 100, 1000, 10)
+    assert not axle_admits_alone(axles, 0, 100, 1000, 100)
+
+
+def test_an_item_alone_above_both_limits_together_is_never_admitted():
+    axles = (Axle(Length(0), Weight(400)), Axle(Length(100), Weight(400)))
+    assert not axle_admits_alone(axles, 0, 100, 1000, 10)
+
+
+def test_an_item_longer_than_the_container_is_not_admitted():
+    axles = (Axle(Length(0), None), Axle(Length(100), None))
+    assert not axle_admits_alone(axles, 0, 100, 1, 101)
+
+
+def test_a_weightless_item_is_admitted_exactly_when_the_tare_alone_is():
+    # Tare 800 at the centre puts 400 on each axle.
+    assert axle_admits_alone((Axle(Length(0), Weight(400)), Axle(Length(100), None)), 800, 100, 0, 10)
+    assert not axle_admits_alone((Axle(Length(0), Weight(399)), Axle(Length(100), None)), 800, 100, 0, 10)
+

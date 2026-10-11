@@ -22,13 +22,16 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Set, Tuple, Type
 
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
+from .flat_bag import DEFORMABLE_BOUNDARY_KINDS
 from .units import Length, Weight
+from .made_to_measure import box_cost_minor_for
 
 REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "negative_measure",
            "invalid_unit", "duplicate_id", "not_allowed", "invalid_value")
 
 SOLVER_PROFILES = ("fast", "balanced", "quality", "exact_small")
-OBJECTIVES = ("default", "lowest_cost", "shipping_cost", "lowest_landed_cost", "open_dimension_height", "maximum_value")
+OBJECTIVES = ("default", "lowest_cost", "shipping_cost", "lowest_landed_cost", "open_dimension_height", "maximum_value",
+              "maximum_volume")
 ACCESS_DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
 
 
@@ -211,6 +214,8 @@ def _check_item(raw: Any, where: str, unit: str) -> None:
     _optional(item, "max_compression_pressure_kpa", where, lambda v, f: _integer(v, f, 0))
     _optional(item, "minimum_support_ratio", where, _ratio)
     _optional(item, "compression_ratio", where, lambda v, f: _ratio(v, f, None))
+    _optional(item, "stacking_group", where, _stacking_group_name)
+    _optional(item, "accepts_stacking_groups", where, _stacking_group_names)
 
 
 def _check_container(raw: Any, where: str, unit: str) -> None:
@@ -228,6 +233,80 @@ def _check_container(raw: Any, where: str, unit: str) -> None:
     _optional(container, "tag_limits", where, _tag_limits)
     _optional(container, "rate_table", where, _rate_table)
     _optional(container, "obstacles", where, lambda v, f: _obstacles(v, f, unit))
+    _optional(container, "deformable_boundary", where,
+              lambda v, f: _deformable_boundary(container, v, f, where))
+    _optional(container, "made_to_measure", where,
+              lambda v, f: _made_to_measure(container, v, f, where, unit))
+
+
+#: Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md).
+BAG_EXCLUSIONS = ("obstacles", "axles", "access_directions", "max_stack_density",
+                  "outer_dimensions", "void_fill_reserve_ratio", "made_to_measure")
+
+
+def _deformable_boundary(container: Mapping[str, Any], raw: Any, field: str, where: str) -> None:
+    boundary = _object(raw, field)
+    _one_of(_required(boundary, "kind", field), pointer_join(field, "kind"), DEFORMABLE_BOUNDARY_KINDS)
+    _known_fields(boundary, field, ("kind",))
+    for name in BAG_EXCLUSIONS:
+        if _set_beside_a_bag(name, container.get(name)):
+            raise InvalidRequestError("not_allowed", pointer_join(where, name),
+                                      "cannot be combined with deformable_boundary")
+
+
+#: Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`.
+MADE_TO_MEASURE_FIELDS = ("cost_per_square_metre_minor", "increment", "minimum", "outer_allowance",
+                          "tare_per_square_metre")
+
+
+def _made_to_measure(container: Mapping[str, Any], raw: Any, field: str, where: str, unit: str) -> None:
+    """The made-to-measure rules: shape top to bottom, then each axis, then the price.
+
+    Run after every other container field, so an existing error always wins. O(1)."""
+    machine = _object(raw, field)
+    _known_fields(machine, field, MADE_TO_MEASURE_FIELDS)
+    for name in ("minimum", "increment"):
+        _required(machine, name, field)
+    for name in ("minimum", "increment", "outer_allowance"):
+        _optional(machine, name, field, lambda v, f: _dimensions(v, f, unit))
+    _optional(machine, "cost_per_square_metre_minor", field, lambda v, f: _integer(v, f, 0))
+    _optional(machine, "tare_per_square_metre", field, lambda v, f: _measure(v, f, Weight, "g"))
+    if container.get("outer_dimensions") is not None:
+        raise InvalidRequestError("not_allowed", pointer_join(where, "outer_dimensions"),
+                                  "cannot be combined with made_to_measure")
+    inner = _ticks(container["inner_dimensions"], unit)
+    minimum = _ticks(machine["minimum"], unit)
+    increment = _ticks(machine["increment"], unit)
+    for axis, side in enumerate(_SIDES):
+        if minimum[axis] == 0:
+            raise InvalidRequestError("invalid_value", pointer_join(field, "minimum", side), "must be positive")
+        if increment[axis] == 0:
+            raise InvalidRequestError("invalid_value", pointer_join(field, "increment", side), "must be positive")
+        if minimum[axis] > inner[axis]:
+            raise InvalidRequestError("invalid_value", pointer_join(field, "minimum", side),
+                                      "exceeds inner_dimensions")
+        if (inner[axis] - minimum[axis]) % increment[axis]:
+            raise InvalidRequestError("invalid_value", pointer_join(field, "increment", side),
+                                      "does not divide inner_dimensions minus minimum")
+    price = json_integer(machine.get("cost_per_square_metre_minor") or 0)
+    fee = json_integer(container.get("cost_minor") or 0)
+    if box_cost_minor_for(price, fee, inner) > MAX_EXACT_MAGNITUDE:
+        raise InvalidRequestError("invalid_value", pointer_join(field, "cost_per_square_metre_minor"),
+                                  f"prices the largest box above {MAX_EXACT_MAGNITUDE}")
+
+
+def _ticks(sides: Mapping[str, Any], unit: str) -> Tuple[int, int, int]:
+    length, width, height = (Length.parse(sides[side], unit).ticks for side in _SIDES)
+    return (length, width, height)
+
+
+def _set_beside_a_bag(name: str, value: Any) -> bool:
+    """An empty obstacle list and a zero reserve change nothing, so only they are let through."""
+    if name == "obstacles":
+        return bool(value)
+    if name == "void_fill_reserve_ratio":
+        return value is not None and value > 0
+    return value is not None
 
 
 def _access_directions(raw: Any, where: str) -> None:
@@ -240,6 +319,18 @@ def _dimensions(raw: Any, where: str, unit: str) -> None:
     sides = _object(raw, where)
     for side in _SIDES:
         _measure(_required(sides, side, where), pointer_join(where, side), Length, unit)
+
+
+def _stacking_group_name(value: Any, field: str) -> None:
+    if not isinstance(value, str):
+        raise InvalidRequestError("wrong_type", field, "must be a string")
+    if value == "":
+        raise InvalidRequestError("invalid_value", field, "must not be empty")
+
+
+def _stacking_group_names(raw: Any, where: str) -> None:
+    for index, name in enumerate(_list(raw, where)):
+        _stacking_group_name(name, pointer_join(where, index))
 
 
 def _tag_limits(raw: Any, where: str) -> None:

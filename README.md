@@ -10,7 +10,7 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.5.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.6.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -52,6 +52,12 @@ echo '{"items":[{"id":"box","quantity":8,"dimensions":{"length":"50","width":"50
        "containers":[{"id":"carton","inner_dimensions":{"length":"100","width":"100","height":"100"}}]}' \
   | python -m packvium
 ```
+
+Support is not required by default: `minimum_support_ratio` is 0, so an item may rest on
+nothing above the container floor, and the result then says so in `warnings`
+(`unsupported_placements: N placement(s) rest on nothing above the container floor; ...`).
+To require support, set it above 0 — `PackingConfig.balanced(minimum_support_ratio=0.75)`,
+or `"configuration": {"minimum_support_ratio": 0.75}` in JSON.
 
 ## Units
 
@@ -287,7 +293,7 @@ CodeMeta form.
 @software{packvium_python,
   author  = {{Packvium contributors}},
   title   = {Packvium for Python},
-  version = {1.5.0},
+  version = {1.6.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

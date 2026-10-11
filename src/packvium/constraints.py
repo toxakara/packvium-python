@@ -7,7 +7,7 @@ from .axle_load import axle_load_exceeded
 from .contact import ContactEdge, ContactGraph
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
                        Point, Rotation, sweep_intersects, swept_volume)
-from .models import Container, ItemInstance, Placement
+from .models import Container, Item, ItemInstance, Placement
 from .support_polygon import contact_hull_points, convex_hull, doubled_centroid, point_in_hull
 from .compression import applied_pressure
 from .units import Length, Weight
@@ -111,7 +111,7 @@ def active_constraints(constraints: Sequence[PlacementConstraint], container: Co
             or (constraint_type is RouteOrderConstraint and not route_sensitive)
             or (constraint_type is StopAccessibilityConstraint
                 and (not route_sensitive
-                     or not (container.access_directions or constraint._default_directions)))
+                     or not constraint.directions_for(container)))
             or (constraint_type is AxleLoadConstraint and container.axles is None)
         )
         if not inert:
@@ -396,13 +396,38 @@ def non_stackable_failure(
     placements: Sequence[Placement], item: ItemInstance,
     graph: LoadSupportGraph, candidate_index: int,
 ) -> ConstraintResult | None:
-    """A direct-support edge may never originate at a non-stackable item."""
+    """The first direct-support edge at the candidate its lower item refuses, or None.
+
+    Supporters ascending, then children ascending. `non_stackable` is tested before the
+    stacking-group rule on every edge, so a scene invalid before keeps its code;
+    the group test rides this same walk, one set lookup per edge and no pass of its own.
+    """
+    upper_group = item.item.stacking_group
     for edge in graph.supporters(candidate_index):
-        supporter = placements[edge.index]
-        if not supporter.instance.item.stackable:
-            return ConstraintResult.reject("non_stackable", supporter.instance.item.id)
-    if not item.item.stackable and graph.children(candidate_index):
-        return ConstraintResult.reject("non_stackable", item.item.id)
+        lower = placements[edge.index].instance.item
+        code = stacking_refusal(lower, upper_group)
+        if code is not None:
+            return ConstraintResult.reject(code, lower.id)
+    lower = item.item
+    if lower.stackable and not lower.accepts_stacking_groups:
+        return None
+    for child in graph.children(candidate_index):
+        code = stacking_refusal(lower, placements[child].instance.item.stacking_group)
+        if code is not None:
+            return ConstraintResult.reject(code, lower.id)
+    return None
+
+
+def stacking_refusal(lower: Item, upper_group: str | None) -> str | None:
+    """Why `lower` refuses an item of `upper_group` resting directly on it, or None. O(1).
+
+    An empty list is unconstrained; a non-empty one is closed, so an item with no group is
+    in none of them (docs/STACKING-GROUPS.md section 2).
+    """
+    if not lower.stackable:
+        return "non_stackable"
+    if lower.accepts_stacking_groups and upper_group not in lower.accepts_stacking_groups:
+        return "stacking_group_incompatible"
     return None
 
 
@@ -903,12 +928,17 @@ class StopAccessibilityConstraint:
         self._stops = stops
         return self._clear, self._stops
 
+    def directions_for(self, container: Container) -> tuple[str, ...]:
+        """The container's own doors win; the configured tuple is what a container that
+        states none inherits. `or` rather than a None check because both sides are already
+        canonical tuples and "no doors" is the same answer either way. A flat bag has no
+        walls, so it inherits no doors either."""
+        if container.is_flat_bag: return ()
+        return container.access_directions or self._default_directions
+
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if not context.route_sensitive: return ConstraintResult.allow()
-        # The container's own doors win; the configured tuple is what a container that
-        # states none inherits. `or` rather than a None check because both sides are
-        # already canonical tuples and "no doors" is the same answer either way.
-        directions = context.container.access_directions or self._default_directions
+        directions = self.directions_for(context.container)
         if not directions: return ConstraintResult.allow()
 
         candidate_stop = context.item.item.stop_index

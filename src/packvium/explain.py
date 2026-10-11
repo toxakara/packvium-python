@@ -50,6 +50,9 @@ REASON_MESSAGES: dict[str, str] = {
         "was not placed because the exact search ended before proving a final answer",
     "container_inventory_exhausted":
         "requires another compatible container, but the declared inventory is exhausted",
+    "axle_overloaded":
+        "would overload an axle wherever it stood alone in any container that otherwise "
+        "admits it",
 }
 
 #: Prefixes an explanation with what kind of evidence backs it, from `ReasonProof.level`

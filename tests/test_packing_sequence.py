@@ -636,6 +636,21 @@ def test_a_loading_prefix_that_stacks_onto_a_non_stackable_item_is_caught():
     assert "non_stackable_item_has_load" in excinfo.value.reason
 
 
+def test_a_loading_prefix_that_breaks_the_stacking_group_rule_is_caught():
+    base = Item.create("base", Dimensions.mm(10, 10, 5), accepts_stacking_groups=["A"])
+    rider = Item.create("rider", Dimensions.mm(10, 10, 5), stacking_group="C")
+    container = Container.create("c", Dimensions.mm(10, 10, 20))
+    for order, step in (([0, 1], 1), ([1, 0], 1)):
+        placements = [stacked_placement(base, 0, 0, 0), stacked_placement(rider, 0, 0, 5)]
+        with pytest.raises(SequenceReplayError) as excinfo:
+            verify_loading_prefix_business_rules(placements, order, container)
+        assert excinfo.value.step == step
+        assert excinfo.value.reason == "stacking_group_incompatible: base"
+    accepted = Item.create("rider", Dimensions.mm(10, 10, 5), stacking_group="A")
+    verify_loading_prefix_business_rules(
+        [stacked_placement(base, 0, 0, 0), stacked_placement(accepted, 0, 0, 5)], [0, 1], container)
+
+
 def test_a_loading_prefix_that_violates_a_ground_contact_rule_is_caught():
     # "single" requires resting on exactly one supporter; two half-width bases side
     # by side under one full-width rider violate it.
@@ -831,3 +846,32 @@ def test_reachability_refuses_a_stop_list_of_the_wrong_length():
     container = Dimensions.mm(20, 10, 10)
     with pytest.raises(ValueError, match="one entry per placement"):
         placement_reachability([box(0, 0, 0, 10, 10, 10)], container, stops=[0, 1])
+
+
+def test_safe_removal_order_tie_breaks_by_lowest_index_among_unblocked():
+    container = Dimensions.mm(40, 20, 20)
+    b0 = box(0, 0, 0, 10, 10, 10)
+    b1 = box(10, 0, 0, 10, 10, 10)
+    b2 = box(20, 0, 0, 10, 10, 10)
+    # All can exit via +z freely. Lowest index must always be chosen first.
+    order = safe_removal_order([b0, b1, b2], container, directions=("+z",))
+    assert order == [0, 1, 2]
+
+
+def test_safe_route_removal_order_multiple_unblocked_at_same_stop():
+    container = Dimensions.mm(40, 20, 20)
+    b0 = box(0, 0, 0, 10, 10, 10)
+    b1 = box(10, 0, 0, 10, 10, 10)
+    b2 = box(20, 0, 0, 10, 10, 10)
+    order = safe_route_removal_order([b0, b1, b2], stops=[0, 0, 0], container=container, directions=("+z",))
+    assert order == [0, 1, 2]
+
+
+def test_safe_route_removal_order_deadlock_reports_all_stuck_boxes():
+    container = Dimensions.mm(20, 10, 10)
+    b0 = box(0, 0, 0, 10, 10, 10)
+    b1 = box(10, 0, 0, 10, 10, 10)
+    with pytest.raises(RouteSequenceError) as excinfo:
+        safe_route_removal_order([b0, b1], stops=[1, 0], container=container, directions=("-x",))
+    assert excinfo.value.stop == 0
+    assert 1 in excinfo.value.stuck
