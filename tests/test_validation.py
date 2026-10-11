@@ -456,6 +456,30 @@ def test_the_stacking_rule_is_checked_against_later_placements_too():
     assert "non_stackable" in issues_for([base, load], [box], [reversed_order])
 
 
+def _two_tier(base: Item, load: Item, load_first: bool = False) -> list[str]:
+    box = shelf()
+    base_instance, = base.instances()
+    load_instance, = load.instances()
+    placements = (place(base_instance), place(load_instance, z=50 * MM))
+    packed = PackedContainer(box, 1, placements[::-1] if load_first else placements)
+    return issues_for([base, load], [box], [packed])
+
+
+def test_an_item_on_one_that_does_not_accept_its_stacking_group_is_caught():
+    base = item("base", 100, 100, 50, stacking_group="A", accepts_stacking_groups=["A", "B"])
+    for load_first in (False, True):
+        issues = _two_tier(base, item("load", 100, 100, 50, stacking_group="C"), load_first)
+        assert "stacking_group_incompatible" in issues
+    assert _two_tier(base, item("load", 100, 100, 50, stacking_group="B")) == []
+
+
+def test_a_non_stackable_item_with_a_list_reports_only_non_stackable():
+    base = item("base", 100, 100, 50, stackable=False, accepts_stacking_groups=["B"])
+    issues = _two_tier(base, item("load", 100, 100, 50, stacking_group="C"))
+    assert "non_stackable" in issues
+    assert "stacking_group_incompatible" not in issues
+
+
 # --------------------------------------------------------- ground contact
 
 def test_a_ratio_that_would_pass_is_still_caught_by_the_corner_rule():

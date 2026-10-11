@@ -18,16 +18,11 @@ queries after insertions and forks, to guard that completeness invariant.
 
 from __future__ import annotations
 
-from itertools import chain
+from itertools import chain, product
 from typing import Iterable
 
 Bound = tuple[int, int, int, int, int, int]
 _QUERY_CACHE_LIMIT = 1024
-# Every live search state keeps the dictionary it was born with, so what an insertion
-# carries over multiplies by the beam. Carrying 128 kept the measured quality
-# tracemalloc peak near 1.4.0 while preserving most of the reuse; carrying 1024
-# raised that peak by 22–27%.
-_RETAINED_ANSWERS_LIMIT = 128
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -44,7 +39,7 @@ class SpatialIndex:
     of placements spreads them across many buckets instead of one.
     """
 
-    __slots__ = ("cell_x", "cell_y", "cell_z", "cells", "_answers")
+    __slots__ = ("cell_x", "cell_y", "cell_z", "cells", "_answers", "_inherited", "_changed")
 
     def __init__(self, length_ticks: int, width_ticks: int, height_ticks: int, cells_per_axis: int = 8):
         self.cell_x = max(1, _ceil_div(max(1, length_ticks), cells_per_axis))
@@ -60,6 +55,13 @@ class SpatialIndex:
         # contents. Disjoint insertions preserve answers; overlapping insertions and
         # the retention ceiling cause lazy recomputation.
         self._answers: dict[tuple[int, int, int, int, int, int], tuple[int, ...]] = {}
+        # The answers valid just before the latest insertion, and the cell range that
+        # insertion changed. An answer for a range disjoint from it is still exact, and
+        # is adopted into `_answers` the first time it is asked for. Inheriting by
+        # reference costs an insertion nothing, so a search branch that is discarded
+        # without being queried never pays for a copy (see `add`).
+        self._inherited: dict[tuple[int, int, int, int, int, int], tuple[int, ...]] | None = None
+        self._changed: tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
 
     def copy(self) -> "SpatialIndex":
         """A structural fork: independent of the original from this point on.
@@ -76,6 +78,7 @@ class SpatialIndex:
         # Same contents, same answers. Safe to share: an insert on either side replaces
         # the dict on that side rather than mutating it, so the other keeps a valid one.
         clone._answers = self._answers
+        clone._inherited, clone._changed = self._inherited, self._changed
         return clone
 
     def _cell_range(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int):
@@ -93,15 +96,16 @@ class SpatialIndex:
                 for iz in range(iz1, iz2):
                     key = (ix, iy, iz)
                     cells[key] = cells.get(key, ()) + (index,)
-        # Forks share immutable answers. Replace this branch's cache, retaining only
-        # ranges disjoint from the cells changed by this insertion, the oldest first.
-        retained: dict[tuple[int, int, int, int, int, int], tuple[int, ...]] = {}
-        for key, answer in self._answers.items():
-            if (key[1] <= ix1 or ix2 <= key[0] or key[3] <= iy1 or iy2 <= key[2]
-                    or key[5] <= iz1 or iz2 <= key[4]):
-                retained[key] = answer
-                if len(retained) >= _RETAINED_ANSWERS_LIMIT: break
-        self._answers = retained
+        # Forks share immutable answers, so this branch starts a cache of its own and
+        # keeps the old one, as it stood for the contents before this insertion, to
+        # inherit from. Only one generation is kept: the old dictionary links to nothing,
+        # so live states hold at most their own cache and their parent's, and siblings
+        # share that parent's. Copying the disjoint answers here instead made every
+        # child pay for answers most children never ask for, and every live state carry
+        # its own copy -- which is why that copy had to stop at 128 answers.
+        self._inherited = self._answers
+        self._changed = (ix1, ix2, iy1, iy2, iz1, iz2)
+        self._answers = {}
 
     def query(self, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> tuple[int, ...]:
         """Bound indices sharing at least one cell with the given box, each at most once.
@@ -112,29 +116,35 @@ class SpatialIndex:
         candidate scan. Buckets and cached answers can be shared safely across forks.
         """
         cell_x, cell_y, cell_z = self.cell_x, self.cell_y, self.cell_z
-        ix1, ix2 = x1 // cell_x, -(-max(x2, x1 + 1) // cell_x)
-        iy1, iy2 = y1 // cell_y, -(-max(y2, y1 + 1) // cell_y)
-        iz1, iz2 = z1 // cell_z, -(-max(z2, z1 + 1) // cell_z)
+        # Conditional expressions rather than `max()`: three builtin calls per query were
+        # 4% of a profiled `quality` solve.
+        ix1, ix2 = x1 // cell_x, -(-(x2 if x2 > x1 else x1 + 1) // cell_x)
+        iy1, iy2 = y1 // cell_y, -(-(y2 if y2 > y1 else y1 + 1) // cell_y)
+        iz1, iz2 = z1 // cell_z, -(-(z2 if z2 > z1 else z1 + 1) // cell_z)
         if ix1 + 1 == ix2 and iy1 + 1 == iy2 and iz1 + 1 == iz2:
             return self.cells.get((ix1, iy1, iz1), ())
         cell_range = (ix1, ix2, iy1, iy2, iz1, iz2)
         answers = self._answers
         answer = answers.get(cell_range)
         if answer is not None: return answer
+        inherited = self._inherited
+        if inherited is not None and (answer := inherited.get(cell_range)) is not None:
+            cx1, cx2, cy1, cy2, cz1, cz2 = self._changed
+            if not (ix2 <= cx1 or cx2 <= ix1 or iy2 <= cy1 or cy2 <= iy1 or iz2 <= cz1 or cz2 <= iz1):
+                answer = None
+        if answer is None:
+            answer = self._collect(ix1, ix2, iy1, iy2, iz1, iz2)
         if len(answers) >= _QUERY_CACHE_LIMIT:
             # Detach rather than clear: another search branch may share this cache.
             self._answers = answers = {}
-        answers[cell_range] = answer = self._collect(ix1, ix2, iy1, iy2, iz1, iz2)
+        answers[cell_range] = answer
         return answer
 
     def _collect(self, ix1: int, ix2: int, iy1: int, iy2: int, iz1: int, iz2: int) -> tuple[int, ...]:
-        cells = self.cells
-        hits: list[tuple[int, ...]] = []
-        for ix in range(ix1, ix2):
-            for iy in range(iy1, iy2):
-                for iz in range(iz1, iz2):
-                    bucket = cells.get((ix, iy, iz))
-                    if bucket: hits.append(bucket)
+        # `product` yields the cells in the same (x, y, z) order as three nested loops,
+        # without an interpreted loop body per cell.
+        hits = [bucket for bucket in map(self.cells.get, product(range(ix1, ix2), range(iy1, iy2), range(iz1, iz2)))
+                if bucket]
         if not hits: return ()
         if len(hits) == 1: return hits[0]
         return tuple(dict.fromkeys(chain.from_iterable(hits)))

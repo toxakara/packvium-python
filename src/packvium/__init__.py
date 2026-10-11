@@ -15,6 +15,7 @@ from .fixed_placements import FixedPlacementError
 from .request_errors import InvalidRequestError
 from .models import (Axle, Container, FixedPlacement, Item, ItemInstance, Obstacle, PackedContainer,
                      PackingRequest, Placement, ReasonProof, RejectionObservation, UnpackedItem)
+from .made_to_measure import MadeToMeasure
 from .nested import NestedPacker, NestedPackingResult, PackingLevel
 from .packer import Packer
 from .packing_sequence import (
@@ -59,7 +60,7 @@ __all__ = [
     "EffortBudget", "ExtensionRegistry", "FixedPlacement", "FixedPlacementError", "InvalidRequestError",
     "PolicyError", "UnknownObjectiveError", "UnknownSolverError", "UnsupportedFeatureError",
     "IndependentSolutionValidator", "InvalidDirectionError", "Item", "ItemInstance", "LEVEL_PREFIXES", "Length",
-    "LoadingDependencyGraph", "NestedPacker",
+    "LoadingDependencyGraph", "MadeToMeasure", "NestedPacker",
     "NestedPackingResult", "Obstacle", "PackedContainer", "Packer", "PackingConfig",
     "PackingLevel", "PackingRequest", "PackingResult", "PackingStatus", "Placement", "Point",
     "REASON_MESSAGES", "Reachability", "ReasonProof", "RebalanceResult", "RejectionObservation", "ResultFact", "Rotation",

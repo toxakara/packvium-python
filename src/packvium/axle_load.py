@@ -126,3 +126,34 @@ def axle_balanced_origins(
         doubled_centre = allowed // item_weight_ticks  # floor: never overstate what rear allows
         origins.append((doubled_centre - item_length_ticks) // 2)  # floor: stay on the safe side
     return origins
+
+
+def axle_admits_alone(
+    axles: tuple["Axle", "Axle"],
+    tare_weight_ticks: int,
+    inner_length_ticks: int,
+    item_weight_ticks: int,
+    envelope_length_ticks: int,
+) -> bool:
+    """Whether one item, alone in an empty container, has an x-origin that overloads
+    neither axle.
+
+    Each limit is linear in the item's doubled centre, so the feasible origins form one
+    interval: `axle_balanced_origins` with no other units gives its two ends exactly.
+    O(1), integers only. This is a statement about an empty container, not a proof: a
+    counterweight behind the rear axle can relieve the front one, which is why the
+    reason it backs is `inferred`.
+    """
+    last_origin = inner_length_ticks - envelope_length_ticks
+    if last_origin < 0:
+        return False
+    if item_weight_ticks <= 0:
+        return axle_load_exceeded(axles, (), tare_weight_ticks, inner_length_ticks) is None
+    front, rear = axles
+    origins = axle_balanced_origins(
+        axles, (), tare_weight_ticks, inner_length_ticks,
+        item_weight_ticks, envelope_length_ticks,
+    )
+    lowest = origins[0] if front.max_load is not None else 0
+    highest = origins[-1] if rear.max_load is not None else last_origin
+    return max(0, lowest) <= min(last_origin, highest)

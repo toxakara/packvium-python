@@ -4,6 +4,46 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0]
+
+Boxes cut to measure, flat bags, stacking groups and a volume-first objective. A request that
+uses none of them keeps its meaning; `fast` and `balanced` may now answer better.
+
+### Added
+
+- **`packvium.MadeToMeasure` and `Container(made_to_measure=...)`.** A container becomes an
+  on-demand box machine (largest box, `minimum`, `increment`, board price and weight per m²);
+  each packed box is the load's extent rounded up onto the machine grid and priced as cut.
+  `PackedContainer.achieved_dimensions` reports the extent.
+- **Flat bags: `Container(deformable_boundary="flat_bag")`.** A poly mailer admits a load when
+  length plus thickness and width plus thickness fit; dimensional weight is billed from the
+  load's size.
+- **Stacking groups: `Item(stacking_group=..., accepts_stacking_groups=...)`.** Which item
+  classes may rest directly on which.
+- **`objective="maximum_volume"`**, which ranks the volume left behind ahead of the piece count.
+- **A warning for items resting on nothing** when `minimum_support_ratio` is 0
+  (`unsupported_placements: N ...` in `result.warnings`). No answer changes.
+
+### Changed
+
+- **An unpacked item names the limit that left it out, the same in every engine.**
+  Where the search used to fall back to `no_feasible_placement` or `search_exhausted`, an item a
+  fresh container would take but none is left reports `container_inventory_exhausted`, and one
+  that overloads an axle wherever it stands alone reports `axle_overloaded`; both are
+  `inferred`. Code that matched the old reason for these cases must match the new one.
+- **`quality` orders its beam by a `convex_hull` item's own solid**, not its box, so
+  it no longer assumes a second wedge cannot fit when it can.
+- **The container plan counts a `convex_hull` item by its own solid too**, so
+  `quality` no longer ranks a plan as if wedges that share a container each needed their own.
+- **`fast` and `balanced` add the block solver as one more start** on multi-type loads and keep
+  its answer only when strictly better.
+
+### Fixed
+
+- **`quality`'s beam refinement searches wide again** after a late-type ordering wins; it ran
+  greedily since 0.1.0.
+- **The exact solver ranks volume first under `maximum_volume`.**
+
 ## [1.5.0]
 
 Refusals you can name by type, and the replay promise of a result without building an

@@ -27,7 +27,8 @@ def test_every_reason_this_library_can_produce_has_a_registered_message():
     produced = {
         "no_compatible_container_dimensions", "rotation_restricted", "payload_exceeded",
         "no_eligible_container", "time_limit", "effort_limit", "group_cannot_fit_together",
-        "insufficient_support", "no_feasible_placement",
+        "insufficient_support", "no_feasible_placement", "container_inventory_exhausted",
+        "axle_overloaded",
     }
     assert produced <= REASON_MESSAGES.keys()
 

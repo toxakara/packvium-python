@@ -25,7 +25,7 @@ from packvium.constraints import (SQUARE_METRE_TICKS, SUPPORT_SCALE, AxleLoadCon
                                      route_order_violated, scaled_ratio,
                                      stack_density_exceeded, stack_limit_exceeded, stacked_counts, top_loads)
 from packvium.contact import ContactGraph
-from packvium.models import Placement
+from packvium.models import Placement, is_stack_sensitive
 
 BOX = Container.create("box", Dimensions.mm(100, 100, 100))
 
@@ -1167,6 +1167,111 @@ def test_the_bearing_check_is_skipped_when_nothing_can_refuse_a_load():
     assert TopLoadConstraint().evaluate(
         context(instance_of("c"), z=160_000, placements=(base,), stack_sensitive=False)
     ).allowed
+
+
+# ----------------------------------------------------- stacking groups
+
+TOP = 160_000  # 10 mm: the top face of a 10 mm item on the floor
+
+
+def stacking_verdict(lower, upper):
+    return TopLoadConstraint().evaluate(context(upper, z=TOP, placements=(placed(lower),)))
+
+
+def test_an_item_whose_group_the_lower_item_accepts_may_rest_on_it():
+    lower = instance_of("a", stacking_group="A", accepts_stacking_groups=["A", "B"])
+    assert stacking_verdict(lower, instance_of("b", stacking_group="B")).allowed
+
+
+def test_an_item_whose_group_the_lower_item_omits_is_refused():
+    lower = instance_of("a", stacking_group="A", accepts_stacking_groups=["A", "B"])
+    result = stacking_verdict(lower, instance_of("c", stacking_group="C"))
+    assert not result.allowed
+    assert (result.code, result.detail) == ("stacking_group_incompatible", "a")
+
+
+@pytest.mark.parametrize("accepts", [None, (), frozenset()])
+def test_an_empty_or_absent_list_is_unconstrained(accepts):
+    kwargs = {} if accepts is None else {"accepts_stacking_groups": accepts}
+    lower = instance_of("a", stacking_group="A", **kwargs)
+    assert stacking_verdict(lower, instance_of("c", stacking_group="C")).allowed
+    assert stacking_verdict(lower, instance_of("none")).allowed
+
+
+def test_an_item_with_no_group_may_not_rest_on_a_constrained_one():
+    lower = instance_of("a", accepts_stacking_groups=["A"])
+    assert stacking_verdict(lower, instance_of("unclassified")).code == "stacking_group_incompatible"
+
+
+def test_an_item_need_not_accept_its_own_group():
+    lower = instance_of("a", stacking_group="A", accepts_stacking_groups=["B"])
+    assert stacking_verdict(lower, instance_of("a2", stacking_group="A")).code == "stacking_group_incompatible"
+    assert stacking_verdict(lower, instance_of("b", stacking_group="B")).allowed
+
+
+def test_group_names_compare_as_exact_strings():
+    lower = instance_of("a", accepts_stacking_groups=["B"])
+    assert stacking_verdict(lower, instance_of("b", stacking_group="b")).code == "stacking_group_incompatible"
+    assert stacking_verdict(lower, instance_of("b", stacking_group=" B")).code == "stacking_group_incompatible"
+
+
+def test_every_supporter_of_a_bridging_item_must_accept_it():
+    left = placed(instance_of("left", 50, 100, 10, accepts_stacking_groups=["A"]))
+    right = placed(instance_of("right", 50, 100, 10), x=800_000)
+    bridge = instance_of("bridge", 100, 100, 10, stacking_group="B")
+    result = TopLoadConstraint().evaluate(context(bridge, z=TOP, placements=(left, right)))
+    assert (result.code, result.detail) == ("stacking_group_incompatible", "left")
+    allowed = instance_of("bridge", 100, 100, 10, stacking_group="A")
+    assert TopLoadConstraint().evaluate(context(allowed, z=TOP, placements=(left, right))).allowed
+
+
+def test_the_first_refusing_supporter_in_placement_order_is_named():
+    left = placed(instance_of("left", 50, 100, 10, accepts_stacking_groups=["A"]))
+    right = placed(instance_of("right", 50, 100, 10, accepts_stacking_groups=["A"]), x=800_000)
+    bridge = instance_of("bridge", 100, 100, 10, stacking_group="B")
+    result = TopLoadConstraint().evaluate(context(bridge, z=TOP, placements=(right, left)))
+    assert result.detail == "right"
+
+
+def test_the_rule_is_direct_not_transitive():
+    a = placed(instance_of("a", accepts_stacking_groups=["B"]))
+    b = placed(instance_of("b", stacking_group="B"), z=TOP)
+    c = instance_of("c", stacking_group="C")
+    assert TopLoadConstraint().evaluate(context(c, z=2 * TOP, placements=(a, b))).allowed
+
+
+def test_a_candidate_slid_under_an_existing_item_is_judged_by_its_own_list():
+    above = placed(instance_of("above", stacking_group="C"), z=TOP)
+    refusing = instance_of("under", accepts_stacking_groups=["A"])
+    result = TopLoadConstraint().evaluate(context(refusing, z=0, placements=(above,)))
+    assert (result.code, result.detail) == ("stacking_group_incompatible", "under")
+    accepting = instance_of("under", accepts_stacking_groups=["C"])
+    assert TopLoadConstraint().evaluate(context(accepting, z=0, placements=(above,))).allowed
+
+
+def test_non_stackable_dominates_a_list_that_names_the_upper_group():
+    lower = instance_of("a", stackable=False, accepts_stacking_groups=["B"])
+    assert stacking_verdict(lower, instance_of("b", stacking_group="B")).code == "non_stackable"
+
+
+def test_a_non_stackable_item_may_itself_rest_on_an_item_that_accepts_its_group():
+    lower = instance_of("a", accepts_stacking_groups=["B"])
+    assert stacking_verdict(lower, instance_of("b", stacking_group="B", stackable=False)).allowed
+
+
+def test_a_nested_column_is_refused_when_the_list_omits_the_items_own_group():
+    crate = Item.create("crate", Dimensions.mm(100, 100, 50), quantity=2,
+                        nesting_height=Length.mm(25), stacking_group="A", accepts_stacking_groups=["B"])
+    lower, upper = crate.instances()
+    result = TopLoadConstraint().evaluate(
+        context(upper, z=Length.mm(25).ticks, placements=(placed(lower),)))
+    assert result.code == "stacking_group_incompatible"
+
+
+def test_only_a_non_empty_list_makes_an_item_stack_sensitive():
+    assert is_stack_sensitive(instance_of("a", accepts_stacking_groups=["A"]).item)
+    assert not is_stack_sensitive(instance_of("a", stacking_group="A").item)
+    assert not is_stack_sensitive(instance_of("a", accepts_stacking_groups=[]).item)
 
 
 # ------------------------------------------------------------- axle load

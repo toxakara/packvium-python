@@ -15,6 +15,7 @@ import pytest
 
 from packvium import (AxisAlignedBox, Container, Dimensions, EffortBudget, Item, Length,
                          Obstacle, PackedContainer, PackingConfig, Placement, Point, Rotation)
+from packvium.extensions import DefaultSolutionScorer
 from packvium.geometry import ShapeType
 from packvium.nesting import used_volume as nesting_used_volume
 from packvium.solvers import (MAX_MAXIMAL_SPACES, MINIMUM_SLICE_NS, ContainerState, Deadline,
@@ -236,7 +237,7 @@ def test_a_lattice_solver_runs_once_rather_than_once_per_ordering():
     assert len(layer_starts) == 1
 
 
-def test_the_portfolio_drops_from_sixteen_starts_to_nine_on_a_three_type_order():
+def test_the_portfolio_drops_from_sixteen_starts_to_nine_and_adds_one_block_start():
     """The acceptance criterion, made executable rather than only claimed in prose.
 
     Three item types, each diverse enough on a different axis (volume, base area,
@@ -246,7 +247,8 @@ def test_the_portfolio_drops_from_sixteen_starts_to_nine_on_a_three_type_order()
     random shuffles distinct from those four and from each other -- so the naive
     portfolio genuinely is `extreme_points` and `layer`, 8 orders each, 16 starts, not
     something that happens to collapse below that on its own. Declaring `LayerSolver`
-    order-insensitive collapses its eight down to one, leaving 8 + 1 = 9.
+    order-insensitive collapses its eight down to one, leaving 8 + 1 = 9. The block start
+    `balanced` adds where the lattice can express the request is the tenth, and the last.
     """
     tall_thin = instances("tall_thin", 10, 50, 2, quantity=2, weight=300,
                           allowed_rotations=(Rotation.LWH,))
@@ -263,9 +265,10 @@ def test_the_portfolio_drops_from_sixteen_starts_to_nine_on_a_three_type_order()
 
     run = SolverOrchestrator().solve(items, containers, config, generous())
 
-    assert len(run.starts) == 9
+    assert len(run.starts) == 10
     starts_by_solver = Counter(start.id.split(":", 1)[0] for start in run.starts)
-    assert starts_by_solver == {"extreme_points": 8, "layer": 1}
+    assert starts_by_solver == {"extreme_points": 8, "layer": 1, "homogeneous_blocks": 1}
+    assert run.starts[-1].id.startswith("homogeneous_blocks:")
 
 
 def test_a_layer_solver_produces_the_identical_packing_regardless_of_the_order_it_is_handed():
@@ -771,6 +774,117 @@ def test_bounded_candidates_preserve_full_sort_ties_work_and_trace(width, cleara
     assert rule.calls == full_calls
 
 
+def populated_state(config):
+    """A container with boxes at several heights, so candidates collide and rise."""
+    state = ContainerState(Container.create("c", Dimensions.mm(100, 80, 90)), 1)
+    for item in (*instances("a", 40, 30, 20, quantity=3), *instances("b", 25, 25, 35, quantity=3)):
+        extend(state, item, config)
+    return state
+
+
+@pytest.mark.parametrize("width", [1, 3, None])
+def test_selection_counts_and_answers_as_the_full_sorted_scan_does(width):
+    from packvium.constraints import SupportConstraint
+
+    class EvaluatedSupport(SupportConstraint):
+        """Not the exact built-in type, so the chain is evaluated rather than counted."""
+
+    config, constraints = config_and_constraints()
+    state = populated_state(config)
+    item, = instances("x", 30, 20, 10)
+    evaluated = tuple(EvaluatedSupport(rule.global_minimum) if type(rule) is SupportConstraint
+                      else rule for rule in constraints)
+    every_stats, stats, evaluated_stats = SearchStats(), SearchStats(), SearchStats()
+    every = find_candidates(state, item, config, evaluated, every_stats, generous(), None)
+    selected = find_candidates(state, item, config, constraints, stats, generous(), width)
+    reference = find_candidates(state, item, config, evaluated, evaluated_stats, generous(), width)
+    assert len({candidate.point.z for candidate in every}) > 1
+    assert stats.collision_checks > 0 and stats.support_checks > 0
+    assert selected == reference == (every if width is None else every[:width])
+    assert stats == evaluated_stats == every_stats
+    assert (stats.placements_attempted, stats.collision_checks) == pair_by_pair_counts(state, item)
+
+
+def pair_by_pair_counts(state, item):
+    """Attempts and collision checks counted one (point, rotation) pair at a time."""
+    inner = state.container.inner_dimensions
+    attempts = checks = 0
+    for point in state.ordered_points:
+        for _, dims in item.dimensions.unique_rotations(item.item.allowed_rotations):
+            attempts += 1
+            x2, y2, z2 = point.x + dims.length.ticks, point.y + dims.width.ticks, point.z + dims.height.ticks
+            if x2 > inner.length.ticks or y2 > inner.width.ticks or z2 > inner.height.ticks:
+                continue
+            for index in state.index.query(point.x, point.y, point.z, x2, y2, z2):
+                checks += 1
+                bx1, by1, bz1, bx2, by2, bz2 = state.bounds[index]
+                if point.x < bx2 and bx1 < x2 and point.y < by2 and by1 < y2 and point.z < bz2 and bz1 < z2:
+                    break
+    return attempts, checks
+
+
+def test_a_stop_mid_scan_leaves_every_counter_where_the_scanned_points_put_it():
+    config, constraints = config_and_constraints()
+    state = populated_state(config)
+    item, = instances("x", 30, 20, 10)
+    full = SearchStats()
+    find_candidates(state, item, config, constraints, full, generous(), 1)
+    stops = 0
+    for limit in range(1, full.placements_attempted + 1):
+        stats = SearchStats()
+        deadline = generous().with_effort(EffortBudget(max_placement_attempts=limit), stats)
+        try:
+            find_candidates(state, item, config, constraints, stats, deadline, 1)
+        except TimeLimitReached:
+            stops += 1
+        scanned = state.ordered_points[:stats.candidate_points_considered]
+        reference = SearchStats()
+        find_candidates(state, item, config, constraints, reference, generous(), 1, points=scanned)
+        assert stats == reference
+    assert stops > 1
+
+
+def _hull_wedge(id, quantity):
+    side = Length.mm(30).ticks
+    return Item.create(id, Dimensions.mm(30, 30, 30), shape_type=ShapeType.CONVEX_HULL, quantity=quantity,
+                       hull_vertices=((0, 0, 0), (side, 0, 0), (0, side, 0),
+                                      (0, 0, side), (side, 0, side), (0, side, side))).instances()
+
+
+@pytest.mark.parametrize("order, inner", [
+    (lambda: (*instances("a", 40, 30, 20, quantity=3, weight="2kg"), *instances("b", 25, 25, 35, quantity=3)),
+     (100, 80, 90)),
+    (lambda: instances("crate", 30, 30, 30, quantity=5, nesting_height=Length.mm(10)), (60, 30, 90)),
+    (lambda: _hull_wedge("wedge", 5), (60, 60, 60)),
+    # One column, so each sponge loads the ones below it and the volume is recomputed.
+    (lambda: instances("sponge", 30, 30, 30, quantity=4, shape_type=ShapeType.COMPRESSIBLE,
+                       compression_ratio_ppm=200_000, max_compression_pressure_kpa=50, weight="1kg"),
+     (30, 30, 120)),
+])
+def test_a_beam_child_is_ranked_as_the_state_it_would_build(order, inner):
+    from packvium.solvers import _BeamChild, _extended, _placement_signature
+
+    config, constraints = config_and_constraints()
+    *placed, last = order()
+    parent = ContainerState(Container.create("c", Dimensions.mm(*inner), max_payload="40kg"), 1)
+    signature = _placement_signature(parent)
+    checked = 0
+    for item in (*placed, last):
+        for candidate in find_candidates(parent, item, config, constraints, SearchStats(), generous(), None):
+            built = _extended(parent, item, candidate)
+            described = _BeamChild.pending(parent, signature, item, candidate)
+            expected = _BeamChild.built(built, _placement_signature(built))
+            assert (described.container, described.used_volume_ticks, described.payload_ticks,
+                    described.max_z, described.placed, described.signature) == \
+                (expected.container, expected.used_volume_ticks, expected.payload_ticks,
+                 expected.max_z, expected.placed, expected.signature)
+            assert described.materialized().placements == built.placements
+            checked += 1
+        parent = extend(parent, item, config)
+        signature = _placement_signature(parent)
+    assert checked > len(placed)
+
+
 def test_an_item_that_cannot_fit_yields_no_candidate():
     config, constraints = config_and_constraints()
     state = ContainerState(Container.create("c", Dimensions.mm(10, 10, 10)), 1)
@@ -923,6 +1037,31 @@ def test_the_lattice_keeps_non_stackable_items_on_the_floor():
 
     assert all(p.envelope_origin.z == 0 for p in solution.state.placements)
     assert_physically_sound(solution.state)
+
+
+def test_the_lattice_keeps_an_item_that_refuses_its_own_group_on_the_floor():
+    """Every lattice edge joins two items of one type, so a type whose list omits its own
+    group caps the lattice at one layer; blinding the list restores the column."""
+    box = Container.create("c", Dimensions.mm(100, 100, 100))
+    refusing = instances("a", 40, 40, 40, quantity=8, stacking_group="A", accepts_stacking_groups=["B"])
+    solution = GridSolver().pack_one(box, 1, refusing, PackingConfig.fast(), SearchStats(), generous())
+    assert all(p.envelope_origin.z == 0 for p in solution.state.placements)
+    assert_physically_sound(solution.state)
+
+    accepting = instances("a", 40, 40, 40, quantity=8, stacking_group="A", accepts_stacking_groups=["A"])
+    stacked = GridSolver().pack_one(box, 1, accepting, PackingConfig.fast(), SearchStats(), generous())
+    assert any(p.envelope_origin.z > 0 for p in stacked.state.placements)
+
+
+def test_two_types_share_a_lattice_only_if_they_share_the_stacking_rule():
+    first = instances("first", 40, 40, 40, stacking_group="A")
+    alias = instances("alias", 40, 40, 40, stacking_group="A")
+    other_group = instances("second", 40, 40, 40, stacking_group="B")
+    listed = instances("third", 40, 40, 40, stacking_group="A", accepts_stacking_groups=["A"])
+    solver = GridSolver()
+    assert solver.supports([*first, *alias])
+    assert not solver.supports([*first, *other_group])
+    assert not solver.supports([*first, *listed])
 
 
 def test_the_lattice_caps_its_layers_by_max_stacked_items():
@@ -1232,6 +1371,17 @@ def test_exact_equal_count_bound_keeps_a_larger_remaining_item_reachable():
     assert [item.item.id for item in solution.unpacked] == ["small"]
 
 
+@pytest.mark.parametrize(("objective", "kept"), [("default", ["small", "small"]), ("maximum_volume", ["large"])])
+def test_the_exact_solver_ranks_volume_first_when_the_objective_does(objective, kept):
+    box = Container.create("c", Dimensions.mm(10, 10, 10))
+    items = (*instances("small", 3, 10, 10, quantity=2), *instances("large", 8, 10, 10))
+
+    solution = ExactSmallSolver().pack_one(
+        box, 1, items, PackingConfig.exact_small(objective=objective), SearchStats(), generous())
+
+    assert sorted(placement.instance.item.id for placement in solution.state.placements) == kept
+
+
 def test_the_exact_solver_refuses_an_order_beyond_its_limit():
     box = Container.create("c", Dimensions.mm(1_000, 1_000, 1_000))
     items = instances("a", 10, 10, 10, quantity=9)
@@ -1393,6 +1543,20 @@ def test_block_search_falls_back_when_a_business_rule_can_distinguish_placements
     assert_physically_sound(solution.state)
 
 
+def test_block_search_delegates_when_an_item_declares_a_stacking_group_list():
+    box = Container.create("box", Dimensions.mm(100, 100, 200), quantity=1)
+    order = (*instances("a", 100, 100, 100, accepts_stacking_groups=["A"]),
+             *instances("b", 100, 100, 100, stacking_group="B"))
+    solver = HomogeneousBlockSolver()
+    assert not solver._supports(box, order, PackingConfig.quality())
+    grouped_only = (*instances("a", 100, 100, 100, stacking_group="A"),
+                    *instances("b", 100, 100, 100, stacking_group="B"))
+    assert solver._supports(box, grouped_only, PackingConfig.quality())
+    solution = solver.pack_one(box, 1, order, PackingConfig.quality(), SearchStats(), generous())
+    assert len(solution.state.placements) == 1
+    assert_physically_sound(solution.state)
+
+
 def test_block_search_falls_back_for_compressible_items():
     box = Container.create("box", Dimensions.mm(100, 100, 200), quantity=1)
     compressible_item = Item.create(
@@ -1411,3 +1575,104 @@ def test_block_search_falls_back_for_compressible_items():
     )
     assert len(solution.state.placements) == 2
     assert_physically_sound(solution.state)
+
+
+# ------------------------------------------- the block start of `fast` and `balanced`
+
+def _four_similar_cartons():
+    return (*instances("b1", 350, 250, 140), *instances("b2", 350, 250, 140),
+            *instances("b3", 350, 230, 130), *instances("b4", 350, 250, 140))
+
+
+def _start_solvers(items, containers, config):
+    run = SolverOrchestrator().solve(items, containers, config, generous())
+    return [start.id.split(":", 1)[0] for start in run.starts], run
+
+
+@pytest.mark.parametrize("config", [PackingConfig.fast(), PackingConfig.balanced()])
+def test_fast_and_balanced_end_with_a_block_start_where_the_lattice_can_express_the_request(config):
+    containers = (Container.create("box", Dimensions.mm(600, 400, 250)),)
+    solvers, _ = _start_solvers(_four_similar_cartons(), containers, config)
+    assert solvers[-1] == "homogeneous_blocks"
+    assert solvers.count("homogeneous_blocks") == 1
+
+
+def test_the_block_start_wins_only_by_a_strictly_better_score():
+    # The per-item search needs a second box for these four cartons; the lattice does not.
+    containers = (Container.create("box", Dimensions.mm(600, 400, 250)),)
+    _, improved = _start_solvers(_four_similar_cartons(), containers, PackingConfig.balanced())
+    assert min(len(solution.containers) for solution in improved) == 1
+    assert [s.solver_name for s in improved if len(s.containers) == 1] == ["homogeneous_blocks:volume"]
+
+    # Two cubes that any start stacks into one box: the lattice ties, so its answer is dropped.
+    cubes = (*instances("light", 100, 100, 100, weight=1), *instances("heavy", 100, 100, 100, weight=3))
+    tower = (Container.create("box", Dimensions.mm(100, 100, 200)),)
+    solvers, tied = _start_solvers(cubes, tower, PackingConfig.fast())
+    assert solvers[-1] == "homogeneous_blocks"
+    assert not any(s.solver_name.startswith("homogeneous_blocks") for s in tied)
+
+
+def test_the_block_start_stays_out_where_the_lattice_cannot_honour_the_request():
+    box = (Container.create("box", Dimensions.mm(600, 400, 250)),)
+    cartons = _four_similar_cartons()
+    one_type = instances("only", 100, 100, 100, quantity=4)
+    prioritised = (*instances("first", 350, 250, 140, priority=5), *instances("rest", 350, 230, 130, quantity=3))
+    floor_only = (*instances("floor", 350, 250, 140, must_be_on_floor=True), *instances("free", 350, 230, 130))
+    for items, config in (
+        (cartons, PackingConfig.quality()),
+        (cartons, PackingConfig.balanced(solvers=("extreme_points",))),
+        (one_type, PackingConfig.balanced()),
+        (prioritised, PackingConfig.balanced()),
+        (floor_only, PackingConfig.balanced()),
+    ):
+        starts = SolverOrchestrator()._starts(items, config, box)
+        added = [solver for solver, _, _ in starts if getattr(solver, "node_limit", None) is not None]
+        assert added == []
+
+
+def test_the_fast_block_start_enumerates_one_mode_and_balanced_both():
+    box = (Container.create("box", Dimensions.mm(600, 400, 250)),)
+    cartons = _four_similar_cartons()
+    orchestrator = SolverOrchestrator()
+    assert orchestrator._block_start(cartons, PackingConfig.fast(), box).modes == ("count",)
+    assert orchestrator._block_start(cartons, PackingConfig.fast(objective="maximum_volume"), box).modes == ("volume",)
+    assert orchestrator._block_start(cartons, PackingConfig.balanced(), box).modes == ("count", "volume")
+
+
+@pytest.mark.parametrize(("order_name", "greedy"), [
+    ("volume:greedy", True),
+    ("volume:greedy:late_box", True),
+    ("volume:greedy:beam", False),
+    ("volume:greedy:late_box:beam", False),
+    ("volume", False),
+])
+def test_only_greedy_orderings_and_their_neighbourhoods_keep_one_candidate(order_name, greedy):
+    from packvium.solvers import _runs_greedy
+    assert _runs_greedy(order_name) is greedy
+
+
+def test_the_refinement_of_a_late_type_winner_searches_at_the_narrowed_width():
+    from packvium.solvers import LATE_TYPE_REFINEMENT_WIDTH, _start_config
+    config = PackingConfig.quality()
+    narrowed = _start_config("volume:greedy:late_box:beam", config)
+    assert LATE_TYPE_REFINEMENT_WIDTH == 4
+    assert (narrowed.container_plan_beam_width, narrowed.max_candidates_per_item) == (4, 4)
+    assert narrowed.container_plan_node_limit == config.container_plan_node_limit
+
+
+def test_other_refinements_keep_the_profile_width_and_greedy_starts_keep_one_candidate():
+    from packvium.solvers import _start_config
+    config = PackingConfig.quality()
+    assert _start_config("volume:greedy:beam", config) is config
+    assert _start_config("volume", config) is config
+    greedy = _start_config("volume:greedy:late_box", config)
+    assert (greedy.container_plan_beam_width, greedy.max_candidates_per_item,
+            greedy.container_plan_node_limit) == (1, 1, 1)
+
+
+def test_a_late_type_refinement_never_widens_a_narrower_request():
+    from packvium.solvers import _start_config
+    from dataclasses import replace
+    config = replace(PackingConfig.quality(), container_plan_beam_width=2, max_candidates_per_item=3)
+    narrowed = _start_config("volume:greedy:late_box:beam", config)
+    assert (narrowed.container_plan_beam_width, narrowed.max_candidates_per_item) == (2, 3)

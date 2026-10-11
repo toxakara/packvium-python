@@ -7,7 +7,9 @@ from .constraints import (CompatibilityConstraint, ConstraintContext, LoadSuppor
                           SupportConstraint, TagCountConstraint, load_units,
                           crushed, non_stackable_failure, overloaded, stack_density_exceeded,
                           stack_limit_exceeded)
+from .flat_bag import extent_of, girth_admits
 from .geometry import AxisAlignedBox, Point
+from . import made_to_measure
 from .models import (PackedContainer, PackingRequest, UnpackedItem, is_stack_sensitive,
                      placement_hits_box, placements_collide)
 from .nesting import is_valid_nesting as _is_valid_nesting
@@ -112,6 +114,8 @@ class IndependentSolutionValidator:
                     packed.container.inner_dimensions.length.ticks,
                 )
                 if axle_failure is not None: issues.append(ValidationIssue(axle_failure[0], f"{packed.id}: {axle_failure[1]}"))
+            if packed.container.is_flat_bag and not self._bag_admits(packed):
+                issues.append(ValidationIssue("bag_girth_exceeded", packed.id))
             if any(p.instance.item.stop_index is not None for p in placements):
                 route_issue = self._unloading_order_violation(packed)
                 if route_issue is not None: issues.append(route_issue)
@@ -131,10 +135,33 @@ class IndependentSolutionValidator:
                 issues.append(ValidationIssue("missing_item", item_id))
         for item_id in sorted(seen - expected): issues.append(ValidationIssue("unknown_item", item_id))
         self._check_groups(containers, issues)
+        self._check_made_to_measure(request, containers, issues)
         self._check_fixed_placements(request, containers, issues)
         if unpacked is not None:
             self._check_group_accounting(request, containers, issues)
         return ValidationReport(not issues, tuple(issues))
+
+    @staticmethod
+    def _check_made_to_measure(request: PackingRequest, containers: tuple[PackedContainer, ...],
+                               issues: list[ValidationIssue]) -> None:
+        """Every made-to-measure box is the one its placements call for.
+
+        Containment in the box was checked above like any container's; this re-cuts it from
+        the declared machine and the achieved extent, so a trial committed with a stale or
+        mixed-up box is caught. O(p) per container."""
+        declared = {container.id: container for container in request.containers}
+        for packed in containers:
+            machine = declared.get(packed.container.id)
+            achieved = packed.achieved_dimensions
+            if machine is None or machine.made_to_measure is None or achieved is None:
+                continue
+            expected = made_to_measure.fabricate(machine, made_to_measure.as_triple(achieved))
+            for code, field in (("fabricated_dimensions_mismatch", "inner_dimensions"),
+                                ("outer_dimensions_mismatch", "outer_dimensions"),
+                                ("made_to_measure_cost_mismatch", "cost_minor"),
+                                ("made_to_measure_tare_mismatch", "tare_weight")):
+                if getattr(packed.container, field) != getattr(expected, field):
+                    issues.append(ValidationIssue(code, packed.id))
 
     @staticmethod
     def _check_fixed_placements(request: PackingRequest, containers: tuple[PackedContainer, ...],
@@ -197,6 +224,12 @@ class IndependentSolutionValidator:
                         pairs.add((min(index, other), max(index, other)))
                 active.append((x2, index))
         return sorted(pairs)
+
+    @staticmethod
+    def _bag_admits(packed: PackedContainer) -> bool:
+        """The girth rule over the envelopes alone; the frame is checked above."""
+        a, b, c = extent_of((box.x2, box.y2, box.z2) for box in (p.envelope_box for p in packed.placements))
+        return girth_admits(packed.container.inner_dimensions, a, b, c)
 
     @staticmethod
     def _unloading_order_violation(packed: PackedContainer) -> "ValidationIssue | None":

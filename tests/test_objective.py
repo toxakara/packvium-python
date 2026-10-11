@@ -13,6 +13,7 @@ import pytest
 
 from packvium import (Container, Dimensions, Item, PackedContainer, PackingConfig, Placement,
                          Point, Rotation, UnpackedItem)
+from packvium.effort import EffortBudget
 from packvium.extensions import DefaultSolutionScorer
 from support import assert_sound, container, item, pack
 
@@ -811,3 +812,79 @@ def test_alternatives_never_quote_the_sentinel():
     for alternative in result.alternatives:
         assert alternative.score[1] != UNPRICEABLE_MINOR
         assert unpriceable_container(alternative.containers, config) is None
+
+
+# --------------------------------------------------------- maximum volume
+
+def _left_behind(*items):
+    return tuple(UnpackedItem(instance, "no_feasible_placement") for i in items for instance in i.instances())
+
+
+def test_maximum_volume_ranks_the_volume_left_behind_ahead_of_the_piece_count():
+    from packvium.extensions import MaximumVolumeSolutionScorer
+
+    scorer = MaximumVolumeSolutionScorer()
+    one_large = scorer.score_containers((), _left_behind(item("large", 100, 100, 90)))
+    five_small = scorer.score_containers((), _left_behind(item("small", 40, 40, 40, quantity=5)))
+    assert one_large == (1_000_000, 1, 0, 0, 0)
+    assert five_small == (1_000_000, 5, 0, 0, 0)
+
+
+def test_maximum_volume_rounds_the_share_up_so_an_incomplete_answer_never_scores_zero():
+    from packvium.extensions import MaximumVolumeSolutionScorer
+
+    speck, freight = item("speck", 1, 1, 1), item("freight", 12000, 2300, 2400)
+    result = pack([freight, speck], [container("c", 12000, 2300, 2400, quantity=1)],
+                  PackingConfig.balanced(objective="maximum_volume"))
+    assert [u.instance.item.id for u in result.unpacked] == ["speck"]
+    assert result.score[:2] == (1, 1)
+    assert MaximumVolumeSolutionScorer().score_containers((), ()) == (0, 0, 0, 0, 0)
+
+
+def test_maximum_volume_counts_a_compact_lattices_items_as_requested():
+    """The compact path carries no per-item placements; the packed volume must still come
+    from the instances the lattice consumed."""
+    result = pack([item("cube", 100, 100, 100, quantity=3)], [container("tower", 100, 100, 200, quantity=1)],
+                  PackingConfig.fast(objective="maximum_volume", require_placement_coordinates=False))
+    assert result.containers[0].lattice_summary is not None
+    assert result.score[:2] == (333_334, 1)
+
+
+@pytest.mark.parametrize("profile", [PackingConfig.fast, PackingConfig.balanced, PackingConfig.quality])
+def test_maximum_volume_keeps_the_one_large_item(profile):
+    items = [item("small", 40, 40, 40, quantity=5), item("large", 100, 100, 90)]
+    box = [container("c", 100, 100, 100, quantity=1)]
+
+    by_volume = pack(items, box, profile(objective="maximum_volume"))
+
+    assert {p.instance.item.id for c in by_volume.containers for p in c.placements} == {"large"}
+    assert by_volume.score[:2] == (262_296, 5)
+
+
+def test_default_keeps_more_pieces_on_the_scene_maximum_volume_fills():
+    items = [item("small", 40, 40, 40, quantity=5), item("large", 100, 100, 90)]
+    by_count = pack(items, [container("c", 100, 100, 100, quantity=1)], PackingConfig.quality())
+    assert {p.instance.item.id for c in by_count.containers for p in c.placements} == {"small"}
+
+
+def test_maximum_volume_opens_the_container_that_loads_the_most_volume():
+    items = [item("small", 40, 40, 40, quantity=5), item("large", 100, 100, 90)]
+    snug = container("snug", 90, 90, 90, quantity=1)
+    tall = container("tall", 100, 100, 95, quantity=1)
+
+    by_volume = pack(items, [snug, tall], PackingConfig.balanced(objective="maximum_volume", max_containers=1))
+    by_count = pack(items, [snug, tall], PackingConfig.balanced(max_containers=1))
+
+    assert [c.container.id for c in by_volume.containers] == ["tall"]
+    assert [c.container.id for c in by_count.containers] == ["snug"]
+
+
+def test_maximum_volume_is_deterministic():
+    items = [item("small", 40, 40, 40, quantity=5), item("large", 100, 100, 90)]
+    box = [container("c", 100, 100, 100, quantity=1)]
+    config = PackingConfig.quality(objective="maximum_volume", effort_budget=EffortBudget(max_search_nodes=2000),
+                                   time_limit_ms=60_000)
+    first, second = pack(items, box, config), pack(items, box, config)
+    assert first.score == second.score
+    assert [(p.instance.id, p.envelope_origin) for c in first.containers for p in c.placements] == \
+           [(p.instance.id, p.envelope_origin) for c in second.containers for p in c.placements]

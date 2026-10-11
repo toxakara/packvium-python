@@ -206,6 +206,21 @@ def test_a_fixed_set_that_cannot_hold_is_refused_before_search(mutate, fragment)
     assert fragment in message
 
 
+def test_a_fixed_set_that_breaks_the_stacking_group_rule_is_refused_before_search():
+    """Admission runs the validator over the fixed set alone, so the new code arrives
+    with no admission code of its own."""
+    drum = {"id": "drum", "quantity": 1, "stacking_group": "C",
+            "dimensions": {"length": "100", "width": "100", "height": "100"}}
+    data = request(items=[cube(1, accepts_stacking_groups=["A"]), drum],
+                   placements=[fixed(), {**fixed(z="100"), "item_type": "drum"}])
+    with pytest.raises(FixedPlacementError) as caught:
+        pack_from_dict(data)
+    assert (caught.value.reason, caught.value.field) == ("cannot_hold", "/fixed_placements")
+    assert str(caught.value).startswith("invalid_fixed_placement: stacking_group_incompatible: ")
+    drum["stacking_group"] = "A"
+    assert pack_from_dict(data)["status"] in {"feasible", "optimal"}
+
+
 def test_the_validator_catches_a_moved_fixed_item():
     items, containers = domain_request()
     packed = Packer(PackingConfig()).pack(items, containers, [at(100, 0, 0)])

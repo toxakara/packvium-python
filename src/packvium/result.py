@@ -118,6 +118,34 @@ def derive_result_facts(
     return ResultFact(feasibility), ResultFact(termination), ResultFact(optimality)
 
 
+def unsupported_placements_warning(
+    containers: Iterable[PackedContainer], minimum_support_ratio: float
+) -> str | None:
+    """The warning, or None when it does not apply.
+
+    The default `minimum_support_ratio` of 0 is kept so that no packing answer changes;
+    a caller who never set it is told instead. The count reads the support ratio every
+    placement already reports, O(placements) with no geometry: an obstacle is geometry
+    only and gives no support, so an item on one counts, while a fixed placement is a
+    supporter like any other. A lattice summary is always floor-up and has no placements.
+    Every engine emits this text byte for byte.
+    """
+    if minimum_support_ratio != 0:
+        return None
+    count = sum(
+        1
+        for container in containers
+        for placement in container.placements
+        if placement.support_ratio == 0 and placement.position.z > 0
+    )
+    if count == 0:
+        return None
+    return (
+        f"unsupported_placements: {count} placement(s) rest on nothing above the container "
+        "floor; set configuration.minimum_support_ratio above 0 to require support"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SolverMetrics:
     candidate_points_considered: int = 0
@@ -222,6 +250,20 @@ class PackingResult:
                 "layer_step": Length(summary.layer_step).to_dict(length_unit),
                 "count": summary.count,
             }}
+        def made_to_measure_dict(container):
+            # A packed made-to-measure container is the fabricated box, so its own price
+            # and tare are the box's; absent for every other container.
+            if container.made_to_measure is None:
+                return {}
+            return {"made_to_measure": {
+                "cost_minor": container.cost_minor,
+                "tare_weight": container.tare_weight.to_dict(weight_unit),
+            }}
+        def achieved_dict(container):
+            # Present exactly when the container conforms to its contents, so a
+            # rigid container's bytes are unchanged.
+            achieved = container.achieved_dimensions
+            return {} if achieved is None else {"achieved_dimensions": achieved.to_dict(length_unit)}
         def axle_dict(container):
             if container.container.axles is None:
                 return {}
@@ -259,6 +301,8 @@ class PackingResult:
                 "id": c.id, "container_type": c.container.id,
                 "inner_dimensions": c.container.inner_dimensions.to_dict(length_unit),
                 "outer_dimensions": (c.container.outer_dimensions or c.container.inner_dimensions).to_dict(length_unit),
+                **achieved_dict(c),
+                **made_to_measure_dict(c.container),
                 "payload_weight": c.payload_weight.to_dict(weight_unit),
                 "gross_weight": c.gross_weight.to_dict(weight_unit),
                 "used_volume_ticks3": str(c.used_volume),

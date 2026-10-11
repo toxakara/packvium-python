@@ -9,7 +9,7 @@ from .extensions import (ExtensionRegistry, SolutionScorer, UnknownObjectiveErro
 from .fixed_placements import admit_fixed_placements
 from .models import Container, Item, PackingRequest, UnratedWeightError
 from .result import AlgorithmReport, PackingResult, PackingStatus
-from .result import aggregate_termination
+from .result import aggregate_termination, unsupported_placements_warning
 from .solvers import Deadline, SolverOrchestrator
 from contextlib import nullcontext
 
@@ -108,6 +108,9 @@ class Packer:
                 )
                 if not report.valid:
                     status = PackingStatus.INVALID_RESULT; warnings = tuple(f"{i.code}: {i.detail}" for i in report.issues)
+            unsupported = unsupported_placements_warning(raw.containers, self.config.minimum_support_ratio)
+            if unsupported is not None:
+                warnings = (*warnings, unsupported)
             starts = []
             winner_marked = False
             for record in portfolio.starts:

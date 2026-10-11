@@ -7,9 +7,11 @@ from typing import Any, Iterable, Mapping
 
 from .centre_of_mass import centre_of_mass_offset_ppm
 from . import compression, hull
+from .flat_bag import DEFORMABLE_BOUNDARY_KINDS, as_dimensions, extent_of
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
                        Point, Rotation, ShapeType)
 from .lattice_summary import LatticeSummary
+from .made_to_measure import MadeToMeasure, as_triple
 from .nesting import used_volume as nesting_used_volume
 from .units import Length, Weight
 
@@ -105,6 +107,12 @@ class Item:
     # placement or scoring under any objective, `maximum_value` included -- an
     # item with no declared value simply contributes zero to value forgone.
     value: int | None = None
+    # Which stacking class this item belongs to, and which classes it may carry directly
+    # on its top face (docs/STACKING-GROUPS.md). An empty set is unconstrained,
+    # like `tags`; a non-empty one is closed, so an item with no class rests on no
+    # constrained item -- a forgotten classification fails closed, never open.
+    stacking_group: str | None = None
+    accepts_stacking_groups: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if not self.id: raise ValueError("item id is required")
@@ -127,6 +135,7 @@ class Item:
         object.__setattr__(self, "tags", frozenset(self.tags))
         object.__setattr__(self, "incompatible_tags", frozenset(self.incompatible_tags))
         object.__setattr__(self, "eligible_container_tags", frozenset(self.eligible_container_tags))
+        object.__setattr__(self, "accepts_stacking_groups", frozenset(self.accepts_stacking_groups))
         # Coerce here rather than in `create`, so every construction path is covered. An
         # unparsed weight used to travel all the way into the solver before failing.
         object.__setattr__(self, "weight", Weight.parse(self.weight))
@@ -327,9 +336,17 @@ class Container:
     # `ContainerState` starts from them without knowing they exist; a packed result carries
     # the container with this emptied again (docs/PLAN-REVISIONS.md).
     preloaded: tuple["Placement", ...] = ()
+    # `"flat_bag"` makes this a flexible bag whose package conforms to its contents
+    # (`flat_bag.py`); None is a rigid container. Last, so no positional caller moves.
+    deformable_boundary: str | None = None
+    # Cut to measure by an on-demand box machine whose largest box is `inner_dimensions`
+    # (`made_to_measure.py`). A packed result carries the fabricated box instead.
+    made_to_measure: MadeToMeasure | None = None
 
     def __post_init__(self) -> None:
         if not self.id: raise ValueError("container id is required")
+        if self.deformable_boundary is not None: self._require_bag_fields()
+        if self.made_to_measure is not None: self.made_to_measure.admits(as_triple(self.inner_dimensions))
         if self.quantity is not None and self.quantity <= 0: raise ValueError("container quantity must be positive")
         if self.cost_minor < 0: raise ValueError("container cost cannot be negative")
         if not 0 <= self.void_fill_reserve_ratio <= 1: raise ValueError("void_fill_reserve_ratio must be between 0 and 1")
@@ -358,6 +375,25 @@ class Container:
         if self.max_stack_density is not None:
             object.__setattr__(self, "max_stack_density", Weight.parse(self.max_stack_density))
 
+    def _require_bag_fields(self) -> None:
+        """A bag has no walls, floor plan or chassis for a wall-anchored field to refer to,
+        so those fields are refused rather than read against a frame that moves with its
+        contents. The JSON path names the same fields as request errors first."""
+        if self.deformable_boundary not in DEFORMABLE_BOUNDARY_KINDS:
+            raise ValueError(f"unknown deformable_boundary kind {self.deformable_boundary!r}")
+        refused = [name for name, present in (
+            ("obstacles", bool(self.obstacles)), ("axles", self.axles is not None),
+            ("access_directions", bool(self.access_directions)),
+            ("max_stack_density", self.max_stack_density is not None),
+            ("outer_dimensions", self.outer_dimensions is not None),
+            ("void_fill_reserve_ratio", self.void_fill_reserve_ratio > 0)) if present]
+        if refused:
+            raise ValueError(f"{refused[0]} cannot be combined with deformable_boundary")
+
+    @property
+    def is_flat_bag(self) -> bool:
+        return self.deformable_boundary is not None
+
     @classmethod
     def create(cls, id: str, inner_dimensions: Dimensions, tare_weight=0, max_payload=None, **kwargs) -> "Container":
         return cls(id=id, inner_dimensions=inner_dimensions, tare_weight=Weight.parse(tare_weight), max_payload=None if max_payload is None else Weight.parse(max_payload), **kwargs)
@@ -370,11 +406,21 @@ def is_stack_sensitive(item: "Item") -> bool:
     item *yielding* to it: a compressible item needs the cumulative mass above it computed
     before its occupied height -- or its crush limit -- means anything, and that mass only
     exists once the support graph is built.
+
+    A `stacking_group` alone does not count: such an item is refused only by a
+    constrained item beneath it, and that item already switched the graph on.
     """
     return (not item.stackable
+            or bool(item.accepts_stacking_groups)
             or item.max_top_load is not None
             or item.max_stacked_items is not None
             or item.max_compression_pressure_kpa is not None)
+
+
+def carries_itself(item: "Item") -> bool:
+    """Whether a column of this one item type passes every stacking edge."""
+    return item.stackable and (not item.accepts_stacking_groups
+                               or item.stacking_group in item.accepts_stacking_groups)
 
 
 def hull_collision_is_exact(item: "Item", envelope_matches_physical: bool) -> bool:
@@ -529,8 +575,24 @@ class PackedContainer:
             return self.lattice_summary.expand(self.lattice_items)
         return self.placements
 
+    @property
+    def achieved_dimensions(self) -> Dimensions | None:
+        """The largest envelope x2, y2 and z2 of its placements from its origin: a flat bag's
+        conformed package, or a made-to-measure box's extent before it is rounded
+        onto the machine grid. None for any other container. O(p)."""
+        if not (self.container.is_flat_bag or self.container.made_to_measure is not None): return None
+        return as_dimensions(extent_of((box.x2, box.y2, box.z2)
+                                       for box in (p.envelope_box for p in self.placements)))
+
+    @property
+    def billed_dimensions(self) -> Dimensions:
+        """What a carrier measures: a bag's achieved package, else the declared outer size."""
+        achieved = self.achieved_dimensions
+        if achieved is not None and self.container.is_flat_bag: return achieved
+        return self.container.outer_dimensions or self.container.inner_dimensions
+
     def as_item(self, id: str | None = None, keep_upright: bool = True, max_top_load: Weight | None = None) -> Item:
-        return Item(id or self.id, self.container.outer_dimensions or self.container.inner_dimensions, self.gross_weight, keep_upright=keep_upright, max_top_load=max_top_load, metadata={"source_packed_container": self.id})
+        return Item(id or self.id, self.billed_dimensions, self.gross_weight, keep_upright=keep_upright, max_top_load=max_top_load, metadata={"source_packed_container": self.id})
 
 
 @dataclass(frozen=True, slots=True)

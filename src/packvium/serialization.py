@@ -10,6 +10,7 @@ from .effort import EffortBudget
 from .compression import ratio_to_ppm
 from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
 from .models import Axle, Container, FixedPlacement, Item, Obstacle, RateTable
+from .made_to_measure import MadeToMeasure
 from ._canonical_json import json_integer
 from .extensions import ExtensionRegistry
 from .fixed_placements import require_fixed_placement_shapes
@@ -77,6 +78,8 @@ def _item(raw: dict, unit: str) -> Item:
         compression_ratio_ppm=(None if raw.get("compression_ratio") is None
                                else ratio_to_ppm(float(raw["compression_ratio"]))),
         max_compression_pressure_kpa=raw.get("max_compression_pressure_kpa"),
+        stacking_group=raw.get("stacking_group"),
+        accepts_stacking_groups=frozenset(raw.get("accepts_stacking_groups") or ()),
     )
 
 
@@ -133,6 +136,28 @@ def _container(raw: dict, unit: str) -> Container:
         max_stack_density=None if raw.get("max_stack_density") is None else Weight.parse(raw["max_stack_density"]),
         axles=_axles(raw.get("axles"), unit),
         access_directions=tuple(str(d) for d in raw.get("access_directions", ())),
+        deformable_boundary=None if raw.get("deformable_boundary") is None else raw["deformable_boundary"]["kind"],
+        made_to_measure=_made_to_measure(raw.get("made_to_measure"), unit),
+    )
+
+
+def _made_to_measure(raw: dict | None, unit: str) -> MadeToMeasure | None:
+    if raw is None:
+        return None
+
+    def sides(name: str) -> tuple[int, int, int]:
+        value = raw.get(name)
+        if value is None:
+            return (0, 0, 0)
+        return tuple(Length.parse(value[axis], unit).ticks for axis in ("length", "width", "height"))
+
+    tare = raw.get("tare_per_square_metre")
+    return MadeToMeasure(
+        minimum=sides("minimum"),
+        increment=sides("increment"),
+        cost_per_square_metre_minor=int(raw.get("cost_per_square_metre_minor") or 0),
+        tare_per_square_metre=0 if tare is None else Weight.parse(tare).ticks,
+        outer_allowance=sides("outer_allowance"),
     )
 
 
@@ -214,6 +239,7 @@ def reject_unsupported(
     for entry in data.get("items") or ():
         if isinstance(entry, dict) and entry.get("shape_type") in shape_types:
             found.add(f"item.shape_type={entry['shape_type']}")
+    found.update(made_to_measure_combinations(data))
     if not found:
         return
     raise UnsupportedFeatureError(
@@ -221,6 +247,37 @@ def reject_unsupported(
         + ", ".join(sorted(found))
         + "; the request was rejected instead of silently ignoring public fields"
     )
+
+
+def made_to_measure_combinations(data: Mapping[str, Any]) -> set[str]:
+    """The made-to-measure combinations 1.6 refuses (D10, docs/MADE-TO-MEASURE-CONTAINERS.md).
+
+    Each reads a container dimension or position the fabricated box does not keep, so none
+    has a defined meaning for a carton cut to measure. Checked on the raw request, before any
+    request error, like every other unsupported feature. O(containers + fixed placements).
+    """
+    found: set[str] = set()
+    measured: set[str] = set()
+    for entry in data.get("containers") or ():
+        if not isinstance(entry, Mapping) or entry.get("made_to_measure") is None:
+            continue
+        if isinstance(entry.get("id"), str):
+            measured.add(entry["id"])
+        if entry.get("axles") is not None:
+            found.add("container.made_to_measure+axles")
+        obstacles = entry.get("obstacles")
+        if isinstance(obstacles, list) and obstacles:
+            found.add("container.made_to_measure+obstacles")
+        reserve = entry.get("void_fill_reserve_ratio")
+        if isinstance(reserve, (int, float)) and not isinstance(reserve, bool) and reserve > 0:
+            found.add("container.made_to_measure+void_fill_reserve_ratio")
+    fixed = data.get("fixed_placements")
+    if measured and isinstance(fixed, list) and any(
+            isinstance(entry, Mapping) and isinstance(entry.get("container_type"), str)
+            and entry["container_type"] in measured
+            for entry in fixed):
+        found.add("fixed_placements+container.made_to_measure")
+    return found
 
 
 def pack_from_dict(data: dict, *,

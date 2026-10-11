@@ -81,6 +81,32 @@ def test_the_same_two_items_as_cuboids_do_not_fit():
     assert_sound(result, items, [box])
 
 
+def test_the_beam_ordering_bound_lets_the_second_wedge_fit():
+    """The `quality` beam's lower bound must not claim the second wedge stays out.
+
+    With one wedge placed, half the crate is free and the other wedge occupies exactly that
+    half. Counting its declared box -- the whole crate -- against occupied free space said it
+    could never fit, which is not a lower bound on what the packing above achieves."""
+    from packvium.solvers import ContainerState, PrecomputedFuture, _unpacked_lower_bound
+
+    state = ContainerState(container("cube", 10, 10, 10), 1)
+    state.add(_placement(lower_wedge("a")))
+    future = PrecomputedFuture.from_items(upper_wedge("b").instances(), has_max_payload=False)
+    assert _unpacked_lower_bound(state, 0, future) == 0
+
+
+def test_the_container_plan_bound_counts_a_wedge_pair_as_one_crate():
+    """Two wedges that fill one crate between them have boxes worth two crates.
+    Counted by box, the plan bound said a second crate was unavoidable."""
+    from types import SimpleNamespace
+    from packvium.solvers import SolverOrchestrator
+
+    crate = container("cube", 10, 10, 10)
+    pair = (*lower_wedge("a").instances(), *upper_wedge("b").instances())
+    plan = SimpleNamespace(remaining=pair, inventory={crate.id: 2})
+    assert SolverOrchestrator._additional_container_lower_bound(plan, [crate]) == 1
+
+
 def test_touching_wedges_are_contact_and_not_collision():
     """Directly on the shared predicate the solver, the validator and the obstacle check all
     go through, so the three cannot drift apart on what "collides" means."""

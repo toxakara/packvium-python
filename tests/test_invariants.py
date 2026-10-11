@@ -119,7 +119,8 @@ def test_container_stock_is_never_overdrawn(seed):
 def test_every_unpacked_item_carries_a_recognised_reason(seed):
     """A caller acts on these strings, so an unexplained failure is a failure."""
     known = {"no_compatible_container_dimensions", "payload_exceeded", "no_feasible_placement",
-             "group_cannot_fit_together", "time_limit", "insufficient_support"}
+             "group_cannot_fit_together", "time_limit", "insufficient_support",
+             "container_inventory_exhausted", "axle_overloaded"}
     items, containers = generate(seed)
     result = pack(items, containers, PackingConfig.balanced(time_limit_ms=250))
     assert {u.reason for u in result.unpacked} <= known

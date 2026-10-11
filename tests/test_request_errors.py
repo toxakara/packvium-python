@@ -86,6 +86,18 @@ def refusal(edit) -> InvalidRequestError:
      "/configuration/effort_budget/max_nodes", "is not a known field"),
     (lambda d: d["configuration"].update(effort_budget={"max_restarts": 0}), "below_minimum",
      "/configuration/effort_budget/max_restarts", "must be at least 1"),
+    (lambda d: d["items"][0].update(stacking_group=7), "wrong_type",
+     "/items/0/stacking_group", "must be a string"),
+    (lambda d: d["items"][0].update(stacking_group=""), "invalid_value",
+     "/items/0/stacking_group", "must not be empty"),
+    (lambda d: d["items"][0].update(accepts_stacking_groups="A"), "wrong_type",
+     "/items/0/accepts_stacking_groups", "must be a list"),
+    (lambda d: d["items"][0].update(accepts_stacking_groups=["A", 3]), "wrong_type",
+     "/items/0/accepts_stacking_groups/1", "must be a string"),
+    (lambda d: d["items"][0].update(accepts_stacking_groups=["A", ""]), "invalid_value",
+     "/items/0/accepts_stacking_groups/1", "must not be empty"),
+    (lambda d: d["items"][0].update(stacking_group="", accepts_stacking_groups=[""]), "invalid_value",
+     "/items/0/stacking_group", "must not be empty"),
 ])
 def test_a_malformed_request_names_the_value_and_the_rule(edit, reason, field, detail):
     error = refusal(edit)
@@ -131,9 +143,17 @@ def test_a_fixed_set_that_cannot_hold_is_reported_against_the_whole_list():
     assert (caught.value.reason, caught.value.field) == ("cannot_hold", "/fixed_placements")
 
 
+def test_what_stacking_groups_do_not_refuse_is_accepted():
+    data = request()
+    data["items"][0].update(stacking_group="A", accepts_stacking_groups=["B", "B", "unknown"],
+                            stackable=False)
+    check_request(data)
+
+
 def test_null_optionals_are_absent_and_a_valid_request_passes():
     data = request()
-    data["items"][0].update(max_stacked_items=None, stop_index=None)
+    data["items"][0].update(max_stacked_items=None, stop_index=None, stacking_group=None,
+                            accepts_stacking_groups=None)
     data["units"] = None
     data["configuration"]["effort_budget"] = None
     check_request(data)

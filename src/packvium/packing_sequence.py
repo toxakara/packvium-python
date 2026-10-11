@@ -37,8 +37,9 @@ from __future__ import annotations
 from ._compat import dataclass
 from typing import Sequence
 
-from .constraints import (_touches_corners, direct_support_view, load_units, overloaded,
-                          stack_density_exceeded, stack_limit_exceeded, stacked_counts)
+from .constraints import (LoadSupportGraph, _touches_corners, direct_support_view, load_units,
+                          non_stackable_failure, overloaded, stack_density_exceeded,
+                          stack_limit_exceeded, stacked_counts)
 from .contact import ContactGraph
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions,
                        InvalidDirectionError, sweep_intersects, swept_volume)
@@ -215,16 +216,16 @@ def safe_removal_order(boxes: Sequence[AxisAlignedBox], container: Dimensions,
     present = frozenset(range(len(boxes)))
     order: list[int] = []
     while present:
-        removable = [
-            index for index in present
-            if not (graph.depends_on[index] & present)
-            and _clear_direction(index, boxes[index], boxes, present, container, directions) is not None
-        ]
-        if not removable:
+        chosen = None
+        for index in range(len(boxes)):
+            if (index in present and not (graph.depends_on[index] & present)
+                    and _clear_direction(index, boxes[index], boxes, present, container, directions) is not None):
+                chosen = index
+                break
+        if chosen is None:
             raise SequenceError(present)
         # Deterministic: the lowest index among this step's candidates, not
         # arbitrary set iteration order.
-        chosen = min(removable)
         order.append(chosen)
         present = present - {chosen}
     replay_removal_order(boxes, container, order, directions)
@@ -259,16 +260,16 @@ def safe_route_removal_order(boxes: Sequence[AxisAlignedBox], stops: Sequence[in
     for stop in sorted({stop for stop in stops if stop is not None}):
         due = frozenset(index for index in remaining if stops[index] == stop)
         while due:
-            removable = [
-                index for index in due
-                if not (graph.depends_on[index] & remaining)
-                and _clear_direction(index, boxes[index], boxes, remaining, container, directions) is not None
-            ]
-            if not removable:
+            chosen = None
+            for index in range(len(boxes)):
+                if (index in due and not (graph.depends_on[index] & remaining)
+                        and _clear_direction(index, boxes[index], boxes, remaining, container, directions) is not None):
+                    chosen = index
+                    break
+            if chosen is None:
                 raise RouteSequenceError(stop, due)
             # Deterministic: the lowest index among this step's candidates, not
             # arbitrary set iteration order.
-            chosen = min(removable)
             order.append(chosen)
             remaining = remaining - {chosen}
             due = due - {chosen}
@@ -500,6 +501,10 @@ def verify_loading_prefix_business_rules(
     if sorted(order) != list(range(len(placements))):
         raise SequenceReplayError(-1, -1, "order is not a permutation of every placement index exactly once")
     max_density_ticks = None if container.max_stack_density is None else container.max_stack_density.ticks
+    # A caller may hand this any scene, validated or not, so the stacking-group rule is
+    # re-checked here too -- only when some item declares a list, and only on the edges
+    # of the step's own new placement, since every earlier edge was judged at its step.
+    grouped = any(placement.instance.item.accepts_stacking_groups for placement in placements)
     present: list[Placement] = []
     for step, index in enumerate(order):
         present.append(placements[index])
@@ -512,6 +517,11 @@ def verify_loading_prefix_business_rules(
                 if not item.stackable and counts[unit_index] > 0:
                     problem = ("non_stackable_item_has_load", unit.label)
                     break
+        if problem is None and grouped:
+            refusal = non_stackable_failure(present, present[-1].instance, LoadSupportGraph(units),
+                                            len(present) - 1)
+            if refusal is not None:
+                problem = (refusal.code, refusal.detail)
         if problem is None:
             candidate = present[-1]
             rule = candidate.instance.item.ground_contact_rule
