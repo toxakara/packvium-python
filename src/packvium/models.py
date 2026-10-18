@@ -14,10 +14,20 @@ from .lattice_summary import LatticeSummary
 from .made_to_measure import MadeToMeasure, as_triple
 from .nesting import used_volume as nesting_used_volume
 from .units import Length, Weight
+from ._request_error import refused
 
 
 GROUND_CONTACT_RULES = frozenset({"free", "covered", "single", "multiple"})
 
+
+
+def _ratio_between_zero_and_one(value: float, name: str) -> None:
+    """The ratio rule of the request schema: below zero and above one are told apart, and
+    anything else outside [0, 1] (NaN) is still refused."""
+    if 0 <= value <= 1:
+        return
+    reason = "below_minimum" if value < 0 else "above_maximum" if value > 1 else "invalid_value"
+    raise refused(reason, f"{name} must be between 0 and 1")
 
 @dataclass(frozen=True, slots=True)
 class Obstacle:
@@ -115,22 +125,23 @@ class Item:
     accepts_stacking_groups: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        if not self.id: raise ValueError("item id is required")
-        if self.quantity <= 0: raise ValueError("item quantity must be positive")
-        if not 0 <= self.minimum_support_ratio <= 1: raise ValueError("minimum_support_ratio must be between 0 and 1")
+        if not self.id: raise refused("invalid_value", "item id is required")
+        if self.quantity <= 0: raise refused("below_minimum", "item quantity must be positive")
+        _ratio_between_zero_and_one(self.minimum_support_ratio, "minimum_support_ratio")
         if self.max_stacked_items is not None and self.max_stacked_items < 1:
-            raise ValueError("max_stacked_items must be at least 1")
+            raise refused("below_minimum", "max_stacked_items must be at least 1")
         if self.stop_index is not None and not 0 <= self.stop_index <= MAX_EXACT_STOP_INDEX:
-            raise ValueError("stop_index must be a non-negative safe integer")
+            reason = "below_minimum" if self.stop_index < 0 else "above_maximum"
+            raise refused(reason, "stop_index must be a non-negative safe integer")
         if self.value is not None and self.value < 0:
-            raise ValueError("value must be non-negative")
+            raise refused("below_minimum", "value must be non-negative")
         if self.nesting_height is not None and not 0 <= self.nesting_height.ticks < self.dimensions.height.ticks:
-            raise ValueError("nesting_height must be at least zero and strictly less than the item's own height")
+            raise refused("invalid_value", "nesting_height must be at least zero and strictly less than the item's own height")
         if self.ground_contact_rule is not None and self.ground_contact_rule not in GROUND_CONTACT_RULES:
-            raise ValueError(f"ground_contact_rule must be one of {sorted(GROUND_CONTACT_RULES)}")
+            raise refused("not_allowed", f"ground_contact_rule must be one of {sorted(GROUND_CONTACT_RULES)}")
         self._validate_shape()
         rotations = tuple(r for r in self.allowed_rotations if not self.keep_upright or r in Rotation.upright())
-        if not rotations: raise ValueError("at least one rotation must be allowed")
+        if not rotations: raise refused("invalid_value", "at least one rotation must be allowed")
         object.__setattr__(self, "allowed_rotations", rotations)
         object.__setattr__(self, "tags", frozenset(self.tags))
         object.__setattr__(self, "incompatible_tags", frozenset(self.incompatible_tags))
@@ -150,14 +161,17 @@ class Item:
         have to be consistent with.
         """
         object.__setattr__(self, "shape_type", ShapeType(self.shape_type))
+        # The value's own floor first, as the JSON rules check it before the shape.
+        if self.max_compression_pressure_kpa is not None and self.max_compression_pressure_kpa < 0:
+            raise refused("below_minimum", "max_compression_pressure_kpa cannot be negative")
         for name, value in self._fields_foreign_to_shape():
             if value is not None:
-                raise ValueError(f"{name} is not part of a {self.shape_type.value} item")
+                raise refused("invalid_value", f"{name} is not part of a {self.shape_type.value} item")
         if self.nesting_height is not None and self.shape_type is not ShapeType.RIGID_CUBOID:
             # Both rewrite occupied height. Picking an order silently would give four
             # engines four contracts; the interaction gets its own task before it is allowed.
-            raise ValueError(
-                f"nesting_height with shape_type {self.shape_type.value} is not supported yet"
+            raise refused(
+                "invalid_value", f"nesting_height with shape_type {self.shape_type.value} is not supported yet"
             )
         if self.shape_type is ShapeType.CONVEX_HULL:
             self._validate_hull()
@@ -178,7 +192,7 @@ class Item:
 
     def _validate_hull(self) -> None:
         if self.hull_vertices is None:
-            raise ValueError("a convex_hull item requires hull_vertices")
+            raise refused("invalid_value", "a convex_hull item requires hull_vertices")
         object.__setattr__(self, "hull_vertices", hull.validate(self.hull_vertices))
         lower, upper = hull.bounding_extent(self.hull_vertices)
         extent = tuple(high - low for high, low in zip(upper, lower))
@@ -188,20 +202,18 @@ class Item:
             # `dimensions` stays the broad phase and the candidate-generation envelope, so a
             # hull poking out of it would be tested for collision against space the solver
             # never reserved.
-            raise ValueError(
-                f"hull_vertices span {extent} does not fit inside dimensions {declared}"
+            raise refused(
+                "invalid_value", f"hull_vertices span {extent} does not fit inside dimensions {declared}"
             )
 
     def _validate_compression(self) -> None:
         if self.compression_ratio_ppm is None or self.max_compression_pressure_kpa is None:
-            raise ValueError(
-                "a compressible item requires both compression_ratio and "
+            raise refused(
+                "invalid_value", "a compressible item requires both compression_ratio and "
                 "max_compression_pressure_kpa"
             )
         if not 0 <= self.compression_ratio_ppm <= compression.PPM:
-            raise ValueError("compression_ratio must be between zero and one")
-        if self.max_compression_pressure_kpa < 0:
-            raise ValueError("max_compression_pressure_kpa cannot be negative")
+            raise refused("invalid_value", "compression_ratio must be between zero and one")
 
     @classmethod
     def create(cls, id: str, dimensions: Dimensions, weight=0, **kwargs) -> "Item":
@@ -246,22 +258,22 @@ class RateTable:
 
     def __post_init__(self) -> None:
         if not self.weight_brackets_g:
-            raise ValueError("rate_table requires at least one weight bracket")
+            raise refused("invalid_value", "rate_table requires at least one weight bracket")
         if len(self.weight_brackets_g) != len(self.prices_minor):
-            raise ValueError("rate_table weight_brackets_g and prices_minor must be the same length")
+            raise refused("invalid_value", "rate_table weight_brackets_g and prices_minor must be the same length")
         if any(bound <= 0 for bound in self.weight_brackets_g):
-            raise ValueError("rate_table weight brackets must be positive")
+            raise refused("below_minimum", "rate_table weight brackets must be positive")
         if any(
             later <= earlier
             for earlier, later in zip(self.weight_brackets_g, self.weight_brackets_g[1:])
         ):
-            raise ValueError("rate_table weight brackets must be strictly ascending")
+            raise refused("invalid_value", "rate_table weight brackets must be strictly ascending")
         if any(price < 0 for price in self.prices_minor):
-            raise ValueError("rate_table prices cannot be negative")
+            raise refused("below_minimum", "rate_table prices cannot be negative")
         if self.minimum_charge_minor < 0:
-            raise ValueError("rate_table minimum_charge_minor cannot be negative")
+            raise refused("below_minimum", "rate_table minimum_charge_minor cannot be negative")
         if self.fuel_surcharge_permille < 0:
-            raise ValueError("rate_table fuel_surcharge_permille cannot be negative")
+            raise refused("below_minimum", "rate_table fuel_surcharge_permille cannot be negative")
 
     def charge_minor_or_none(self, billed_weight_g: int) -> int | None:
         """The exact landed cost of one shipment at this billed weight, or `None` when the
@@ -344,20 +356,20 @@ class Container:
     made_to_measure: MadeToMeasure | None = None
 
     def __post_init__(self) -> None:
-        if not self.id: raise ValueError("container id is required")
+        if not self.id: raise refused("invalid_value", "container id is required")
         if self.deformable_boundary is not None: self._require_bag_fields()
         if self.made_to_measure is not None: self.made_to_measure.admits(as_triple(self.inner_dimensions))
-        if self.quantity is not None and self.quantity <= 0: raise ValueError("container quantity must be positive")
-        if self.cost_minor < 0: raise ValueError("container cost cannot be negative")
-        if not 0 <= self.void_fill_reserve_ratio <= 1: raise ValueError("void_fill_reserve_ratio must be between 0 and 1")
+        if self.quantity is not None and self.quantity <= 0: raise refused("below_minimum", "container quantity must be positive")
+        if self.cost_minor < 0: raise refused("below_minimum", "container cost cannot be negative")
+        _ratio_between_zero_and_one(self.void_fill_reserve_ratio, "void_fill_reserve_ratio")
         if self.axles is not None:
             front, rear = self.axles
             if front.position.ticks >= rear.position.ticks:
-                raise ValueError("the front axle must be strictly nearer the origin than the rear axle")
+                raise refused("invalid_value", "the front axle must be strictly nearer the origin than the rear axle")
             if front.position.ticks < 0 or rear.position.ticks > self.inner_dimensions.length.ticks:
-                raise ValueError("axle positions must lie within the container's length")
-        if any(limit < 1 for limit in self.tag_limits.values()): raise ValueError("tag_limits must be at least 1")
-        if self.max_items is not None and self.max_items < 1: raise ValueError("container max_items must be at least 1")
+                raise refused("invalid_value", "axle positions must lie within the container's length")
+        if any(limit < 1 for limit in self.tag_limits.values()): raise refused("below_minimum", "tag_limits must be at least 1")
+        if self.max_items is not None and self.max_items < 1: raise refused("below_minimum", "container max_items must be at least 1")
         # Deduplicated into the canonical order rather than kept as given: two callers
         # naming the same doors in a different order must search identically, and this is
         # the one place every construction path passes through.
@@ -366,11 +378,11 @@ class Container:
                 raise InvalidDirectionError(direction)
         object.__setattr__(self, "access_directions",
                            tuple(d for d in ALL_DIRECTIONS if d in set(self.access_directions)))
-        if self.outer_dimensions and not self.inner_dimensions.fits_inside(self.outer_dimensions): raise ValueError("outer dimensions cannot be smaller than inner dimensions")
+        if self.outer_dimensions and not self.inner_dimensions.fits_inside(self.outer_dimensions): raise refused("invalid_value", "outer dimensions cannot be smaller than inner dimensions")
         boundary = AxisAlignedBox(Point(0, 0, 0), self.inner_dimensions)
         for obstacle in self.obstacles:
             if not all(boundary.contains(box) for box in obstacle.boxes):
-                raise ValueError(f"obstacle {obstacle.id} lies outside container")
+                raise refused("invalid_value", f"obstacle {obstacle.id} lies outside container")
         object.__setattr__(self, "tags", frozenset(self.tags))
         if self.max_stack_density is not None:
             object.__setattr__(self, "max_stack_density", Weight.parse(self.max_stack_density))
@@ -380,15 +392,15 @@ class Container:
         so those fields are refused rather than read against a frame that moves with its
         contents. The JSON path names the same fields as request errors first."""
         if self.deformable_boundary not in DEFORMABLE_BOUNDARY_KINDS:
-            raise ValueError(f"unknown deformable_boundary kind {self.deformable_boundary!r}")
-        refused = [name for name, present in (
+            raise refused("not_allowed", f"unknown deformable_boundary kind {self.deformable_boundary!r}")
+        fields = [name for name, present in (
             ("obstacles", bool(self.obstacles)), ("axles", self.axles is not None),
             ("access_directions", bool(self.access_directions)),
             ("max_stack_density", self.max_stack_density is not None),
             ("outer_dimensions", self.outer_dimensions is not None),
             ("void_fill_reserve_ratio", self.void_fill_reserve_ratio > 0)) if present]
-        if refused:
-            raise ValueError(f"{refused[0]} cannot be combined with deformable_boundary")
+        if fields:
+            raise refused("not_allowed", f"{fields[0]} cannot be combined with deformable_boundary")
 
     @property
     def is_flat_bag(self) -> bool:
@@ -660,10 +672,8 @@ class FixedPlacement:
     position: Point
     rotation: Rotation
     container_instance: int = 1
-
-    def __post_init__(self) -> None:
-        if self.container_instance < 1:
-            raise ValueError("container_instance counts from 1")
+    # Every rule on these fields is checked where the placement sits in a request, by
+    # `Packer.pack` (`request_objects.check_objects`), with the JSON path's refusal and pointer.
 
     @property
     def packed_container_id(self) -> str:
@@ -677,10 +687,10 @@ class PackingRequest:
     fixed_placements: tuple[FixedPlacement, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.items: raise ValueError("at least one item is required")
-        if not self.containers: raise ValueError("at least one container is required")
-        if len({item.id for item in self.items}) != len(self.items): raise ValueError("item ids must be unique")
-        if len({container.id for container in self.containers}) != len(self.containers): raise ValueError("container ids must be unique")
+        if not self.items: raise refused("invalid_value", "at least one item is required")
+        if not self.containers: raise refused("invalid_value", "at least one container is required")
+        if len({item.id for item in self.items}) != len(self.items): raise refused("duplicate_id", "item ids must be unique")
+        if len({container.id for container in self.containers}) != len(self.containers): raise refused("duplicate_id", "container ids must be unique")
 
     @property
     def instances(self) -> tuple[ItemInstance, ...]:

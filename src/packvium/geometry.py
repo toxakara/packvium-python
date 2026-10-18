@@ -7,6 +7,7 @@ from itertools import product
 from typing import Iterable
 
 from .units import Length, Rounding, Weight
+from ._request_error import refused
 
 
 class Rotation(str, Enum):
@@ -64,7 +65,8 @@ class Dimensions:
 
     @classmethod
     def of(cls, length, width, height, unit: str = "mm", rounding: Rounding = Rounding.NEAREST) -> "Dimensions":
-        return cls(Length.of(length, unit, rounding), Length.of(width, unit, rounding), Length.of(height, unit, rounding))
+        return cls._read(Length.of(length, unit, rounding), Length.of(width, unit, rounding),
+                         Length.of(height, unit, rounding))
 
     @classmethod
     def mm(cls, length, width, height, rounding: Rounding = Rounding.NEAREST) -> "Dimensions":
@@ -76,11 +78,19 @@ class Dimensions:
 
     @classmethod
     def from_dict(cls, data: dict, default_unit: str = "mm", rounding: Rounding = Rounding.NEAREST) -> "Dimensions":
-        return cls(
+        return cls._read(
             Length.parse(data["length"], default_unit, rounding),
             Length.parse(data["width"], default_unit, rounding),
             Length.parse(data["height"], default_unit, rounding),
         )
+
+    @classmethod
+    def _read(cls, length: Length, width: Length, height: Length) -> "Dimensions":
+        """Sides read from the caller's input, where a zero side is a request refusal;
+        `__post_init__` still guards the arithmetic with a plain error."""
+        if min(length.ticks, width.ticks, height.ticks) <= 0:
+            raise refused("invalid_value", "all dimensions must be positive")
+        return cls(length, width, height)
 
     @property
     def volume(self) -> int:

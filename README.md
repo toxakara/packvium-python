@@ -10,7 +10,7 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.6.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.7.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -96,8 +96,9 @@ config = PackingConfig.balanced(
 
 The result says what stopped the search: `result.termination.code` is `complete`,
 `effort_limit` (reproducible), or `time_limit` (not reproducible).
-`packvium.artifacts.replay_level(result.to_dict())` gives the same verdict as `exact` or
-`not_guaranteed`. `reproducibility.py` shows four simulated machines giving four
+`replay_level(result.to_dict())`, imported with `from packvium.artifacts import
+replay_level` (a submodule `import packvium` does not load), gives the same verdict as
+`exact` or `not_guaranteed`. `reproducibility.py` shows four simulated machines giving four
 different answers under a clock, and one answer under a budget.
 
 ## Solver profiles
@@ -112,9 +113,14 @@ tries:
 | `quality` | More solvers and orderings, a beam over container choices, and exact search for small orders. Slower. |
 | `exact_small` | Bounded exact search when the order has at most `exact_item_limit` items (7, counting quantity); otherwise the same search as `balanced`. |
 
-`PackingConfig.fast()`, `.balanced()`, `.quality()` and `.exact_small()` default to time
-limits of 0.2, 1, 5 and 10 seconds; a JSON request defaults to 1 second whatever the
-profile. An `effort_budget` makes any of them reproducible.
+The JSON path and the `PackingConfig` constructors share a profile's solvers but not all of
+its defaults. A JSON request defaults to 1 second, 8 item orderings (1 under `fast`) and
+`alternatives: 3` (ranked answers, the winner included) whatever the profile.
+`PackingConfig.fast()`, `.balanced()`, `.quality()` and `.exact_small()` default to 0.2, 1, 5
+and 10 seconds; `.fast()` keeps 1 ranked answer, and `.quality()` runs 24 orderings and keeps
+5, so `"solver_profile": "quality"` in JSON searches
+less than `PackingConfig.quality()` unless you set `multi_start_orders`, `alternatives` and
+`time_limit_ms` to match. An `effort_budget` makes any of them reproducible.
 
 ## Trucks, axles and delivery routes
 
@@ -130,8 +136,8 @@ A container can describe a vehicle, not only a box:
 
 After the solve, `safe_route_removal_order` gives an unloading order stop by stop,
 `replay_loading_order` checks the reverse as a loading order, and `placement_reachability`
-says what can be reached when the doors open. An item the axle ratings cannot carry is
-reported as `no_feasible_placement`, not as an axle problem. See `trucking.py`.
+says what can be reached when the doors open. An item the axle ratings cannot carry even
+alone in the vehicle is reported as `axle_overloaded`. See `trucking.py`.
 
 ## Errors
 
@@ -162,6 +168,27 @@ raise `UnknownObjectiveError` or `InvalidDirectionError`). A request that is
 valid but does not fit completely is not an error: the result lists what was left out, and
 why, in `unpacked_items`. `errors.py` turns all of these into HTTP responses.
 
+## Checking a result
+
+*New in 1.7.0.*
+
+`packvium.validate` checks a result against the request it answers, from the JSON documents
+alone: geometry, support and load, accounting, the result's facts and its score. It is the
+reference validator every Packvium package exports a port of, so they all return the same
+issues, code and detail:
+
+```python
+from packvium import MalformedResult, pack_from_dict, validate
+
+issues = validate(request, pack_from_dict(request))  # [] -- valid
+for issue in issues:
+    print(issue.code, issue.detail)  # e.g. collision cube#1 with cube#2 in box#1
+```
+
+It shares no code with the engine, so it judges any engine's result, not only this package's. A
+result without the documented shape raises `MalformedResult`, whose `kind` is `contract` or
+`shape`.
+
 ## Examples
 
 Runnable, in [`examples/`](https://github.com/toxakara/packvium-python/tree/main/examples),
@@ -177,7 +204,7 @@ in `constraints.py` and `limits.py` have failed you.
 | File | What it shows |
 | --- | --- |
 | [`basic.py`](https://github.com/toxakara/packvium-python/blob/main/examples/basic.py) | The smallest useful call: items in, placements out — and the three details in it that are easy to miss. |
-| [`objectives.py`](https://github.com/toxakara/packvium-python/blob/main/examples/objectives.py) | All six objectives on scenes where they genuinely disagree, including the rate card that makes the heavier shipment the cheaper one. |
+| [`objectives.py`](https://github.com/toxakara/packvium-python/blob/main/examples/objectives.py) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree, including the rate card that makes the heavier shipment the cheaper one. |
 | [`constraints.py`](https://github.com/toxakara/packvium-python/blob/main/examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused. |
 | [`limits.py`](https://github.com/toxakara/packvium-python/blob/main/examples/limits.py) | A courier fleet: a van with a fridge unit and wheel arches as obstacles, an item cap per bike, one dangerous-goods item per van, frozen goods only in a refrigerated vehicle, and a cap on vehicles. |
 | [`units.py`](https://github.com/toxakara/packvium-python/blob/main/examples/units.py) | Why there are no floats anywhere: fractional inches, exact ticks, and the one-tick difference between a fit and a refusal. |
@@ -261,7 +288,9 @@ Python 3.9 or newer. No dependencies.
 ## The Packvium family
 
 One request and result contract, implemented independently in four engines (Rust,
-Python, PHP, JavaScript) and held to identical placements on a shared fixture set.
+Python, PHP, JavaScript) and checked against each other on a shared fixture set. Python and
+PHP are held to byte-identical canonical results; Rust and the JavaScript fallback are held
+to independent validity and a per-fixture objective floor.
 Pick the package for your stack; mixing them in one system is safe.
 
 Documentation, the constraint reference and the benchmarks are at
@@ -271,7 +300,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.0"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.7"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -293,7 +322,7 @@ CodeMeta form.
 @software{packvium_python,
   author  = {{Packvium contributors}},
   title   = {Packvium for Python},
-  version = {1.6.0},
+  version = {1.7.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

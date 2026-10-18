@@ -445,6 +445,15 @@ def test_a_synthetic_loading_cycle_is_detected():
     assert not graph.is_acyclic()
 
 
+def test_a_dependency_chain_taller_than_the_recursion_limit_is_checked():
+    """An 1100-sheet stack is an 1100-long chain; the old depth-first check recursed
+    once per level. A cycle behind a tail is still found."""
+    chain = tuple(frozenset({level + 1}) for level in range(1_099)) + (frozenset(),)
+    assert UnloadingDependencyGraph(chain).is_acyclic()
+    assert LoadingDependencyGraph(chain).is_acyclic()
+    assert not UnloadingDependencyGraph((frozenset({1}), frozenset({2}), frozenset({1}))).is_acyclic()
+
+
 def test_an_unknown_direction_is_rejected_not_treated_as_minus_z():
     """The concrete bug the audit reopened this over: an unrecognised direction string
     used to fall through to `-z` silently. Checked against both graphs and both the

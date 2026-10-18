@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from ._compat import dataclass
-from decimal import Decimal
+from ._request_error import refused, refused_type
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from fractions import Fraction
 import re
@@ -15,9 +16,12 @@ class Rounding(str, Enum):
 
 
 def _fraction(value: int | str | Decimal | Fraction) -> Fraction:
+    if isinstance(value, bool):
+        # `True` is an `int` to Python and `1` to arithmetic, but never a measure anyone wrote.
+        raise refused_type("a boolean is not a measure")
     if isinstance(value, float):
         if not value.is_integer():
-            raise TypeError("float measure input is intentionally rejected; use a decimal string")
+            raise refused_type("float measure input is intentionally rejected; use a decimal string")
         value = int(value)
     if isinstance(value, Fraction):
         return value
@@ -41,8 +45,19 @@ def _fraction(value: int | str | Decimal | Fraction) -> Fraction:
     # silently different accepted range between the two is exactly the kind of divergence
     # this library exists to avoid. Eighteen digits is far past what a tick can express.
     if decimal and decimal.group(1) and len(decimal.group(1)) > 18:
-        raise ValueError("decimal has more fractional digits than a tick can distinguish")
-    return Fraction(Decimal(text))
+        raise refused("wrong_type", "decimal has more fractional digits than a tick can distinguish")
+    try:
+        return Fraction(Decimal(text))
+    except InvalidOperation as error:
+        raise refused("wrong_type", f"invalid decimal or fraction: {text}") from error
+
+
+def _non_negative(ticks: int, kind: str) -> int:
+    """A measure read from the caller's input; `__post_init__` still guards the arithmetic,
+    where a negative value is a defect rather than a caller's mistake."""
+    if ticks < 0:
+        raise refused("negative_measure", f"{kind} cannot be negative")
+    return ticks
 
 
 def _rounded(value: Fraction, rounding: Rounding) -> int:
@@ -61,6 +76,12 @@ def _rounded(value: Fraction, rounding: Rounding) -> int:
     if doubled > denominator:
         return sign * (quotient + 1)
     return sign * (quotient if quotient % 2 == 0 else quotient + 1)
+
+
+#: The unit codes the request schema names wherever it asks for a unit by itself (an output
+#: unit, a dimensional-weight unit). A measure's own unit may also be spelt out ("inch").
+LENGTH_UNIT_CODES = ("mm", "cm", "m", "in", "ft")
+WEIGHT_UNIT_CODES = ("mg", "g", "kg", "oz", "lb")
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -92,8 +113,8 @@ class Length:
     def of(cls, value: int | str | Decimal | Fraction, unit: str = "mm", rounding: Rounding = Rounding.NEAREST) -> "Length":
         key = unit.lower().strip()
         if key not in cls._MULTIPLIERS:
-            raise ValueError(f"unsupported length unit: {unit}")
-        return cls(_rounded(_fraction(value) * cls._MULTIPLIERS[key], rounding))
+            raise refused("invalid_unit", f"unsupported length unit: {unit}")
+        return cls(_non_negative(_rounded(_fraction(value) * cls._MULTIPLIERS[key], rounding), "length"))
 
     @classmethod
     def mm(cls, value: Any, rounding: Rounding = Rounding.NEAREST) -> "Length":
@@ -113,7 +134,7 @@ class Length:
             # A fraction in binary floating point is not the decimal the caller wrote; an
             # integral float is exact, and JavaScript cannot send anything else for `100`.
             if not value.is_integer():
-                raise TypeError("float length input is intentionally rejected; use a decimal string")
+                raise refused_type("float length input is intentionally rejected; use a decimal string")
             value = int(value)
         if isinstance(value, str):
             match = re.fullmatch(r"(.+?)\s*(mm|cm|m|in|inch|inches|ft|ticks?)", value.strip(), re.I)
@@ -164,8 +185,8 @@ class Weight:
     def of(cls, value: Any, unit: str = "g", rounding: Rounding = Rounding.NEAREST) -> "Weight":
         key = unit.lower().strip()
         if key not in cls._MULTIPLIERS:
-            raise ValueError(f"unsupported weight unit: {unit}")
-        return cls(_rounded(_fraction(value) * cls._MULTIPLIERS[key], rounding))
+            raise refused("invalid_unit", f"unsupported weight unit: {unit}")
+        return cls(_non_negative(_rounded(_fraction(value) * cls._MULTIPLIERS[key], rounding), "weight"))
 
     @classmethod
     def parse(cls, value: Any, default_unit: str = "g", rounding: Rounding = Rounding.NEAREST) -> "Weight":
@@ -177,7 +198,7 @@ class Weight:
             # A fraction in binary floating point is not the decimal the caller wrote; an
             # integral float is exact, and JavaScript cannot send anything else for `100`.
             if not value.is_integer():
-                raise TypeError("float weight input is intentionally rejected; use a decimal string")
+                raise refused_type("float weight input is intentionally rejected; use a decimal string")
             value = int(value)
         if isinstance(value, str):
             match = re.fullmatch(r"(.+?)\s*(mg|kg|g|oz|lbs?|ticks?)", value.strip(), re.I)
@@ -192,3 +213,13 @@ class Weight:
 
     def to_dict(self, unit: str = "g") -> dict[str, int | str]:
         return {"ticks": self.ticks, "value": self.decimal(unit), "unit": unit}
+
+
+def output_length_unit(request_unit: str) -> str:
+    """The output unit a request without `output.length_unit` is written in.
+
+    The request's own `units.length`, spelt as the schema's output code: case and surrounding
+    space are ignored and a spelt-out name folds to its code (`"Inches"` is `in`). A unit no
+    output code names -- the internal `tick` -- gives `mm`, the default of both blocks."""
+    multiplier = Length._MULTIPLIERS.get(request_unit.lower().strip())
+    return next((code for code in LENGTH_UNIT_CODES if Length._MULTIPLIERS[code] == multiplier), "mm")

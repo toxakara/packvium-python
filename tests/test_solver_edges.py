@@ -394,6 +394,13 @@ def blocks(box: Container, instances, deadline: Deadline | None = None, **config
                                              SearchStats(), deadline or generous())
 
 
+def greedy_blocks(box: Container, instances, **config):
+    """The block solver without `quality`'s lookahead: one greedy pass per mode."""
+    config.setdefault("container_plan_node_limit", 100_000)
+    return HomogeneousBlockSolver().pack_one(box, 1, instances, PackingConfig.balanced(**config),
+                                             SearchStats(), generous())
+
+
 def test_the_block_solver_places_nothing_once_the_deadline_has_passed():
     instances = items_of([item("a", 50, 50, 50, quantity=2)])
     solution = blocks(container("c", 100, 100, 100), instances, expired())
@@ -524,12 +531,23 @@ def _resting_share(placements, placement) -> float:
 
 
 def test_a_block_set_on_a_smaller_one_reports_the_support_it_really_has():
-    solution = blocks(container("crate", 100, 100, 100, quantity=1), _a_base_and_three_tops())
+    # The greedy pass sets the base on two tops; `quality`'s lookahead finds a layout with
+    # no overhang at all, so the greedy pass is the one that exercises the report.
+    solution = greedy_blocks(container("crate", 100, 100, 100, quantity=1), _a_base_and_three_tops())
     base, = [p for p in solution.state.placements if p.instance.item.id == "base"]
     assert base.envelope_origin.z > 0
     assert base.support_ratio == pytest.approx(5 / 6)
     assert base.support_ratio == _resting_share(solution.state.placements, base)
     assert {p.support_ratio for p in solution.state.placements if p.envelope_origin.z == 0} == {1.0}
+
+
+def test_the_quality_lookahead_finds_a_layout_with_nothing_overhanging():
+    box = container("crate", 100, 100, 100, quantity=1)
+    greedy = greedy_blocks(box, _a_base_and_three_tops())
+    looked = blocks(box, _a_base_and_three_tops())
+    assert not looked.unpacked and not looked.time_limit_reached
+    assert {p.support_ratio for p in looked.state.placements} == {1.0}
+    assert looked.state.max_z < greedy.state.max_z
 
 
 def test_the_block_solver_leaves_a_request_that_asks_for_support_to_the_per_item_search():

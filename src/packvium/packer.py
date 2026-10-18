@@ -8,6 +8,7 @@ from .extensions import (ExtensionRegistry, SolutionScorer, UnknownObjectiveErro
                          resolve_objective_scorer, unpriceable_container)
 from .fixed_placements import admit_fixed_placements
 from .models import Container, Item, PackingRequest, UnratedWeightError
+from .request_objects import check_objects
 from .result import AlgorithmReport, PackingResult, PackingStatus
 from .result import aggregate_termination, unsupported_placements_warning
 from .solvers import Deadline, SolverOrchestrator
@@ -34,7 +35,11 @@ class Packer:
         self.trace = trace
 
     def pack(self, items, containers, fixed_placements=()) -> PackingResult:
-        request = PackingRequest(tuple(items), tuple(containers), tuple(fixed_placements))
+        items, containers, fixed_placements = tuple(items), tuple(containers), tuple(fixed_placements)
+        # The JSON path's rules, with the JSON path's reason and field: a request
+        # built from objects is refused exactly where the same request as JSON would be.
+        check_objects(items, containers, self.config, fixed_placements)
+        request = PackingRequest(items, containers, fixed_placements)
         # Both weight objectives price the same billed weight, so both need the divisor
         # up front -- a wrong guess would silently misprice every shipment. And rating
         # some containers while others carry no tariff would rank a priced packing

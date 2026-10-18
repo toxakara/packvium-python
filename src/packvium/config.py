@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from ._request_error import refused
 from ._compat import dataclass
 from enum import Enum
 
 from .effort import EffortBudget
-from .units import Length
+from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length
 
 
 class SolverProfile(str, Enum):
@@ -69,14 +70,21 @@ class PackingConfig:
                 or self.multi_start_orders <= 0 or self.max_candidates_per_item <= 0
                 or self.parallel_starts <= 0 or self.container_plan_beam_width <= 0
                 or self.container_plan_node_limit <= 0):
-            raise ValueError("positive configuration values required")
+            raise refused("below_minimum", "positive configuration values required")
         if self.max_containers is not None and self.max_containers < 1:
-            raise ValueError("max_containers must be at least 1")
+            raise refused("below_minimum", "max_containers must be at least 1")
         if self.max_candidate_points < 16:
-            raise ValueError("max_candidate_points must be at least 16")
-        if not 0 <= self.minimum_support_ratio <= 1: raise ValueError("minimum_support_ratio must be between 0 and 1")
+            raise refused("below_minimum", "max_candidate_points must be at least 16")
+        if not 0 <= self.minimum_support_ratio <= 1:
+            ratio = self.minimum_support_ratio
+            reason = "below_minimum" if ratio < 0 else "above_maximum" if ratio > 1 else "invalid_value"
+            raise refused(reason, "minimum_support_ratio must be between 0 and 1")
         if self.dimensional_weight_divisor is not None and self.dimensional_weight_divisor <= 0:
-            raise ValueError("dimensional_weight_divisor must be positive")
+            raise refused("below_minimum", "dimensional_weight_divisor must be positive")
+        for name, allowed in (("dimensional_weight_length_unit", LENGTH_UNIT_CODES),
+                              ("dimensional_weight_weight_unit", WEIGHT_UNIT_CODES)):
+            if getattr(self, name) not in allowed:
+                raise refused("not_allowed", f"{name} must be one of {list(allowed)}")
 
     @classmethod
     def fast(cls, time_limit_ms: int = 200, **kwargs) -> "PackingConfig":

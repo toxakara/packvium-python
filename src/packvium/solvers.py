@@ -16,12 +16,12 @@ from .effort import EffortBudget
 # `_grams` rather than a local ceil-div: the round-up from ticks to whole grams is the
 # published billing rule, and a second copy of it could drift a bracket.
 from .extensions import UNPRICEABLE_MINOR, _grams
-from .constraints import (AxleLoadConstraint, CompatibilityConstraint, ConstraintContext,
+from .constraints import (AxleLoadConstraint, CompatibilityConstraint, ConstraintContext, ConstraintResult,
                           ContainerEligibilityConstraint, FloorConstraint, LoadUnit, PlacementConstraint,
                           RIDES_THE_WHOLE_ROUTE, RouteOrderConstraint,
                           StopAccessibilityConstraint, SupportConstraint,
                           TagCountConstraint, TopLoadConstraint, active_constraints, direct_support_view,
-                          load_units, top_loads, usable_volume)
+                          is_position_independent, load_units, top_loads, usable_volume)
 from . import bounds, hull, made_to_measure
 from .geometry import (AxisAlignedBox, Dimensions, Point, Rotation, ShapeType,
                        dimensional_weight)
@@ -219,12 +219,13 @@ class ContainerState:
 
     __slots__ = ("container", "sequence", "placements", "points", "ordered_points", "payload_ticks", "used_volume_ticks",
                  "stack_sensitive", "route_sensitive", "compression_sensitive", "max_x", "max_y", "max_z", "occupied", "bounds", "index", "hull_shapes",
-                 "lattice_summary", "lattice_items")
+                 "lattice_summary", "lattice_items", "_placed")
 
     def __init__(self, container: Container, sequence: int):
         self.container = container
         self.sequence = sequence
         self.placements: list[Placement] = []
+        self._placed: tuple[Placement, ...] | None = None
         self.payload_ticks = 0
         self.used_volume_ticks = 0
         self.stack_sensitive = False
@@ -263,6 +264,9 @@ class ContainerState:
         other.container = self.container
         other.sequence = self.sequence
         other.placements = list(self.placements)
+        # The same placements, so the same tuple: a copy that adds nothing keeps serving
+        # the constraint caches keyed on it.
+        other._placed = self._placed
         other.points = dict(self.points)
         other.ordered_points = list(self.ordered_points)
         other.payload_ticks = self.payload_ticks
@@ -278,6 +282,18 @@ class ContainerState:
         other.lattice_summary = self.lattice_summary
         other.lattice_items = self.lattice_items
         return other
+
+    @property
+    def frozen_placements(self) -> tuple[Placement, ...]:
+        """`placements` as a tuple that keeps its identity until the next placement.
+
+        The support and corridor caches in `constraints.py` key on the identity of the
+        placement tuple they are handed. A fresh `tuple()` per candidate search made every
+        search a miss, and the maximal-space solver searches once per free space.
+        """
+        if self._placed is None:
+            self._placed = tuple(self.placements)
+        return self._placed
 
     @property
     def placement_count(self) -> int:
@@ -311,6 +327,7 @@ class ContainerState:
         else:
             self.used_volume_ticks += used_volume_delta(self.placements, placement)
         self.placements.append(placement)
+        self._placed = None
         self.payload_ticks += placement.instance.weight.ticks
         item = placement.instance.item
         self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
@@ -359,6 +376,7 @@ class ContainerState:
         else:
             self.used_volume_ticks += used_volume_delta(self.placements, placement)
         self.placements.append(placement)
+        self._placed = None
         self.payload_ticks += placement.instance.weight.ticks
         item = placement.instance.item
         self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
@@ -512,6 +530,23 @@ def _axle_balanced_points(state: ContainerState, item: ItemInstance, forms: Sequ
     return points
 
 
+def _append_unseen(points: Sequence[Point], extra: Sequence[Point]) -> list[Point]:
+    """``points`` then the ``extra`` points not already offered, keeping their order (S20).
+
+    A repeated point is the same candidate scanned twice: it can change nothing but the
+    counted effort. O(k + a) for ``k`` offered and ``a`` extra points.
+    """
+    fresh = {(point.x, point.y, point.z) for point in extra}
+    fresh.difference_update((point.x, point.y, point.z) for point in points)
+    appended = [*points]
+    for point in extra:
+        key = (point.x, point.y, point.z)
+        if key in fresh:
+            fresh.discard(key)
+            appended.append(point)
+    return appended
+
+
 def _nesting_points(state: ContainerState, item: ItemInstance) -> list[Point]:
     """Origins where ``item`` sinks into an existing identical footprint.
 
@@ -530,6 +565,23 @@ def _nesting_points(state: ContainerState, item: ItemInstance) -> list[Point]:
     }
     return [Point(x, y, z) for x, y, z in sorted(points, key=lambda point: (point[2], point[1], point[0]))
             if z >= 0]
+
+
+def _once_per_search(evaluate: Callable[[ConstraintContext], ConstraintResult]) -> Callable[[ConstraintContext], ConstraintResult]:
+    """`evaluate`, asked on the first call and answered from that verdict afterwards.
+
+    Only for a rule `is_position_independent` admits: its verdict reads the item, the
+    container and the placements, which one candidate search holds fixed.
+    """
+    verdict: ConstraintResult | None = None
+
+    def cached(context: ConstraintContext) -> ConstraintResult:
+        nonlocal verdict
+        if verdict is None:
+            verdict = evaluate(context)
+        return verdict
+
+    return cached
 
 
 def find_candidates(state: ContainerState, item: ItemInstance, config: PackingConfig, constraints: Sequence[PlacementConstraint], stats: SearchStats, deadline: Deadline, max_candidates: int | None = None, points: Sequence[Point] | None = None) -> list[Candidate]:
@@ -573,7 +625,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                  if exact_hull else None)
         forms.append((rotation, physical, envelope, envelope.length.ticks, envelope.width.ticks,
                       envelope.height.ticks, shape))
-    placed = tuple(state.placements)
+    placed = state.frozen_placements
     stack_sensitive = (state.stack_sensitive
                        or is_stack_sensitive(item.item)
                        or container.max_stack_density is not None)
@@ -589,14 +641,18 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     # Everything that decides whether a rule can fire is fixed for this call, so the chain
     # is pruned once here rather than answered "allow" once per position. The support rule
     # stays in regardless: `support_checks` counts every time the chain reaches it.
-    active = [(constraint, isinstance(constraint, SupportConstraint))
-              for constraint in active_constraints(constraints, container, item, stack_sensitive, route_sensitive)]
+    chain = active_constraints(constraints, container, item, stack_sensitive, route_sensitive)
+    # A rule that reads no position answers the same at every (point, rotation) of this
+    # search, so it is asked once, by the first position that reaches it.
+    active = [(_once_per_search(constraint.evaluate) if is_position_independent(constraint) else constraint.evaluate,
+               isinstance(constraint, SupportConstraint), type(constraint).__name__)
+              for constraint in chain]
     # A built-in support rule that cannot apply to this item allows every position, so a
     # chain of nothing else would only count: each position adds one support check per
     # rule, and no context is built for it. Exact types, as in `active_constraints`.
     inert_chain = all(type(constraint) is SupportConstraint and not constraint.applies_to(item)
-                      for constraint, _ in active)
-    inert_support_checks = len(active)
+                      for constraint in chain)
+    inert_support_checks = len(chain)
     tracing = trace.active()
     if points is None:
         if item.item.nesting_height is None:
@@ -606,7 +662,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                       for point in (*state.ordered_points, *_nesting_points(state, item))}
             ordered = sorted(merged.values(), key=lambda point: (point.z, point.y, point.x))[:config.max_candidate_points]
         if container.axles is not None:
-            ordered = [*ordered, *_axle_balanced_points(state, item, forms, limit_x)]
+            ordered = _append_unseen(ordered, _axle_balanced_points(state, item, forms, limit_x))
     else:
         ordered = sorted(points, key=lambda p: (p.z, p.y, p.x))
     candidates: list[Candidate] = []
@@ -669,13 +725,13 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
             else:
                 context = ConstraintContext(container, placed, item, point, rotation, physical, envelope, stack_sensitive, route_sensitive)
                 rejected = False
-                for constraint, counts_support in active:
+                for evaluate, counts_support, constraint_name in active:
                     if counts_support:
                         stats.support_checks += 1
-                    result = constraint.evaluate(context)
+                    result = evaluate(context)
                     if not result.allowed:
                         if tracing:
-                            trace.emit({"type": "placement_rejection", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "constraint": type(constraint).__name__, "code": result.code})
+                            trace.emit({"type": "placement_rejection", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "constraint": constraint_name, "code": result.code})
                         rejected = True
                         break
                 if rejected: continue
@@ -1028,7 +1084,10 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
                     expansions.extend((child, unplaced) for child in children)
                 else:
                     expansions.append((state, (*unplaced, *batch)))
-            expansions.sort(key=lambda node: _node_key(node, by_volume=by_volume))
+            # A one-node beam has nothing to order, and its key builds an O(m) signature
+            # string -- once per batch on every width-1 greedy solve.
+            if len(expansions) > 1:
+                expansions.sort(key=lambda node: _node_key(node, by_volume=by_volume))
             beam = expansions[:branch_width]
             if exhausted:
                 state, unplaced = beam[0]
@@ -1642,6 +1701,10 @@ class HomogeneousBlockSolver:
             solution = self._pack_mode(
                 container, sequence, items, config, stats, deadline, mode, lattices
             )
+            if config.profile.value == "quality" and not deadline.expired:
+                solution = self._lookahead(
+                    container, sequence, items, config, stats, deadline, mode, lattices, solution
+                )
             reached = reached or solution.time_limit_reached
             by_volume = _ranks_by_volume(config)
             if best is None or self._solution_key(solution, by_volume) < self._solution_key(best, by_volume):
@@ -1704,9 +1767,9 @@ class HomogeneousBlockSolver:
         return (len(solution.unpacked), -state.used_volume_ticks, state.max_z, signature)
 
     @staticmethod
-    def _better_block(best, mode, space, space_volume, item_id, rotation, physical, envelope,
-                      nx, ny, nz, count):
-        """`best`, or this group's winning block when its key ranks strictly ahead."""
+    def _block(mode, space, space_volume, item_id, rotation, physical, envelope,
+               nx, ny, nz, count):
+        """A group's winning block with the key the mode ranks it by, smaller first."""
         used_volume = count * physical.volume
         space_fill_ppm = used_volume * 1_000_000 // space_volume
         if mode == "count":
@@ -1715,8 +1778,6 @@ class HomogeneousBlockSolver:
             lead = (-used_volume, -space_fill_ppm, -count)
         score = (*lead, space.origin.z, space.origin.y, space.origin.x, item_id, rotation.value,
                  nx, ny, nz)
-        if best is not None and not score < best.score:
-            return best
         return _HomogeneousBlock(space, item_id, rotation, physical, envelope,
                                  nx, ny, nz, count, used_volume, score)
 
@@ -1748,32 +1809,114 @@ class HomogeneousBlockSolver:
         for instance in items:
             remaining.setdefault(instance.item.id, []).append(instance)
         forms = {item_id: self._forms(available[0], config) for item_id, available in remaining.items()}
-        nodes = 0
+        solution, _, reached = self._complete(
+            container, state, spaces, remaining, forms, config, stats, deadline, mode,
+            lattices, 0,
+        )
+        return SingleContainerSolution(
+            solution.state, solution.unpacked, False, reached or deadline.expired
+        )
+
+    def _complete(self, container, state, spaces, remaining, forms, config, stats, deadline,
+                  mode, lattices, nodes):
+        """Commit each round's leading block until nothing more fits; mutates its inputs.
+
+        Returns the solution, the mode's node count after it, and whether a limit stopped
+        it (a stopped round commits nothing)."""
         reached = False
         while spaces and any(remaining.values()):
-            best, nodes, reached = self._next_block(
+            leading, nodes, reached = self._leading_blocks(
                 container, state, spaces, remaining, forms, config, stats, deadline, mode,
-                lattices, nodes,
+                lattices, nodes, 1,
             )
-            if best is None or reached:
+            if not leading or reached:
                 break
-            self._commit(state, best, remaining, config, stats)
-            spaces = subtract_all(spaces, [best.box], stats)
+            self._commit(state, leading[0], remaining, config, stats)
+            spaces = subtract_all(spaces, [leading[0].box], stats)
         unpacked = tuple(
             instance
             for item_id in sorted(remaining)
             for instance in remaining[item_id]
         )
-        return SingleContainerSolution(state, unpacked, False, reached or deadline.expired)
+        return SingleContainerSolution(state, unpacked, False, reached), nodes, reached
 
-    def _next_block(self, container, state, spaces, remaining, forms, config, stats, deadline,
-                    mode, lattices, nodes):
-        """One round's winning block, the mode's node count after it, and whether a limit
-        stopped the round (which then commits nothing)."""
+    def _lookahead(self, container, sequence, items, config, stats, deadline, mode, lattices,
+                   greedy):
+        """`greedy`, or a better answer from completing each round's leading blocks.
+
+        Each round ranks its `BLOCK_LOOKAHEAD_WIDTH` leading blocks, completes each one
+        greedily on a copy, and commits the block whose completion ranks best. The greedy
+        answer is the first completion, so the result is never worse than it. The round's
+        first block is the greedy choice after the block committed last, so its completion is
+        the one already known and is not recomputed -- unless the greedy pass was stopped by
+        `container_plan_node_limit`, when the first round completes it under the lookahead's
+        larger budget. The work is counted against its own
+        budget of `BLOCK_LOOKAHEAD_NODE_FACTOR * container_plan_node_limit` lattice nodes;
+        when that runs out the best completion so far stands, and only the deadline or the
+        effort budget marks the answer as stopped by a limit.
+        """
+        budget = replace(config, container_plan_node_limit=(
+            config.container_plan_node_limit * BLOCK_LOOKAHEAD_NODE_FACTOR))
+        by_volume = _ranks_by_volume(config)
+        state = ContainerState(container, sequence)
+        spaces = [Space(Point(0, 0, 0), container.inner_dimensions)]
+        remaining: dict[str, list[ItemInstance]] = {}
+        for instance in items:
+            remaining.setdefault(instance.item.id, []).append(instance)
+        forms = {item_id: self._forms(available[0], config) for item_id, available in remaining.items()}
+        best, best_key = greedy, self._solution_key(greedy, by_volume)
+        known: SingleContainerSolution | None = None if greedy.time_limit_reached else greedy
+        nodes = 0
+        while spaces and any(remaining.values()):
+            leading, nodes, reached = self._leading_blocks(
+                container, state, spaces, remaining, forms, budget, stats, deadline, mode,
+                lattices, nodes, BLOCK_LOOKAHEAD_WIDTH,
+            )
+            if not leading or reached:
+                break
+            chosen: tuple[tuple, SingleContainerSolution, _HomogeneousBlock] | None = (
+                None if known is None else (self._solution_key(known, by_volume), known, leading[0])
+            )
+            for block in leading if known is None else leading[1:]:
+                trial, nodes, reached = self._completion(
+                    container, state, spaces, remaining, forms, budget, stats, deadline, mode,
+                    lattices, nodes, block,
+                )
+                if reached:
+                    break
+                trial_key = self._solution_key(trial, by_volume)
+                if chosen is None or trial_key < chosen[0]:
+                    chosen = (trial_key, trial, block)
+            if reached or chosen is None:
+                break
+            chosen_key, known, block = chosen
+            if chosen_key < best_key:
+                best, best_key = known, chosen_key
+            self._commit(state, block, remaining, config, stats)
+            spaces = subtract_all(spaces, [block.box], stats)
+        return SingleContainerSolution(
+            best.state, best.unpacked, False, best.time_limit_reached or deadline.expired
+        )
+
+    def _completion(self, container, state, spaces, remaining, forms, config, stats, deadline,
+                    mode, lattices, nodes, block):
+        """The greedy completion after committing `block`, on copies of the round's state."""
+        trial_state = state.copy()
+        trial_remaining = {item_id: list(available) for item_id, available in remaining.items()}
+        self._commit(trial_state, block, trial_remaining, config, stats)
+        return self._complete(
+            container, trial_state, subtract_all(spaces, [block.box], stats), trial_remaining,
+            forms, config, stats, deadline, mode, lattices, nodes,
+        )
+
+    def _leading_blocks(self, container, state, spaces, remaining, forms, config, stats, deadline,
+                        mode, lattices, nodes, leaders):
+        """One round's `leaders` leading blocks, best first, the mode's node count after them,
+        and whether a limit stopped the round (which then commits nothing)."""
         node_limit = config.container_plan_node_limit
         node_ceiling = deadline._search_node_ceiling(stats)
         by_count = mode == "count"
-        best: _HomogeneousBlock | None = None
+        leading: list[_HomogeneousBlock] = []
         # Capacity reads only the committed state, so it is fixed for the whole round.
         types = []
         for item_id in sorted(remaining):
@@ -1798,7 +1941,7 @@ class HomogeneousBlockSolver:
                     # stopping. Only a wall-clock expiry inside a group is seen at the next
                     # group instead, and any stop discards the whole round anyway.
                     if nodes >= node_limit or deadline.expired:
-                        return best, nodes, True
+                        return leading, nodes, True
                     key = (columns, rows, height // step_z, capacity)
                     lattice = lattices.get(key)
                     if lattice is None:
@@ -1811,18 +1954,24 @@ class HomogeneousBlockSolver:
                         budget = min(budget, node_ceiling - stats.search_nodes_expanded)
                     if group_nodes > budget:
                         stats.search_nodes_expanded += budget
-                        return best, nodes + budget, True
+                        return leading, nodes + budget, True
                     nodes += group_nodes
                     stats.search_nodes_expanded += group_nodes
                     # The key's first field is `-count` or `-used_volume`; a group that
-                    # loses on it loses on the key, so its key is never built.
-                    if count and (best is None
-                                  or (-count if by_count else -count * volume) <= best.score[0]):
-                        best = self._better_block(
-                            best, mode, space, space_volume, item_id, rotation, physical,
+                    # loses on it to the last kept block loses on the key, so its key is
+                    # never built.
+                    full = len(leading) == leaders
+                    if count and (not full
+                                  or (-count if by_count else -count * volume) <= leading[-1].score[0]):
+                        block = self._block(
+                            mode, space, space_volume, item_id, rotation, physical,
                             envelope, nx, ny, nz, count,
                         )
-        return best, nodes, False
+                        if not full or block.score < leading[-1].score:
+                            leading.append(block)
+                            leading.sort(key=lambda kept: kept.score)
+                            del leading[leaders:]
+        return leading, nodes, False
 
     def _commit(self, state, best, remaining, config, stats) -> None:
         """Place every member of the chosen block, bottom layer first."""
@@ -1944,7 +2093,6 @@ class ExactSmallSolver:
                 return
             stats.search_nodes_expanded += 1
             state_count = len(state.placements)
-            best_count = len(best.placements)
             candidate_rank = state_rank(state, state_volume)
             if candidate_rank < best_rank:
                 best = state
@@ -2181,6 +2329,14 @@ def _start_config(order_name: str, config: PackingConfig) -> PackingConfig:
         )
     return config
 
+
+#: Leading blocks the `quality` block lookahead completes in each round. Four
+#: improved 71 of 73 BR answers and worsened none at 12% more Python CPU; two improved 60 at
+#: 6%, eight 72 at 24% (docs/PERFORMANCE-PRACTICE.md).
+BLOCK_LOOKAHEAD_WIDTH = 4
+#: The lookahead's lattice-node budget per mode, as a multiple of `container_plan_node_limit`.
+#: The largest BR7 instance measured needed 47 times the `quality` default.
+BLOCK_LOOKAHEAD_NODE_FACTOR = 64
 
 #: Lattice nodes the block start added to `fast` and `balanced` may enumerate per mode --
 #: the bound `quality` gives the same solver through `container_plan_node_limit`.

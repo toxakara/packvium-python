@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from packvium import AxisAlignedBox, Dimensions, Length, Point, Rotation, Weight, dimensional_weight
+from packvium import (AxisAlignedBox, Dimensions, InvalidRequestError, Length, Point, Rotation, Weight,
+                      dimensional_weight)
 
 
 def box(x, y, z, length, width, height) -> AxisAlignedBox:
@@ -23,6 +24,15 @@ def test_dimensions_must_be_positive():
     for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0)):
         with pytest.raises(ValueError):
             Dimensions(Length(bad[0]), Length(bad[1]), Length(bad[2]))
+
+
+def test_a_zero_side_read_from_input_is_a_request_refusal():
+    for read in (lambda: Dimensions.mm(1, 0, 1),
+                 lambda: Dimensions.from_dict({"length": "1", "width": "1", "height": "0"})):
+        with pytest.raises(InvalidRequestError) as caught:
+            read()
+        assert (caught.value.reason, caught.value.field) == ("invalid_value", "")
+        assert str(caught.value) == "all dimensions must be positive"
 
 
 def test_derived_measures():

@@ -60,6 +60,11 @@ def require_fixed_placement_shapes(raw: Any, unit: str = "mm") -> List[Mapping[s
     return raw
 
 
+def orientation_rule() -> str:
+    """The orientation rule as the request-error tables word a closed vocabulary."""
+    return f"must be one of {json_spelling(list(ORIENTATIONS))}"
+
+
 def _malformed(detail: str, field: str) -> FixedPlacementError:
     return FixedPlacementError(detail, "malformed", field)
 
@@ -77,7 +82,7 @@ def _require_entry_shape(entry: Any, where: str, field: str, unit: str) -> None:
         if not isinstance(entry[name], str) or not entry[name]:
             raise _malformed(f"{where}.{name} is a non-empty string", f"{field}/{name}")
     if entry["orientation"] not in ORIENTATIONS:
-        raise _malformed(f"{where}.orientation is one of the six codes", f"{field}/orientation")
+        raise _malformed(f"{where}.orientation {orientation_rule()}", f"{field}/orientation")
     instance = json_integer(entry.get("container_instance", 1))
     if instance is None or instance < 1:
         raise _malformed(f"{where}.container_instance counts from 1", f"{field}/container_instance")

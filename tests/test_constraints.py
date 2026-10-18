@@ -210,13 +210,10 @@ def test_nested_support_replacement_restores_canonical_index_order():
     assert graph.children(2) == (0, 1)
 
 
-def test_a_nesting_predecessor_takes_its_place_in_the_surface_order():
-    """A face seen before the predecessor keeps its position, it does not move behind it.
-
-    `direct_support_view` promises placement-index order, and the replacement inserts
-    the predecessor rather than appending it. Ordering is what makes two engines agree
-    on which supporter a rejection names, so it is a contract, not a detail.
-    """
+def test_a_nesting_predecessor_is_the_only_supporter_beside_a_face_at_the_same_height():
+    """A shelf whose top is level with the candidate's base but which lies beside it
+    carries nothing, so the immediate nesting predecessor is the one supporter. Since
+    the view no longer keeps such level faces as corner surfaces either."""
     crate = Item.create("crate", Dimensions.mm(10, 10, 10), quantity=2,
                         nesting_height=Length.mm(5), minimum_support_ratio=1.0)
     predecessor, candidate = crate.instances()
@@ -226,7 +223,6 @@ def test_a_nesting_predecessor_takes_its_place_in_the_surface_order():
 
     support = direct_support_view(placements, candidate, resting.envelope_box)
 
-    assert [surface.origin.x for surface in support.surfaces] == [Length.mm(20).ticks, 0]
     assert [entry.index for entry in support.supporters] == [1]
 
 
@@ -748,6 +744,15 @@ def test_a_stack_limit_met_exactly_is_not_exceeded():
     assert stack_limit_exceeded(column) is None
 
 
+def test_a_stack_taller_than_the_recursion_limit_is_counted_without_recursing():
+    """1100 sheets one tick high: the audit's reproduction (S3) at the constraint level,
+    where a full solve of the same request takes many seconds. The old walk spent one
+    frame per level and raised RecursionError here."""
+    column = tuple(unit(0, 0, level, 10, 10, 1, stack_limit=5_000, label=f"s{level}") for level in range(1_100))
+    assert stacked_counts(column) == [1_099 - level for level in range(1_100)]
+    assert stack_limit_exceeded(column) is None
+
+
 def test_a_third_item_over_the_stack_limit_is_refused():
     base = placed(instance_of("base", max_stacked_items=1))
     middle = placed(instance_of("middle"), z=160_000)
@@ -1058,6 +1063,23 @@ def test_covered_is_satisfied_when_supporters_cover_all_four_corners():
         placed(left, x=0, y=0), placed(right, x=800_000, y=0),
     ))
     assert SupportConstraint(0.0).evaluate(resting).allowed
+
+
+def test_covered_counts_only_boxes_the_candidate_actually_rests_on():
+    """The audit's three-box case (S4): `a` carries the front half of the candidate,
+    `b` and `c` touch its two back corners with zero overlap area. Corners touched only
+    by a zero-area neighbour hang, so this is refused, as the validators refuse it."""
+    mm = Length.mm(1).ticks
+    front, = Item.create("a", Dimensions.mm(10, 5, 10)).instances()
+    left, = Item.create("b", Dimensions.mm(10, 10, 10)).instances()
+    right, = Item.create("c", Dimensions.mm(10, 10, 10)).instances()
+    candidate = instance_of("top", 10, 10, 10, ground_contact_rule="covered")
+    resting = context(candidate, x=10 * mm, z=10 * mm, placements=(
+        placed(front, x=10 * mm), placed(left, y=10 * mm), placed(right, x=20 * mm, y=10 * mm),
+    ))
+    result = SupportConstraint(0.0).evaluate(resting)
+    assert not result.allowed and result.code == "ground_contact_violation"
+    assert result.detail == "covered: 1 supporter(s), not all four corners touched"
 
 
 def test_single_rejects_a_candidate_split_across_two_supporters():
@@ -1382,6 +1404,19 @@ def test_the_blocked_item_and_its_blocker_are_both_named():
     code, detail = route_order_violated(column, [0.0, 1.0])
     assert code == "unloading_order_violation"
     assert "base" in detail and "top" in detail
+
+
+def test_the_first_blocker_named_is_the_lowest_index_not_the_first_reached():
+    """`left` rests on `base` and carries `high`; `right` rests on `base` beside it. Both
+    `high` and `right` block `base`, and the walk reaches `high` first through `left`.
+    The detail names the lowest index so PHP and Python agree (S16)."""
+    scene = (
+        unit(0, 0, 0, 20, 10, 10, label="base"),
+        unit(0, 0, 10, 10, 10, 10, label="left"),
+        unit(10, 0, 10, 10, 10, 10, label="right"),
+        unit(0, 0, 20, 10, 10, 10, label="high"),
+    )
+    assert route_order_violated(scene, [0.0, 0.0, 1.0, 2.0]) == ("unloading_order_violation", "base blocked by right")
 
 
 # ------------------------------------------------- stop accessibility

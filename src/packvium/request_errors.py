@@ -12,8 +12,8 @@ error is an `InvalidRequestError` with:
 - `detail`: the fixed text for the reason, so the message is identical in every engine.
 
 `check_request` walks the schema's rules over the raw JSON before any model is built, and the
-first violation wins, in a fixed order every engine follows: units, configuration, items,
-containers. The floors are the ones the request schema declares, and a cross-engine suite
+first violation wins, in a fixed order every engine follows: units, output, configuration,
+items, containers. The floors are the ones the request schema declares, and a cross-engine suite
 holds all four engines to the same reason, field and message.
 """
 
@@ -22,8 +22,9 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Set, Tuple, Type
 
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
+from ._request_error import InvalidRequestError
 from .flat_bag import DEFORMABLE_BOUNDARY_KINDS
-from .units import Length, Weight
+from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, Weight
 from .made_to_measure import box_cost_minor_for
 
 REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "negative_measure",
@@ -33,21 +34,13 @@ SOLVER_PROFILES = ("fast", "balanced", "quality", "exact_small")
 OBJECTIVES = ("default", "lowest_cost", "shipping_cost", "lowest_landed_cost", "open_dimension_height", "maximum_value",
               "maximum_volume")
 ACCESS_DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
-
-
-class InvalidRequestError(ValueError):
-    """The request is not one any engine may answer. Nothing was solved."""
-
-    code = "invalid_request"
-
-    def __init__(self, reason: str, field: str, detail: str) -> None:
-        self.reason = reason
-        self.field = field
-        self.detail = detail
-        super().__init__(self._message())
-
-    def _message(self) -> str:
-        return f"{self.code}: {self.field}: {self.detail}" if self.field else f"{self.code}: {self.detail}"
+#: The schema's closed vocabularies, each refused as `not_allowed` like the two above.
+SOLVERS = ("grid", "extreme_points", "homogeneous_blocks", "layer", "maximal_spaces", "exact_small")
+ROTATIONS = ("LWH", "LHW", "WLH", "WHL", "HLW", "HWL")
+LENGTH_UNITS = LENGTH_UNIT_CODES
+WEIGHT_UNITS = WEIGHT_UNIT_CODES
+GROUND_CONTACT_RULES = ("free", "covered", "single", "multiple")
+SHAPE_TYPES = ("rigid_cuboid", "convex_hull", "compressible")
 
 
 def pointer(*parts: Any) -> str:
@@ -155,6 +148,7 @@ def check_request(data: Any) -> None:
     """Refuse the request with its first violation, or return. O(size of the request)."""
     request = _object(data, "")
     unit = _check_units(request.get("units"))
+    _check_output(request.get("output"))
     _check_configuration(request.get("configuration"), unit)
     items = _required_list(request, "items", "")
     for index, raw in enumerate(items):
@@ -179,6 +173,14 @@ def _check_units(raw: Any) -> str:
     return length
 
 
+def _check_output(raw: Any) -> None:
+    if raw is None:
+        return
+    output = _object(raw, "/output")
+    _optional(output, "length_unit", "/output", lambda v, f: _one_of(v, f, LENGTH_UNITS))
+    _optional(output, "weight_unit", "/output", lambda v, f: _one_of(v, f, WEIGHT_UNITS))
+
+
 def _check_configuration(raw: Any, unit: str) -> None:
     if raw is None:
         return
@@ -188,6 +190,11 @@ def _check_configuration(raw: Any, unit: str) -> None:
               lambda v, f: _one_of(v, f, SOLVER_PROFILES))
     _optional(configuration, "objective", "/configuration",
               lambda v, f: _one_of(v, f, OBJECTIVES))
+    _optional(configuration, "solvers", "/configuration", lambda v, f: _each_one_of(v, f, SOLVERS))
+    _optional(configuration, "dimensional_weight_length_unit", "/configuration",
+              lambda v, f: _one_of(v, f, LENGTH_UNITS))
+    _optional(configuration, "dimensional_weight_weight_unit", "/configuration",
+              lambda v, f: _one_of(v, f, WEIGHT_UNITS))
     for name, minimum in _CONFIGURATION_INTEGERS:
         _optional(configuration, name, "/configuration", lambda v, f, m=minimum: _integer(v, f, m))
     _optional(configuration, "minimum_support_ratio", "/configuration", _ratio)
@@ -208,6 +215,7 @@ def _check_item(raw: Any, where: str, unit: str) -> None:
     _optional(item, "weight", where, lambda v, f: _measure(v, f, Weight, "g"))
     _optional(item, "max_top_load", where, lambda v, f: _measure(v, f, Weight, "g"))
     _optional(item, "nesting_height", where, lambda v, f: _measure(v, f, Length, unit))
+    _optional(item, "nesting_height", where, lambda v, f: _nesting_below_height(v, f, item, unit))
     _optional(item, "max_stacked_items", where, lambda v, f: _integer(v, f, 1))
     _optional(item, "stop_index", where, lambda v, f: _integer(v, f, 0))
     _optional(item, "value", where, lambda v, f: _integer(v, f, 0))
@@ -216,6 +224,16 @@ def _check_item(raw: Any, where: str, unit: str) -> None:
     _optional(item, "compression_ratio", where, lambda v, f: _ratio(v, f, None))
     _optional(item, "stacking_group", where, _stacking_group_name)
     _optional(item, "accepts_stacking_groups", where, _stacking_group_names)
+    _optional(item, "allowed_rotations", where, lambda v, f: _each_one_of(v, f, ROTATIONS))
+    _optional(item, "ground_contact_rule", where, lambda v, f: _one_of(v, f, GROUND_CONTACT_RULES))
+    _optional(item, "shape_type", where, lambda v, f: _one_of(v, f, SHAPE_TYPES))
+
+
+def _nesting_below_height(value: Any, field: str, item: Mapping[str, Any], unit: str) -> None:
+    """A nested copy sinks by less than its own height, or it would vanish into the one below
+. Both measures have passed their own rules already. O(1)."""
+    if Length.parse(value, unit).ticks >= Length.parse(item["dimensions"]["height"], unit).ticks:
+        raise InvalidRequestError("invalid_value", field, "must be less than the item's height")
 
 
 def _check_container(raw: Any, where: str, unit: str) -> None:
@@ -309,10 +327,13 @@ def _set_beside_a_bag(name: str, value: Any) -> bool:
     return value is not None
 
 
+def _each_one_of(raw: Any, where: str, allowed: Sequence[str]) -> None:
+    for index, value in enumerate(_list(raw, where)):
+        _one_of(value, pointer_join(where, index), allowed)
+
+
 def _access_directions(raw: Any, where: str) -> None:
-    values = _list(raw, where)
-    for index, value in enumerate(values):
-        _one_of(value, pointer_join(where, index), ACCESS_DIRECTIONS)
+    _each_one_of(raw, where, ACCESS_DIRECTIONS)
 
 
 def _dimensions(raw: Any, where: str, unit: str) -> None:

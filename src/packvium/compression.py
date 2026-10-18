@@ -16,6 +16,7 @@ from __future__ import annotations
 from math import gcd
 
 from ._compat import dataclass
+from ._request_error import refused
 from .units import Length, Weight
 
 #: Parts per million, the scale `compression_ratio` is carried at once parsed. Shared with
@@ -154,5 +155,8 @@ def ratio_to_ppm(ratio: float) -> int:
     geometry: everything downstream of this function is an integer.
     """
     if not 0.0 <= ratio <= 1.0:
-        raise ValueError("compression_ratio must be between zero and one")
+        # Below zero is the schema's floor; the schema sets no ceiling, so above one stays the
+        # catch-all `invalid_value` every engine answers.
+        raise refused("below_minimum" if ratio < 0 else "invalid_value",
+                      "compression_ratio must be between zero and one")
     return int(ratio * PPM + 0.5)

@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ._compat import dataclass
+from ._request_error import refused
 from .geometry import Dimensions
 from .units import Length, Weight
 
@@ -51,13 +52,13 @@ class MadeToMeasure:
 
     def __post_init__(self) -> None:
         if min(self.minimum) <= 0:
-            raise ValueError("made_to_measure minimum must be positive")
+            raise refused("invalid_value", "made_to_measure minimum must be positive")
         if min(self.increment) <= 0:
-            raise ValueError("made_to_measure increment must be positive")
+            raise refused("invalid_value", "made_to_measure increment must be positive")
         if self.cost_per_square_metre_minor < 0 or self.tare_per_square_metre < 0:
-            raise ValueError("made_to_measure prices cannot be negative")
+            raise refused("below_minimum", "made_to_measure prices cannot be negative")
         if min(self.outer_allowance) < 0:
-            raise ValueError("made_to_measure outer_allowance cannot be negative")
+            raise refused("negative_measure", "made_to_measure outer_allowance cannot be negative")
 
     def admits(self, maximum: Triple) -> None:
         """Refuse a machine whose grid does not land on its own maximum. O(1).
@@ -66,10 +67,10 @@ class MadeToMeasure:
         inside the maximum up onto the grid can never pass it (D3, D4)."""
         for axis, name in enumerate(("length", "width", "height")):
             if self.minimum[axis] > maximum[axis]:
-                raise ValueError(f"made_to_measure minimum {name} exceeds inner_dimensions")
+                raise refused("invalid_value", f"made_to_measure minimum {name} exceeds inner_dimensions")
             if (maximum[axis] - self.minimum[axis]) % self.increment[axis]:
-                raise ValueError(
-                    f"made_to_measure increment {name} does not divide inner_dimensions minus minimum"
+                raise refused(
+                    "invalid_value", f"made_to_measure increment {name} does not divide inner_dimensions minus minimum"
                 )
 
     def grid(self, axis: int, value: int) -> int:

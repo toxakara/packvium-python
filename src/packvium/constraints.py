@@ -119,6 +119,17 @@ def active_constraints(constraints: Sequence[PlacementConstraint], container: Co
     return active
 
 
+def is_position_independent(constraint: PlacementConstraint) -> bool:
+    """Whether `constraint`'s verdict for an item never reads the candidate's position.
+
+    Compatibility and tag counts look only at the item, the container and what is already
+    placed, all fixed for one candidate search, so one verdict serves every (point,
+    rotation) of it -- as Rust and JavaScript already compute them once per item. Exact
+    types, as in `active_constraints`: a subclass may override `evaluate` and read more.
+    """
+    return type(constraint) in (CompatibilityConstraint, TagCountConstraint)
+
+
 class ProvenRejection(Protocol):
     """A constraint that can rule an item out of *every* offered container without
     searching for a placement first.
@@ -167,8 +178,7 @@ class DirectSupport:
 
 @dataclass(frozen=True, slots=True)
 class DirectSupportView:
-    """Candidate support surfaces and positive-area direct supporters."""
-    surfaces: tuple[AxisAlignedBox, ...]
+    """Positive-area direct supporters of one candidate, in placement-index order."""
     supporters: tuple[DirectSupport, ...]
 
     @property
@@ -193,13 +203,12 @@ def direct_support_view(
 ) -> DirectSupportView:
     """Direct supports for one active candidate in O(m) time and O(m) output space.
 
-    Ordinary face semantics stay byte-for-byte equivalent: every box whose top is on
-    the candidate's base plane remains a ``surface``, while only positive-area overlaps
-    are supporters. If an exact same-type/same-footprint nesting predecessor exists,
-    shadowed face surfaces from that nesting column are removed and the immediate
-    predecessor becomes one full-area supporter. Lists remain in placement-index order.
+    A box whose top is on the candidate's base plane is a supporter when it overlaps the
+    base with positive area. If an exact same-type/same-footprint nesting predecessor
+    exists, shadowed face supporters from that nesting column are removed and the
+    immediate predecessor becomes one full-area supporter. The list stays in
+    placement-index order.
     """
-    face_surfaces: list[tuple[int, AxisAlignedBox]] = []
     face_supporters: list[DirectSupport] = []
     nearest_lower: tuple[int, AxisAlignedBox] | None = None
     nesting = item.item.nesting_height
@@ -207,7 +216,6 @@ def direct_support_view(
         other = placement.envelope_box
         other_nesting = placement.instance.item.nesting_height
         if other.z2 == box.origin.z:
-            face_surfaces.append((index, other))
             area = other.overlap_area_xy(box)
             if area > 0:
                 face_supporters.append(DirectSupport(index, other, area))
@@ -227,23 +235,13 @@ def direct_support_view(
         else None
     )
     if predecessor is None:
-        return DirectSupportView(
-            tuple(surface for _, surface in face_surfaces), tuple(face_supporters)
-        )
+        return DirectSupportView(tuple(face_supporters))
 
-    surfaces = [
-        entry for entry in face_surfaces
-        if not _same_nesting_column(placements[entry[0]], item, box)
-    ]
     supporters = [
         support for support in face_supporters
         if not _same_nesting_column(placements[support.index], item, box)
     ]
     predecessor_index, predecessor_box = predecessor
-    surface_at = 0
-    while surface_at < len(surfaces) and surfaces[surface_at][0] < predecessor_index:
-        surface_at += 1
-    surfaces.insert(surface_at, (predecessor_index, predecessor_box))
     supporter_at = 0
     while supporter_at < len(supporters) and supporters[supporter_at].index < predecessor_index:
         supporter_at += 1
@@ -251,9 +249,7 @@ def direct_support_view(
         supporter_at,
         DirectSupport(predecessor_index, predecessor_box, predecessor_box.overlap_area_xy(box)),
     )
-    return DirectSupportView(
-        tuple(surface for _, surface in surfaces), tuple(supporters)
-    )
+    return DirectSupportView(tuple(supporters))
 
 
 class LoadSupportGraph:
@@ -508,21 +504,22 @@ def resting_above(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = No
 
     An item stacked through two levels of intermediaries appears in the set of every
     level beneath it, not merely the one it directly touches.
+
+    Walked iteratively in the load order `top_loads` uses: a child's top is above its
+    supporter's, so every child's set is complete before its supporter reads it. A
+    recursive walk spent one Python frame per stack level and a tall stack of sheets
+    raised RecursionError. O(sum of set sizes) after the load order, which the
+    graph sorts once in O(n log n) and caches.
     """
     graph = graph if graph is not None else LoadSupportGraph(units)
-    memo: dict[int, frozenset[int]] = {}
-
-    def above_set(index: int) -> frozenset[int]:
-        cached = memo.get(index)
-        if cached is not None: return cached
+    above: list[frozenset[int]] = [frozenset()] * len(units)
+    for index in graph._descending_indices():
         result: set[int] = set()
         for child in graph.children(index):
             result.add(child)
-            result |= above_set(child)
-        memo[index] = frozenset(result)
-        return memo[index]
-
-    return [above_set(index) for index in range(len(units))]
+            result |= above[child]
+        above[index] = frozenset(result)
+    return above
 
 
 def stacked_counts(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = None) -> list[int]:
@@ -536,7 +533,8 @@ def stacked_counts(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = N
 RIDES_THE_WHOLE_ROUTE = float("inf")
 
 
-def route_order_violated(units: Sequence[LoadUnit], stops: Sequence[float]) -> tuple[str, str] | None:
+def route_order_violated(units: Sequence[LoadUnit], stops: Sequence[float],
+                         graph: LoadSupportGraph | None = None) -> tuple[str, str] | None:
     """First item due at an earlier stop with a later-stop item resting above it.
 
     docs/VALIDATION-CONTRACT.md requires every item due at a stop to be removable
@@ -548,8 +546,10 @@ def route_order_violated(units: Sequence[LoadUnit], stops: Sequence[float]) -> t
     post-validator answers; this check is the necessary condition, not the whole of it.
     """
     if all(stop == RIDES_THE_WHOLE_ROUTE for stop in stops): return None
-    for index, above in enumerate(resting_above(units)):
-        for upper in above:
+    for index, above in enumerate(resting_above(units, graph)):
+        # Ascending, not set order: the detail names the first violator, and PHP and
+        # Python must name the same one (S16).
+        for upper in sorted(above):
             if stops[upper] > stops[index]:
                 return ("unloading_order_violation", f"{units[index].label} blocked by {units[upper].label}")
     return None
@@ -652,16 +652,18 @@ class TagCountConstraint:
         return ConstraintResult.allow()
 
 
-def _touches_corners(candidate, surfaces) -> bool:
-    """Whether every one of the candidate's four base corners rests on some surface.
+def _touches_corners(candidate, supporters) -> bool:
+    """Whether every one of the candidate's four base corners rests on some supporter.
 
     A ratio cannot express this: 90% of the footprint concentrated in the middle
-    passes any ratio below that but leaves every corner hanging.
+    passes any ratio below that but leaves every corner hanging. Only positive-area
+    supporters count: a neighbour touching a corner along an edge carries nothing,
+    and Rust, JS and every validator ignore it.
     """
     corners = ((candidate.origin.x, candidate.origin.y), (candidate.x2, candidate.origin.y),
               (candidate.origin.x, candidate.y2), (candidate.x2, candidate.y2))
     return all(
-        any(surface.origin.x <= x <= surface.x2 and surface.origin.y <= y <= surface.y2 for surface in surfaces)
+        any(box.origin.x <= x <= box.x2 and box.origin.y <= y <= box.y2 for box in supporters)
         for x, y in corners
     )
 
@@ -681,11 +683,10 @@ class SupportConstraint:
             return ConstraintResult.allow()
         candidate = context.envelope_box
         support = direct_support_view(context.placements, context.item, candidate)
-        surfaces = support.surfaces
         supporters = [entry.box for entry in support.supporters]
         rule = context.item.item.ground_contact_rule
         if rule is not None and rule != "free":
-            if rule == "covered" and not _touches_corners(candidate, surfaces):
+            if rule == "covered" and not _touches_corners(candidate, supporters):
                 return ConstraintResult.reject("ground_contact_violation", f"covered: {len(supporters)} supporter(s), not all four corners touched")
             if rule == "single" and len(supporters) != 1:
                 return ConstraintResult.reject("ground_contact_violation", f"single: rests on {len(supporters)} item(s)")
@@ -720,19 +721,17 @@ class SupportConstraint:
         return ConstraintResult.allow()
 
 
-class TopLoadConstraint:
-    """Rejects a placement that would rest on something unable to carry it.
-
-    Bearing limits are checked against the cumulative load of the whole stack, not
-    only the box directly underneath, so a tower of light items cannot crush its base.
+class PlacedSupportBase:
+    """The support graph over one placement tuple, with each candidate appended to it.
 
     The support graph over the *placed* boxes is the same for every candidate evaluated
     against one search state, and rebuilding it per candidate was the cost
-    removes. One base per placement tuple is kept here and each candidate is appended to
-    it. The cache is deliberately a single entry compared by identity: search evaluates a
-    run of candidates against one state before moving on, so a one-entry cache captures
-    the whole run, and holding the tuple keeps `is` sound because the object cannot be
-    collected and its identity reused while the cache refers to it.
+    removes. Every rule that reads the graph -- bearing and route order --
+    keeps one of these. The cache is deliberately a single entry compared by identity:
+    search evaluates a run of candidates against one state before moving on, so a
+    one-entry cache captures the whole run, and holding the tuple keeps `is` sound
+    because the object cannot be collected and its identity reused while the cache
+    refers to it.
     """
 
     __slots__ = ("_placements", "_base", "_base_units", "_hint")
@@ -764,6 +763,28 @@ class TopLoadConstraint:
         self._base = LoadSupportGraph(units, cell_hint=hint)
         return self._base, units
 
+    def with_candidate(self, placements: tuple[Placement, ...],
+                       unit: LoadUnit) -> tuple[tuple[LoadUnit, ...], LoadSupportGraph]:
+        """`placements`' units and graph with `unit` appended at the last index."""
+        box = unit.box
+        footprint = max(box.x2 - box.origin.x, box.y2 - box.origin.y)
+        base, base_units = self._base_for(placements, footprint)
+        return base_units + (unit,), base.with_unit(unit, cell_hint=self._hint)
+
+
+class TopLoadConstraint:
+    """Rejects a placement that would rest on something unable to carry it.
+
+    Bearing limits are checked against the cumulative load of the whole stack, not
+    only the box directly underneath, so a tower of light items cannot crush its base.
+    The graph comes from a `PlacedSupportBase`, so it is not rebuilt per candidate.
+    """
+
+    __slots__ = ("_support",)
+
+    def __init__(self) -> None:
+        self._support = PlacedSupportBase()
+
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if not context.stack_sensitive: return ConstraintResult.allow()
         candidate = context.envelope_box
@@ -774,10 +795,7 @@ class TopLoadConstraint:
                         None if item.nesting_height is None else item.id,
                         None if item.nesting_height is None else item.nesting_height.ticks,
                         item.compression_ratio_ppm, item.max_compression_pressure_kpa)
-        footprint = max(candidate.x2 - candidate.origin.x, candidate.y2 - candidate.origin.y)
-        base, base_units = self._base_for(context.placements, footprint)
-        units = base_units + (unit,)
-        graph = base.with_unit(unit, cell_hint=self._hint)
+        units, graph = self._support.with_candidate(context.placements, unit)
         failure = non_stackable_failure(
             context.placements, context.item, graph, len(units) - 1
         )
@@ -803,15 +821,19 @@ class RouteOrderConstraint:
     a route sees no new rejection code and no behaviour change.
     """
 
+    __slots__ = ("_support",)
+
+    def __init__(self) -> None:
+        # Its own base rather than a rebuild per candidate: 60 routed placements once
+        # cost 8713 graph constructions.
+        self._support = PlacedSupportBase()
+
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if not context.route_sensitive: return ConstraintResult.allow()
-        units = load_units(
-            context.placements,
-            LoadUnit(
-                context.envelope_box, context.item.weight.ticks, None, None, context.item.id,
-                None if context.item.item.nesting_height is None else context.item.item.id,
-                None if context.item.item.nesting_height is None else context.item.item.nesting_height.ticks,
-            ),
+        candidate = LoadUnit(
+            context.envelope_box, context.item.weight.ticks, None, None, context.item.id,
+            None if context.item.item.nesting_height is None else context.item.item.id,
+            None if context.item.item.nesting_height is None else context.item.item.nesting_height.ticks,
         )
         stops = [
             RIDES_THE_WHOLE_ROUTE if p.instance.item.stop_index is None else float(p.instance.item.stop_index)
@@ -819,7 +841,8 @@ class RouteOrderConstraint:
         ]
         item_stop = context.item.item.stop_index
         stops.append(RIDES_THE_WHOLE_ROUTE if item_stop is None else float(item_stop))
-        failure = route_order_violated(units, stops)
+        units, graph = self._support.with_candidate(context.placements, candidate)
+        failure = route_order_violated(units, stops, graph)
         if failure is not None:
             return ConstraintResult.reject(*failure)
         return ConstraintResult.allow()
@@ -893,7 +916,7 @@ class StopAccessibilityConstraint:
                   directions: tuple[str, ...]):
         """Per placed box, the doors still open to it against the already-placed boxes.
 
-        Cached by tuple identity for the same reason `TopLoadConstraint` does it: the
+        Cached by tuple identity for the same reason `PlacedSupportBase` is: the
         search evaluates a run of candidates against one state, so a single entry covers
         the whole run, and holding the tuple keeps `is` sound.
         """
