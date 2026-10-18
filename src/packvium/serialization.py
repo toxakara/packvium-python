@@ -14,10 +14,11 @@ from .made_to_measure import MadeToMeasure
 from ._canonical_json import json_integer
 from .extensions import ExtensionRegistry
 from .fixed_placements import require_fixed_placement_shapes
+from ._request_error import ObjectRefusal
 from .request_errors import InvalidRequestError, check_request
 from .packer import Packer
 from .policy import PolicyRuleSet
-from .units import Length, Weight
+from .units import Length, Weight, output_length_unit
 
 
 def _axles(raw: list | None, unit: str) -> tuple[Axle, Axle] | None:
@@ -300,7 +301,7 @@ def pack_from_dict(data: dict, *,
     result = Packer(config, extensions).pack(items, containers, fixed)
     result = replace(result, catalog_versions_used=references)
     output = data.get("output", {})
-    return result.to_dict(output.get("length_unit", unit), output.get("weight_unit", "g"))
+    return result.to_dict(output.get("length_unit", output_length_unit(unit)), output.get("weight_unit", "g"))
 
 
 def _without_null_optionals(data: Mapping[str, Any]) -> dict:
@@ -341,6 +342,10 @@ def _as_request_error() -> Iterator[None]:
     """
     try:
         yield
+    except ObjectRefusal as error:
+        # A model's own refusal names a reason for the object API; the JSON rule table did not
+        # name this value, and every engine reports that as `invalid_value` with no field.
+        raise InvalidRequestError("invalid_value", "", error.detail) from error
     except (ValueError, TypeError, KeyError, ArithmeticError) as error:
         if isinstance(error, InvalidRequestError) or hasattr(error, "code"):
             raise

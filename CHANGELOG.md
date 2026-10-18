@@ -4,6 +4,47 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0]
+
+The reference validator ships in the package, `quality` looks ahead in its block solver, and a
+request built from objects is refused as its JSON would be. No request or result field changes.
+
+### Added
+
+- **`packvium.validate(request, result)`, `packvium.Issue` and `packvium.MalformedResult`.** The
+  reference validator over the JSON documents: a list of `Issue` (`code`, `detail`), empty when
+  the result is valid, and `MalformedResult` for a result of the wrong shape. It shares no code
+  with the engine it checks.
+
+### Changed
+
+- **A request built from objects is refused as JSON is.** A model constructor that
+  refuses a value raises `InvalidRequestError` (code, reason, field `""`), a subclass of the
+  `ValueError` it raised before, and a mistyped value is still a `TypeError` too. `Packer.pack`
+  checks the objects with the JSON rules before solving. `FixedPlacement` with
+  `container_instance` below 1 is now refused by `pack` as `invalid_fixed_placement`, not by its
+  constructor.
+- **Every schema enum value is refused as `not_allowed`.** A value outside its list in
+  `allowed_rotations`, the output and dimensional-weight units, `shape_type`,
+  `ground_contact_rule` or `configuration.solvers` is `invalid_request` with reason `not_allowed`
+  at its JSON Pointer, where some raised a `KeyError`. **`ticks` as an output unit is now
+  refused**; the schema never listed it.
+- **`quality` looks ahead in the block solver.** Each round completes its leading
+  blocks greedily and commits the best, so the answer is never worse than the greedy pass. On our
+  benchmark 87 of 89 answers improved and none got worse, at 6% more CPU. Under a tight effort
+  budget the block start can now report `truncated` / `effort_limit`. `fast` and `balanced` are
+  unchanged.
+- **A `nesting_height` not below the item's height is refused as `invalid_value`** at its
+  pointer, and with no `output` block the result is written in `units.length`'s schema code.
+
+### Fixed
+
+- **A tall stack no longer raises `RecursionError`**: the load rules walk stacks iteratively.
+- **The covered ground-contact rule counts only supporters with positive area**, so an item no
+  longer rests on a box it touches only at an edge.
+- **A quantity past 2^53 − 1 on the object path is refused** instead of hanging the solver.
+- **A route violation names its violators in sorted order.**
+
 ## [1.6.0]
 
 Boxes cut to measure, flat bags, stacking groups and a volume-first objective. A request that

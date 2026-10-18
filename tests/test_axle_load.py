@@ -124,3 +124,33 @@ def test_a_weightless_item_is_admitted_exactly_when_the_tare_alone_is():
     assert axle_admits_alone((Axle(Length(0), Weight(400)), Axle(Length(100), None)), 800, 100, 0, 10)
     assert not axle_admits_alone((Axle(Length(0), Weight(399)), Axle(Length(100), None)), 800, 100, 0, 10)
 
+
+
+def test_axle_points_already_offered_are_not_offered_again():
+    # S20: an axle point equal to an ordinary point, or to an earlier axle point, is the
+    # same candidate scanned twice; it is dropped and every other point keeps its place.
+    from packvium.solvers import _append_unseen
+    ordinary = [Point(0, 0, 0), Point(5, 0, 0), Point(0, 5, 0)]
+    axle = [Point(7, 0, 0), Point(5, 0, 0), Point(7, 5, 0), Point(7, 0, 0), Point(0, 5, 0)]
+    assert _append_unseen(ordinary, axle) == [*ordinary, Point(7, 0, 0), Point(7, 5, 0)]
+
+
+def test_an_axle_balanced_point_seats_the_envelope_under_a_clearance():
+    # S10: feasible centres are 300..305 mm, narrower than the 10 mm clearance, so only an
+    # envelope origin computed from the envelope's own length lands inside the window.
+    from packvium.serialization import pack_from_dict
+    for profile in ("fast", "balanced", "quality"):
+        result = pack_from_dict({
+            "units": {"length": "mm"},
+            "configuration": {"solver_profile": profile, "clearance": "10"},
+            "items": [{"id": "drum", "allowed_rotations": ["LWH"],
+                       "weight": {"value": "1000", "unit": "g"},
+                       "dimensions": {"length": "200", "width": "100", "height": "100"}}],
+            "containers": [{"id": "trailer",
+                            "inner_dimensions": {"length": "1000", "width": "200", "height": "200"},
+                            "axles": [{"position": "0", "max_load": {"value": "700", "unit": "g"}},
+                                      {"position": "1000", "max_load": {"value": "305", "unit": "g"}}]}],
+        })
+        placements = [p for c in result["containers"] for p in c["placements"]]
+        assert len(placements) == 1, profile
+        assert 200 <= float(placements[0]["position"]["x"]["value"]) <= 205, profile

@@ -20,13 +20,16 @@ from packvium.solvers import (Deadline, HomogeneousBlockSolver, SearchStats, _Ho
 
 
 class NodeByNodeBlockSolver(HomogeneousBlockSolver):
-    """The 1.6.0 round: every lattice node polls the deadline and is counted alone."""
+    """The 1.6.0 round: every lattice node polls the deadline and is counted alone.
 
-    def _next_block(self, container, state, spaces, remaining, forms, config, stats, deadline,
-                    mode, lattices, nodes):
+    It keeps every group winner and the `leaders` best of them, unpruned, so the
+    `quality` lookahead's rounds are checked as well as the greedy one."""
+
+    def _leading_blocks(self, container, state, spaces, remaining, forms, config, stats,
+                        deadline, mode, lattices, nodes, leaders):
         node_limit = config.container_plan_node_limit
         reached = False
-        best: _HomogeneousBlock | None = None
+        winners: list[_HomogeneousBlock] = []
         for space in spaces:
             space_volume = space.dimensions.volume
             for item_id in sorted(remaining):
@@ -74,15 +77,15 @@ class NodeByNodeBlockSolver(HomogeneousBlockSolver):
                     if reached:
                         break
                     if group_count:
-                        best = self._better_block(
-                            best, mode, space, space_volume, item_id, rotation, physical,
+                        winners.append(self._block(
+                            mode, space, space_volume, item_id, rotation, physical,
                             envelope, group_nx, group_ny, group_nz, group_count,
-                        )
+                        ))
                 if reached:
                     break
             if reached:
                 break
-        return best, nodes, reached
+        return sorted(winners, key=lambda block: block.score)[:leaders], nodes, reached
 
 
 def node_by_node_lattice(columns: int, rows: int, layers: int, capacity: int):
@@ -191,3 +194,35 @@ def test_a_full_memo_only_recomputes(monkeypatch):
     monkeypatch.setattr(solvers, "_LATTICE_MEMO_LIMIT", 0)
     assert outcome(HomogeneousBlockSolver(), box, items, config, unlimited) == remembered == \
         outcome(NodeByNodeBlockSolver(), box, items, config, unlimited)
+
+
+def key(solution):
+    return HomogeneousBlockSolver._solution_key(solution)
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_the_quality_lookahead_never_ranks_below_the_greedy_pass(seed):
+    box, items = scene(seed)
+    greedy = PackingConfig.balanced(container_plan_node_limit=100_000)
+    looked = HomogeneousBlockSolver().pack_one(box, 1, items, PackingConfig.quality(), SearchStats(),
+                                               Deadline(600_000))
+    passed = HomogeneousBlockSolver().pack_one(box, 1, items, greedy, SearchStats(), Deadline(600_000))
+    assert key(looked) <= key(passed)
+
+
+def test_a_spent_lookahead_budget_keeps_the_best_completion_and_is_no_limit_stop(monkeypatch):
+    from packvium import solvers
+
+    # Scene 0 at a 5 000-node limit: the greedy pass finishes inside it, the lookahead does
+    # not finish inside the same 5 000, and finishes inside 64 times that.
+    box, items = scene(0)
+    config = PackingConfig.quality(container_plan_node_limit=5_000)
+    full = HomogeneousBlockSolver().pack_one(box, 1, items, config, SearchStats(), Deadline(600_000))
+    monkeypatch.setattr(solvers, "BLOCK_LOOKAHEAD_NODE_FACTOR", 1)
+    spent = HomogeneousBlockSolver().pack_one(box, 1, items, config, SearchStats(), Deadline(600_000))
+    greedy = HomogeneousBlockSolver().pack_one(
+        box, 1, items, PackingConfig.balanced(container_plan_node_limit=5_000), SearchStats(),
+        Deadline(600_000))
+    assert not greedy.time_limit_reached
+    assert key(full) < key(spent) < key(greedy)
+    assert not spent.time_limit_reached

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from packvium import (AxisAlignedBox, Axle, Container, Dimensions, FixedPlacement, Item, Length, Obstacle,
-                         PackedContainer, PackingRequest, Placement, Point, Rotation, Weight)
+from packvium import (AxisAlignedBox, Axle, Container, Dimensions, FixedPlacement, FixedPlacementError, Item,
+                         Length, Obstacle, PackedContainer, Packer, PackingRequest, Placement, Point, Rotation,
+                         Weight)
 
 
 # ---------------------------------------------------------------------------- item
@@ -300,5 +301,9 @@ def test_expanding_a_container_packed_without_a_lattice_returns_its_own_placemen
 
 
 def test_a_fixed_placement_counts_container_instances_from_one():
-    with pytest.raises(ValueError, match="counts from 1"):
-        FixedPlacement("a", "box", Point(0, 0, 0), Rotation.LWH, container_instance=0)
+    """Refused where the placement sits in a request, with the JSON path's refusal."""
+    placement = FixedPlacement("a", "box", Point(0, 0, 0), Rotation.LWH, container_instance=0)
+    with pytest.raises(FixedPlacementError, match="counts from 1") as caught:
+        Packer().pack([Item.create("a", Dimensions.mm(10, 10, 10))],
+                      [Container.create("box", Dimensions.mm(10, 10, 10))], [placement])
+    assert (caught.value.reason, caught.value.field) == ("malformed", "/fixed_placements/0/container_instance")

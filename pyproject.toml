@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "packvium"
-version = "1.6.0"
+version = "1.7.0"
 description = "Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results."
 readme = "README.md"
 requires-python = ">=3.9"

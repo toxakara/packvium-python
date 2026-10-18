@@ -499,6 +499,14 @@ def test_the_sequence_is_pinned_against_the_other_implementations():
     assert DeterministicRandom(7).shuffled(list(range(6))) == [1, 2, 4, 3, 5, 0]
 
 
+def test_a_negative_seed_shuffles_as_php_does():
+    """Seed -7 reduces to its residue modulo 2^31 in both languages. The mirror of
+    this test lives in packvium-php/tests/SolverTest.php."""
+    values = list(range(10))
+    assert DeterministicRandom(-7).shuffled(values) == [5, 0, 3, 4, 8, 7, 6, 9, 2, 1]
+    assert DeterministicRandom(-7).shuffled(values) == DeterministicRandom(2**31 - 7).shuffled(values)
+
+
 def test_degenerate_bounds_are_answered_without_drawing():
     rng = DeterministicRandom(3)
     assert rng.next_int(0) == 0

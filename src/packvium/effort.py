@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ._compat import dataclass
+from ._request_error import refused, refused_type
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -31,8 +32,12 @@ class EffortBudget:
         for name in ("max_candidates_evaluated", "max_placement_attempts", "max_search_nodes",
                      "max_restarts"):
             limit = getattr(self, name)
+            # Only what cannot be compared at all is refused here; an integral float or a
+            # boolean is the request rules' to judge, with its pointer (`check_objects`).
+            if limit is not None and not isinstance(limit, (int, float)):
+                raise refused_type(f"effort_budget.{name} must be an integer")
             if limit is not None and limit < 1:
-                raise ValueError(f"effort_budget.{name} must be at least 1")
+                raise refused("below_minimum", f"effort_budget.{name} must be at least 1")
 
     def exceeded(self, stats: "SearchStats") -> bool:
         return ((self.max_candidates_evaluated is not None and stats.candidates_evaluated >= self.max_candidates_evaluated)

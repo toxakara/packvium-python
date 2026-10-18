@@ -117,7 +117,9 @@ def test_a_request_that_is_not_an_object_is_refused_as_a_whole():
 
 
 def test_what_the_rules_do_not_name_still_arrives_as_a_request_error():
-    error = refusal(lambda d: d["items"][0].update(shape_type="blob"))
+    # A model rule the schema does not state: an item needs at least one rotation. (An unknown
+    # shape type was this case until made it a `not_allowed` rule.)
+    error = refusal(lambda d: d["items"][0].update(allowed_rotations=[]))
     assert (error.code, error.reason, error.field) == ("invalid_request", "invalid_value", "")
 
 
@@ -216,3 +218,23 @@ def test_the_known_configuration_fields_are_the_schema_s():
     configuration = schema["properties"]["configuration"]
     assert configuration["additionalProperties"] is False
     assert set(CONFIGURATION_FIELDS) == set(configuration["properties"])
+
+
+@pytest.mark.parametrize("request_unit, output_unit", [
+    ("cm", "cm"), ("MM", "mm"), ("IN", "in"), ("Inches", "in"), ("millimeter", "mm"), ("tick", "mm"),
+])
+def test_without_an_output_block_the_result_is_in_the_request_unit_spelt_as_its_code(request_unit, output_unit):
+    """The output default is always a unit the schema lists for output."""
+    data = request()
+    data["units"] = {"length": request_unit}
+    result = pack_from_dict(data)
+    assert result["containers"][0]["inner_dimensions"]["length"]["unit"] == output_unit
+
+
+@pytest.mark.parametrize("nesting, detail", [
+    ("100", "must be less than the item's height"),
+    ({"value": "11", "unit": "cm"}, "must be less than the item's height"),
+])
+def test_a_nesting_height_not_below_the_height_is_refused_at_its_pointer(nesting, detail):
+    error = refusal(lambda d: d["items"][0].update(nesting_height=nesting))
+    assert (error.reason, error.field, error.detail) == ("invalid_value", "/items/0/nesting_height", detail)

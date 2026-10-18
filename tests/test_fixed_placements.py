@@ -260,7 +260,7 @@ def test_rebalancing_never_moves_a_fixed_item():
     ([{"item_type": "cube", "container_type": "box"}], 'fixed_placements[0] needs ["orientation"]'),
     ([fixed(item_type="")], "fixed_placements[0].item_type is a non-empty string"),
     ([fixed(container_type=5)], "fixed_placements[0].container_type is a non-empty string"),
-    ([fixed(orientation="XYZ")], "fixed_placements[0].orientation is one of the six codes"),
+    ([fixed(orientation="XYZ")], 'fixed_placements[0].orientation must be one of ["LWH","LHW","WLH","WHL","HLW","HWL"]'),
     ([fixed(instance="1")], "fixed_placements[0].container_instance counts from 1"),
     ([fixed(instance=True)], "fixed_placements[0].container_instance counts from 1"),
     ([fixed(instance=1.5)], "fixed_placements[0].container_instance counts from 1"),

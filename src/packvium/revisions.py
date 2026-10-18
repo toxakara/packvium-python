@@ -283,7 +283,8 @@ def _validate_placement(event: Mapping[str, Any]) -> None:
     _require_name(placement.get("item_type"), "placement.item_type")
     _require_name(placement.get("container_type"), "placement.container_type")
     if placement.get("orientation") not in ORIENTATIONS:
-        raise PlanRevisionError("invalid_event", "placement.orientation is one of the six codes")
+        raise PlanRevisionError("invalid_event",
+                                f"placement.orientation must be one of {json_spelling(list(ORIENTATIONS))}")
     instance = json_integer(placement.get("container_instance", 1))
     if instance is None or instance < 1:
         raise PlanRevisionError("invalid_event", "placement.container_instance counts from 1")

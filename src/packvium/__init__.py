@@ -59,8 +59,8 @@ __all__ = [
     "ALL_DIRECTIONS", "AlgorithmReport", "Axle", "AxisAlignedBox", "Container", "DefaultSolutionScorer", "Dimensions",
     "EffortBudget", "ExtensionRegistry", "FixedPlacement", "FixedPlacementError", "InvalidRequestError",
     "PolicyError", "UnknownObjectiveError", "UnknownSolverError", "UnsupportedFeatureError",
-    "IndependentSolutionValidator", "InvalidDirectionError", "Item", "ItemInstance", "LEVEL_PREFIXES", "Length",
-    "LoadingDependencyGraph", "MadeToMeasure", "NestedPacker",
+    "IndependentSolutionValidator", "InvalidDirectionError", "Issue", "Item", "ItemInstance", "LEVEL_PREFIXES", "Length",
+    "LoadingDependencyGraph", "MadeToMeasure", "MalformedResult", "NestedPacker",
     "NestedPackingResult", "Obstacle", "PackedContainer", "Packer", "PackingConfig",
     "PackingLevel", "PackingRequest", "PackingResult", "PackingStatus", "Placement", "Point",
     "REASON_MESSAGES", "Reachability", "ReasonProof", "RebalanceResult", "RejectionObservation", "ResultFact", "Rotation",
@@ -73,5 +73,17 @@ __all__ = [
     "Weight", "dimensional_weight", "explain_reason", "explain_unpacked_item", "explain_unpacked_items",
     "pack_from_dict", "placement_reachability", "rebalance_weight", "replay_loading_order",
     "replay_removal_order", "safe_loading_order", "safe_loading_order_with_evidence", "safe_removal_order",
-    "safe_removal_order_with_evidence", "safe_route_removal_order", "use_trace",
+    "safe_removal_order_with_evidence", "safe_route_removal_order", "use_trace", "validate",
 ]
+
+#: The result validator is a large module most processes never call, so it is imported on first
+#: use (PEP 562) rather than at `import packvium`: every packing process paid its compile time.
+_RESULT_VALIDATION = frozenset({"Issue", "MalformedResult", "validate"})
+
+
+def __getattr__(name: str) -> object:
+    if name in _RESULT_VALIDATION:
+        from . import result_validation
+
+        return getattr(result_validation, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

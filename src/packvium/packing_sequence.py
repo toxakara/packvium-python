@@ -145,23 +145,25 @@ def _validate_box_at_step(index: int, step: int, boxes: Sequence[AxisAlignedBox]
 
 
 def _acyclic(depends_on: tuple[frozenset[int], ...]) -> bool:
-    visiting: set[int] = set()
-    visited: set[int] = set()
+    """Kahn's algorithm: acyclic exactly when every node can be released. O(V + E).
 
-    def visit(node: int) -> bool:
-        if node in visited:
-            return True
-        if node in visiting:
-            return False
-        visiting.add(node)
+    Iterative, not a depth-first walk: a stack of sheets is a dependency chain as long
+    as the stack, and recursion spent one frame per level.
+    """
+    waiting = [0] * len(depends_on)
+    for dependencies in depends_on:
+        for dependency in dependencies:
+            waiting[dependency] += 1
+    ready = [node for node, count in enumerate(waiting) if count == 0]
+    released = 0
+    while ready:
+        node = ready.pop()
+        released += 1
         for dependency in depends_on[node]:
-            if not visit(dependency):
-                return False
-        visiting.discard(node)
-        visited.add(node)
-        return True
-
-    return all(visit(node) for node in range(len(depends_on)))
+            waiting[dependency] -= 1
+            if waiting[dependency] == 0:
+                ready.append(dependency)
+    return released == len(depends_on)
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,10 +530,9 @@ def verify_loading_prefix_business_rules(
             if rule is not None and rule != "free" and candidate.envelope_box.origin.z != 0:
                 candidate_box = candidate.envelope_box
                 support = direct_support_view(present[:-1], candidate.instance, candidate_box)
-                surfaces = support.surfaces
                 supporters = [entry.box for entry in support.supporters]
                 violated = (
-                    (rule == "covered" and not _touches_corners(candidate_box, surfaces))
+                    (rule == "covered" and not _touches_corners(candidate_box, supporters))
                     or (rule == "single" and len(supporters) != 1)
                     or (rule == "multiple" and len(supporters) < 2)
                 )
