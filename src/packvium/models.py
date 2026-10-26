@@ -14,7 +14,7 @@ from .lattice_summary import LatticeSummary
 from .made_to_measure import MadeToMeasure, as_triple
 from .nesting import used_volume as nesting_used_volume
 from .units import Length, Weight
-from ._request_error import refused
+from ._request_error import refused, refused_type
 
 
 GROUND_CONTACT_RULES = frozenset({"free", "covered", "single", "multiple"})
@@ -66,6 +66,14 @@ class Axle:
 #: the wire identically, it is refused rather than accepted and mis-ordered -- the same
 #: choice `InvalidDirectionError` makes for a direction outside its six.
 MAX_EXACT_STOP_INDEX = 2 ** 53 - 1
+
+
+def _require_booleans(model: Any, names: Iterable[str]) -> None:
+    """Refuse a non-boolean flag, as the JSON rules do: `"no"` is truthy and would
+    otherwise be read as yes. O(len(names))."""
+    for name in names:
+        if not isinstance(getattr(model, name), bool):
+            raise refused_type(f"{name} must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +148,7 @@ class Item:
         if self.ground_contact_rule is not None and self.ground_contact_rule not in GROUND_CONTACT_RULES:
             raise refused("not_allowed", f"ground_contact_rule must be one of {sorted(GROUND_CONTACT_RULES)}")
         self._validate_shape()
+        _require_booleans(self, ("keep_upright", "stackable", "must_be_on_floor"))
         rotations = tuple(r for r in self.allowed_rotations if not self.keep_upright or r in Rotation.upright())
         if not rotations: raise refused("invalid_value", "at least one rotation must be allowed")
         object.__setattr__(self, "allowed_rotations", rotations)

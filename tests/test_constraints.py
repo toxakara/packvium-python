@@ -22,7 +22,7 @@ from packvium.constraints import (SQUARE_METRE_TICKS, SUPPORT_SCALE, AxleLoadCon
                                      FloorConstraint, LoadSupportGraph, LoadUnit, SupportConstraint, TagCountConstraint,
                                      RIDES_THE_WHOLE_ROUTE, RouteOrderConstraint, TopLoadConstraint,
                                      direct_support_view, load_units, overloaded, required_area,
-                                     route_order_violated, scaled_ratio,
+                                     resting_above, route_order_violated, scaled_ratio,
                                      stack_density_exceeded, stack_limit_exceeded, stacked_counts, top_loads)
 from packvium.contact import ContactGraph
 from packvium.models import Placement, is_stack_sensitive
@@ -1417,6 +1417,24 @@ def test_the_first_blocker_named_is_the_lowest_index_not_the_first_reached():
         unit(0, 0, 20, 10, 10, 10, label="high"),
     )
     assert route_order_violated(scene, [0.0, 0.0, 1.0, 2.0]) == ("unloading_order_violation", "base blocked by right")
+
+
+def test_a_blocker_reached_through_two_supporters_is_named_once_and_matches_resting_above():
+    """`bridge` rests on both `left` and `right`, so the walk up from `base` reaches it twice.
+    The answer must be the one the full `resting_above` closure gives."""
+    scene = (
+        unit(0, 0, 0, 20, 10, 10, label="base"),
+        unit(0, 0, 10, 10, 10, 10, label="left"),
+        unit(10, 0, 10, 10, 10, 10, label="right"),
+        unit(0, 0, 20, 20, 10, 10, label="bridge"),
+    )
+    stops = [0.0, 0.0, 0.0, 1.0]
+    above = resting_above(scene)
+    first = next(index for index, uppers in enumerate(above) if any(stops[u] > stops[index] for u in uppers))
+    blocker = min(u for u in above[first] if stops[u] > stops[first])
+    expected = ("unloading_order_violation", f"{scene[first].label} blocked by {scene[blocker].label}")
+    assert expected == ("unloading_order_violation", "base blocked by bridge")
+    assert route_order_violated(scene, stops) == expected
 
 
 # ------------------------------------------------- stop accessibility

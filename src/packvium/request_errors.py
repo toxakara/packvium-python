@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Set, Tu
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
 from ._request_error import InvalidRequestError
 from .flat_bag import DEFORMABLE_BOUNDARY_KINDS
-from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, Weight
+from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, ParsedMeasures, Weight
 from .made_to_measure import box_cost_minor_for
 
 REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "negative_measure",
@@ -79,6 +79,12 @@ def _ratio(value: Any, field: str, maximum: Optional[int] = 1) -> None:
         raise InvalidRequestError("above_maximum", field, f"must be at most {maximum}")
 
 
+def _boolean(value: Any, field: str) -> None:
+    # Only JSON `true`/`false`: a truthiness reading would pack `"no"` as yes.
+    if not isinstance(value, bool):
+        raise InvalidRequestError("wrong_type", field, "must be a boolean")
+
+
 def _one_of(value: Any, field: str, allowed: Sequence[str]) -> None:
     if value not in allowed:
         raise InvalidRequestError("not_allowed", field, f"must be one of {json_spelling(list(allowed))}")
@@ -104,7 +110,8 @@ def _list(value: Any, field: str) -> Sequence[Any]:
     return value
 
 
-def _measure(value: Any, field: str, kind: Type[Length] | Type[Weight], unit: str) -> None:
+def _measure(value: Any, field: str, kind: Type[Length] | Type[Weight], unit: str,
+             measures: ParsedMeasures) -> None:
     """A measure is an integer, a string or `{value, unit}`, and never negative."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str, Mapping)) or (
             isinstance(value, float) and json_integer(value) is None):
@@ -116,7 +123,7 @@ def _measure(value: Any, field: str, kind: Type[Length] | Type[Weight], unit: st
         if not isinstance(stated, str) or stated.lower().strip() not in kind._MULTIPLIERS:
             raise InvalidRequestError("invalid_unit", field, f"has an unknown unit {json_spelling(stated)}")
     try:
-        kind.parse(value, unit)
+        measures.read(kind, value, unit)
     except (ValueError, TypeError, ArithmeticError) as error:
         if "cannot be negative" in str(error):
             raise InvalidRequestError("negative_measure", field, "cannot be negative") from error
@@ -142,22 +149,27 @@ CONFIGURATION_FIELDS = ("alternatives", "clearance", "container_plan_beam_width"
                         "multi_start_orders", "objective", "require_placement_coordinates", "seed",
                         "solver_profile", "solvers", "time_limit_ms")
 _SIDES = ("length", "width", "height")
+#: The item fields the request schema types `boolean`, in schema order.
+ITEM_BOOLEANS = ("keep_upright", "stackable", "must_be_on_floor")
 
 
-def check_request(data: Any) -> None:
-    """Refuse the request with its first violation, or return. O(size of the request)."""
+def check_request(data: Any) -> ParsedMeasures:
+    """Refuse the request with its first violation, or return the measures it parsed, for
+    deserialisation to read instead of parsing them again. O(size of the request)."""
+    measures = ParsedMeasures()
     request = _object(data, "")
     unit = _check_units(request.get("units"))
     _check_output(request.get("output"))
-    _check_configuration(request.get("configuration"), unit)
+    _check_configuration(request.get("configuration"), unit, measures)
     items = _required_list(request, "items", "")
     for index, raw in enumerate(items):
-        _check_item(raw, pointer("items", index), unit)
+        _check_item(raw, pointer("items", index), unit, measures)
     _require_unique_ids(items, "items")
     containers = _required_list(request, "containers", "")
     for index, raw in enumerate(containers):
-        _check_container(raw, pointer("containers", index), unit)
+        _check_container(raw, pointer("containers", index), unit, measures)
     _require_unique_ids(containers, "containers")
+    return measures
 
 
 def _check_units(raw: Any) -> str:
@@ -181,7 +193,7 @@ def _check_output(raw: Any) -> None:
     _optional(output, "weight_unit", "/output", lambda v, f: _one_of(v, f, WEIGHT_UNITS))
 
 
-def _check_configuration(raw: Any, unit: str) -> None:
+def _check_configuration(raw: Any, unit: str, measures: ParsedMeasures) -> None:
     if raw is None:
         return
     configuration = _object(raw, "/configuration")
@@ -198,7 +210,8 @@ def _check_configuration(raw: Any, unit: str) -> None:
     for name, minimum in _CONFIGURATION_INTEGERS:
         _optional(configuration, name, "/configuration", lambda v, f, m=minimum: _integer(v, f, m))
     _optional(configuration, "minimum_support_ratio", "/configuration", _ratio)
-    _optional(configuration, "clearance", "/configuration", lambda v, f: _measure(v, f, Length, unit))
+    _optional(configuration, "clearance", "/configuration", lambda v, f: _measure(v, f, Length, unit, measures))
+    _optional(configuration, "require_placement_coordinates", "/configuration", _boolean)
     effort = configuration.get("effort_budget")
     if effort is not None:
         budget = _object(effort, "/configuration/effort_budget")
@@ -207,15 +220,15 @@ def _check_configuration(raw: Any, unit: str) -> None:
             _optional(budget, name, "/configuration/effort_budget", lambda v, f: _integer(v, f, 1))
 
 
-def _check_item(raw: Any, where: str, unit: str) -> None:
+def _check_item(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
     item = _object(raw, where)
     _required_string(item, "id", where)
     _optional(item, "quantity", where, lambda v, f: _integer(v, f, 1))
-    _dimensions(_required(item, "dimensions", where), where + "/dimensions", unit)
-    _optional(item, "weight", where, lambda v, f: _measure(v, f, Weight, "g"))
-    _optional(item, "max_top_load", where, lambda v, f: _measure(v, f, Weight, "g"))
-    _optional(item, "nesting_height", where, lambda v, f: _measure(v, f, Length, unit))
-    _optional(item, "nesting_height", where, lambda v, f: _nesting_below_height(v, f, item, unit))
+    _dimensions(_required(item, "dimensions", where), where + "/dimensions", unit, measures)
+    _optional(item, "weight", where, lambda v, f: _measure(v, f, Weight, "g", measures))
+    _optional(item, "max_top_load", where, lambda v, f: _measure(v, f, Weight, "g", measures))
+    _optional(item, "nesting_height", where, lambda v, f: _measure(v, f, Length, unit, measures))
+    _optional(item, "nesting_height", where, lambda v, f: _nesting_below_height(v, f, item, unit, measures))
     _optional(item, "max_stacked_items", where, lambda v, f: _integer(v, f, 1))
     _optional(item, "stop_index", where, lambda v, f: _integer(v, f, 0))
     _optional(item, "value", where, lambda v, f: _integer(v, f, 0))
@@ -227,34 +240,38 @@ def _check_item(raw: Any, where: str, unit: str) -> None:
     _optional(item, "allowed_rotations", where, lambda v, f: _each_one_of(v, f, ROTATIONS))
     _optional(item, "ground_contact_rule", where, lambda v, f: _one_of(v, f, GROUND_CONTACT_RULES))
     _optional(item, "shape_type", where, lambda v, f: _one_of(v, f, SHAPE_TYPES))
+    for name in ITEM_BOOLEANS:
+        _optional(item, name, where, _boolean)
 
 
-def _nesting_below_height(value: Any, field: str, item: Mapping[str, Any], unit: str) -> None:
+def _nesting_below_height(value: Any, field: str, item: Mapping[str, Any], unit: str,
+                          measures: ParsedMeasures) -> None:
     """A nested copy sinks by less than its own height, or it would vanish into the one below
 . Both measures have passed their own rules already. O(1)."""
-    if Length.parse(value, unit).ticks >= Length.parse(item["dimensions"]["height"], unit).ticks:
+    height = measures.read(Length, item["dimensions"]["height"], unit)
+    if measures.read(Length, value, unit).ticks >= height.ticks:
         raise InvalidRequestError("invalid_value", field, "must be less than the item's height")
 
 
-def _check_container(raw: Any, where: str, unit: str) -> None:
+def _check_container(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
     container = _object(raw, where)
     _required_string(container, "id", where)
     _optional(container, "quantity", where, lambda v, f: _integer(v, f, 1))
-    _dimensions(_required(container, "inner_dimensions", where), where + "/inner_dimensions", unit)
-    _optional(container, "outer_dimensions", where, lambda v, f: _dimensions(v, f, unit))
+    _dimensions(_required(container, "inner_dimensions", where), where + "/inner_dimensions", unit, measures)
+    _optional(container, "outer_dimensions", where, lambda v, f: _dimensions(v, f, unit, measures))
     for name in ("tare_weight", "max_payload", "max_stack_density"):
-        _optional(container, name, where, lambda v, f: _measure(v, f, Weight, "g"))
+        _optional(container, name, where, lambda v, f: _measure(v, f, Weight, "g", measures))
     _optional(container, "max_items", where, lambda v, f: _integer(v, f, 1))
     _optional(container, "cost_minor", where, lambda v, f: _integer(v, f, 0))
     _optional(container, "void_fill_reserve_ratio", where, _ratio)
     _optional(container, "access_directions", where, _access_directions)
     _optional(container, "tag_limits", where, _tag_limits)
     _optional(container, "rate_table", where, _rate_table)
-    _optional(container, "obstacles", where, lambda v, f: _obstacles(v, f, unit))
+    _optional(container, "obstacles", where, lambda v, f: _obstacles(v, f, unit, measures))
     _optional(container, "deformable_boundary", where,
               lambda v, f: _deformable_boundary(container, v, f, where))
     _optional(container, "made_to_measure", where,
-              lambda v, f: _made_to_measure(container, v, f, where, unit))
+              lambda v, f: _made_to_measure(container, v, f, where, unit, measures))
 
 
 #: Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md).
@@ -277,7 +294,8 @@ MADE_TO_MEASURE_FIELDS = ("cost_per_square_metre_minor", "increment", "minimum",
                           "tare_per_square_metre")
 
 
-def _made_to_measure(container: Mapping[str, Any], raw: Any, field: str, where: str, unit: str) -> None:
+def _made_to_measure(container: Mapping[str, Any], raw: Any, field: str, where: str, unit: str,
+                     measures: ParsedMeasures) -> None:
     """The made-to-measure rules: shape top to bottom, then each axis, then the price.
 
     Run after every other container field, so an existing error always wins. O(1)."""
@@ -286,15 +304,15 @@ def _made_to_measure(container: Mapping[str, Any], raw: Any, field: str, where: 
     for name in ("minimum", "increment"):
         _required(machine, name, field)
     for name in ("minimum", "increment", "outer_allowance"):
-        _optional(machine, name, field, lambda v, f: _dimensions(v, f, unit))
+        _optional(machine, name, field, lambda v, f: _dimensions(v, f, unit, measures))
     _optional(machine, "cost_per_square_metre_minor", field, lambda v, f: _integer(v, f, 0))
-    _optional(machine, "tare_per_square_metre", field, lambda v, f: _measure(v, f, Weight, "g"))
+    _optional(machine, "tare_per_square_metre", field, lambda v, f: _measure(v, f, Weight, "g", measures))
     if container.get("outer_dimensions") is not None:
         raise InvalidRequestError("not_allowed", pointer_join(where, "outer_dimensions"),
                                   "cannot be combined with made_to_measure")
-    inner = _ticks(container["inner_dimensions"], unit)
-    minimum = _ticks(machine["minimum"], unit)
-    increment = _ticks(machine["increment"], unit)
+    inner = _ticks(container["inner_dimensions"], unit, measures)
+    minimum = _ticks(machine["minimum"], unit, measures)
+    increment = _ticks(machine["increment"], unit, measures)
     for axis, side in enumerate(_SIDES):
         if minimum[axis] == 0:
             raise InvalidRequestError("invalid_value", pointer_join(field, "minimum", side), "must be positive")
@@ -313,8 +331,8 @@ def _made_to_measure(container: Mapping[str, Any], raw: Any, field: str, where: 
                                   f"prices the largest box above {MAX_EXACT_MAGNITUDE}")
 
 
-def _ticks(sides: Mapping[str, Any], unit: str) -> Tuple[int, int, int]:
-    length, width, height = (Length.parse(sides[side], unit).ticks for side in _SIDES)
+def _ticks(sides: Mapping[str, Any], unit: str, measures: ParsedMeasures) -> Tuple[int, int, int]:
+    length, width, height = (measures.read(Length, sides[side], unit).ticks for side in _SIDES)
     return (length, width, height)
 
 
@@ -336,10 +354,10 @@ def _access_directions(raw: Any, where: str) -> None:
     _each_one_of(raw, where, ACCESS_DIRECTIONS)
 
 
-def _dimensions(raw: Any, where: str, unit: str) -> None:
+def _dimensions(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
     sides = _object(raw, where)
     for side in _SIDES:
-        _measure(_required(sides, side, where), pointer_join(where, side), Length, unit)
+        _measure(_required(sides, side, where), pointer_join(where, side), Length, unit, measures)
 
 
 def _stacking_group_name(value: Any, field: str) -> None:
@@ -373,7 +391,7 @@ def _rate_table(raw: Any, where: str) -> None:
     _optional(table, "fuel_surcharge_permille", where, lambda v, f: _integer(v, f, 0))
 
 
-def _obstacles(raw: Any, where: str, unit: str) -> None:
+def _obstacles(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
     for index, entry in enumerate(_list(raw, where)):
         at = pointer_join(where, index)
         obstacle = _object(entry, at)
@@ -381,8 +399,8 @@ def _obstacles(raw: Any, where: str, unit: str) -> None:
         if origin is not None:
             point = _object(origin, at + "/origin")
             for axis in ("x", "y", "z"):
-                _optional(point, axis, at + "/origin", lambda v, f: _measure(v, f, Length, unit))
-        _dimensions(_required(obstacle, "dimensions", at), at + "/dimensions", unit)
+                _optional(point, axis, at + "/origin", lambda v, f: _measure(v, f, Length, unit, measures))
+        _dimensions(_required(obstacle, "dimensions", at), at + "/dimensions", unit, measures)
 
 
 # ------------------------------------------------------------------------------ plumbing

@@ -41,6 +41,7 @@ from packvium.locks import (
     resolve_with_locks,
 )
 from packvium.models import Container, Item, ItemInstance
+from packvium.request_errors import InvalidRequestError
 from packvium.serialization import pack_from_dict
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "conformance" / "fixtures"
@@ -58,6 +59,25 @@ def eight_cubes() -> dict:
     if not fixture.is_file():
         pytest.skip("the shared cross-language fixture corpus is not part of this package")
     return json.loads(fixture.read_text())
+
+
+@pytest.mark.parametrize("length", ["furlong", "", 25, True, {"unit": "mm"}, ["mm"]])
+def test_resolve_reports_the_request_unit_before_reading_items(length):
+    request = eight_cubes()
+    request["units"] = {"length": length}
+    for malformed_item in (False, True):
+        if malformed_item:
+            request["items"][0].pop("dimensions")
+        with pytest.raises(InvalidRequestError) as caught:
+            resolve_with_locks(request, [])
+        assert (caught.value.reason, caught.value.field) == ("invalid_unit", "/units/length")
+
+
+@pytest.mark.parametrize("units", [None, {}, {"length": None}])
+def test_resolve_reads_null_units_as_millimetres(units):
+    request = eight_cubes()
+    request["units"] = units
+    assert count(resolve_with_locks(request, []).result) == 8
 
 
 def placed(result: dict) -> set[tuple[int, str, str, tuple[int, int, int]]]:
@@ -245,7 +265,8 @@ def test_a_lock_that_cannot_apply_to_this_container_does_not_empty_it():
 
     assert not resolve.preserved
     assert count(resolve.result) == 8
-    assert resolve.result["status"] == "feasible"
+    # Eight cubes fill the box exactly, which the bound proves: the load is untouched.
+    assert resolve.result["status"] == "optimal"
 
 
 # -------------------------------------------------------- the constraint itself

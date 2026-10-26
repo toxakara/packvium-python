@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "packvium"
-version = "1.7.0"
+version = "1.8.0"
 description = "Deterministic 3D bin-packing and cartonization engine for pallets, containers, trucks and shipping cartons. Exact integer geometry, reproducible results."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [{name = "Packvium contributors"}]
-keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading", "pallet-packing", "truck-loading", "packing-algorithm", "logistics", "deterministic"]
+keywords = ["3d-bin-packing", "bin-packing", "3d-packing", "cartonization", "container-loading", "pallet-packing", "truck-loading", "packing-algorithm", "logistics", "deterministic", "box-packing", "load-planning"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Topic :: Scientific/Engineering",
   "Topic :: Software Development :: Libraries",
@@ -33,6 +33,7 @@ classifiers = [
 Homepage = "https://packvium.com"
 Source = "https://github.com/toxakara/packvium-python"
 Documentation = "https://packvium.com/docs"
+"Quick start" = "https://github.com/toxakara/packvium-python#quick-start"
 Changelog = "https://github.com/toxakara/packvium-python/blob/main/CHANGELOG.md"
 Issues = "https://github.com/toxakara/packvium-python/issues"
 

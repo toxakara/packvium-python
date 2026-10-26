@@ -531,6 +531,7 @@ def stacked_counts(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = N
 #: route, so nothing can be blocking it -- but it does block everything beneath it.
 #: Ordering it after every real stop expresses both halves at once.
 RIDES_THE_WHOLE_ROUTE = float("inf")
+_NO_STOP_ABOVE = float("-inf")
 
 
 def route_order_violated(units: Sequence[LoadUnit], stops: Sequence[float],
@@ -546,12 +547,36 @@ def route_order_violated(units: Sequence[LoadUnit], stops: Sequence[float],
     post-validator answers; this check is the necessary condition, not the whole of it.
     """
     if all(stop == RIDES_THE_WHOLE_ROUTE for stop in stops): return None
-    for index, above in enumerate(resting_above(units, graph)):
+    graph = graph if graph is not None else LoadSupportGraph(units)
+    max_stop_above = [_NO_STOP_ABOVE] * len(units)
+    for index in graph._descending_indices():
+        best = _NO_STOP_ABOVE
+        for child in graph.children(index):
+            child_stop = stops[child]
+            if child_stop > best:
+                best = child_stop
+            child_above = max_stop_above[child]
+            if child_above > best:
+                best = child_above
+        max_stop_above[index] = best
+    for index, stop in enumerate(stops):
+        if max_stop_above[index] <= stop:
+            continue
         # Ascending, not set order: the detail names the first violator, and PHP and
         # Python must name the same one (S16).
-        for upper in sorted(above):
-            if stops[upper] > stops[index]:
-                return ("unloading_order_violation", f"{units[index].label} blocked by {units[upper].label}")
+        seen: set[int] = set()
+        pending = list(graph.children(index))
+        upper_min: int | None = None
+        while pending:
+            upper = pending.pop()
+            if upper in seen:
+                continue
+            seen.add(upper)
+            if stops[upper] > stop and (upper_min is None or upper < upper_min):
+                upper_min = upper
+            pending.extend(graph.children(upper))
+        assert upper_min is not None
+        return ("unloading_order_violation", f"{units[index].label} blocked by {units[upper_min].label}")
     return None
 
 
@@ -1015,22 +1040,50 @@ class AxleLoadConstraint:
     configured axles sees no new rejection code and no behaviour change.
     """
 
+    __slots__ = ("_placements", "_container", "_base_weight", "_base_moment")
+
+    def __init__(self) -> None:
+        self._placements: tuple[Placement, ...] | None = None
+        self._container: Container | None = None
+        self._base_weight = 0
+        self._base_moment = 0
+
+    def _base_for(
+        self, placements: tuple[Placement, ...], container: Container
+    ) -> tuple[int, int]:
+        if self._placements is placements and self._container is container:
+            return self._base_weight, self._base_moment
+        tare = container.tare_weight.ticks
+        total_weight = tare + sum(p.instance.weight.ticks for p in placements)
+        doubled_weighted_x = tare * container.inner_dimensions.length.ticks + sum(
+            p.instance.weight.ticks
+            * (2 * p.envelope_origin.x + p.envelope_dimensions.length.ticks)
+            for p in placements
+        )
+        self._placements = placements
+        self._container = container
+        self._base_weight = total_weight
+        self._base_moment = doubled_weighted_x
+        return total_weight, doubled_weighted_x
+
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if context.container.axles is None:
             return ConstraintResult.allow()
+        front, rear = context.container.axles
+        front_x = front.position.ticks
+        rear_x = rear.position.ticks
+        denominator = 2 * (rear_x - front_x)
+        base_weight, base_moment = self._base_for(context.placements, context.container)
+        cand_weight = context.item.weight.ticks
         candidate = context.envelope_box
-        nesting = context.item.item.nesting_height
-        units = load_units(context.placements, LoadUnit(
-            candidate, context.item.weight.ticks, None, None, context.item.id,
-            None if nesting is None else context.item.item.id,
-            None if nesting is None else nesting.ticks,
-        ))
-        failure = axle_load_exceeded(
-            context.container.axles,
-            units,
-            context.container.tare_weight.ticks,
-            context.container.inner_dimensions.length.ticks,
+        total_weight = base_weight + cand_weight
+        doubled_weighted_x = base_moment + cand_weight * (
+            2 * candidate.origin.x + candidate.dimensions.length.ticks
         )
-        if failure is not None:
-            return ConstraintResult.reject(*failure)
+        front_numerator = 2 * total_weight * rear_x - doubled_weighted_x
+        rear_numerator = doubled_weighted_x - 2 * total_weight * front_x
+        if front.max_load is not None and front_numerator > front.max_load.ticks * denominator:
+            return ConstraintResult.reject("axle_overloaded", "front")
+        if rear.max_load is not None and rear_numerator > rear.max_load.ticks * denominator:
+            return ConstraintResult.reject("axle_overloaded", "rear")
         return ConstraintResult.allow()

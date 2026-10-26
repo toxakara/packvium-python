@@ -12,9 +12,12 @@ sentence -- the best score the request *could* admit, computed by relaxing the p
 until it becomes arithmetic. Where the achieved score meets the bound, the search is over
 whether or not it explored anything, and the engine knows it.
 
-What it is not. These bounds relax geometry away entirely. Attaining one certifies
-optimality *of the relaxation*, never of the packing, and the difference between those two
-claims is the difference between a true statement and a marketing one.
+What it proves. These bounds relax geometry away entirely, and that is why attaining one is
+a proof about the packing: every packing the request admits is a solution of the relaxation,
+so none scores below its optimum, and a validated packing that attains the bound is optimal
+among them. The proof covers only the rules this library models and only the result's own
+objective; where the bound is missed, the gap is an upper limit on what a longer search
+could gain, not a claim that the gain exists.
 
 Instances that occupy less than their box. The document states this rule for
 `nesting_height`: such an instance occupies less than its nominal volume, so nominal volumes
@@ -37,21 +40,26 @@ dropping it; a compressible item has a computable fully-compressed floor. Both a
 mathematics and belong to the design task, not to this implementation of it -- recorded in
 `docs/OPTIMALITY-CERTIFICATES.md` rather than invented here.
 
-Objective key order. The bounds are keyed to the *default* objective,
+Objective key order. `compute` returns the bounds in the *default* objective's order,
 `(unpacked_count, container_count, total_cost_minor, unused_volume_ppm, stack_height_ppm)`.
-`lowest_cost` and `maximum_value` reorder those keys, so a bound vector compared against
-their score vectors compares different quantities and means nothing. Callers pass the
-objective they scored with.
+`for_request` returns them in the order of the objective a result is scored with:
+`lowest_cost` reads `(L0, L2, L1, L3, L4)`, which the document shows is still a bound, and
+every other objective gets none, because a vector compared against a score that ranks other
+quantities means nothing.
+
+Which instances. The bound is a property of the request, so it is taken over every instance
+the request declares, fixed placements included. A bound over the free instances
+alone counts a fixed item's volume as empty and over-states the unused-volume key.
 
 Complexity. `O(n log n + c log c)` for `n` instances and `c` container types -- one sort of
-the instance volumes, one of the weights, one of the per-unit costs. No geometry is touched
-and no candidate position is generated, which is why this can be computed at the root of a
-search rather than inside it.
+the instance volumes, one of the weights, one of the container types by cost. No geometry is
+touched and no candidate position is generated, which is why the packer computes it once per
+pack, before any solver runs.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Sequence, Tuple
 
 from ._compat import dataclass
 from .constraints import usable_volume
@@ -79,6 +87,14 @@ MAX_BOUND_SUM = 10 ** 30
 #: keys inside ``2**53 - 1`` makes "byte-identical" mean numerically identical as well as
 #: textually similar; a larger cost must be refused before one engine rounds it.
 MAX_BOUND_VALUE = 2 ** 53 - 1
+
+
+#: The objectives a bound is stated for, and where each reads the five bounds: the position
+#: in `compute`'s default-order vector of each of the objective's own score keys.
+OBJECTIVE_ORDERS = {
+    "default": (0, 1, 2, 3, 4),
+    "lowest_cost": (0, 2, 1, 3, 4),
+}
 
 
 class BoundOverflowError(ValueError):
@@ -239,12 +255,40 @@ def _occupies_less_than_its_box(item: Item) -> bool:
     return item.shape_type in (ShapeType.CONVEX_HULL, ShapeType.COMPRESSIBLE)
 
 
-def compute(instances: Sequence[ItemInstance], containers: Sequence[Container]) -> Bounds:
-    """Every bound for one request, at the root of a search.
+def for_request(instances: Sequence[ItemInstance], containers: Sequence[Container],
+                objective: str) -> "Tuple[int, ...] | None":
+    """The request's bound in `objective`'s own score order, or `None` where none is stated.
 
-    The instances are the quantity-expanded list the solver is about to place, and the
-    containers are the types it may open -- both exactly as the request declares them,
-    before any placement decision has been taken.
+    `instances` is every instance the request declares, fixed placements included, and
+    `containers` every type it may open. `None` for an objective with no bound, for a
+    request with a `made_to_measure` container (D13: the unused-volume key would be
+    taken from the machine maximum while the score uses the fabricated box), and for a
+    request past a declared ceiling. The last withholds the bound and nothing else: the pack
+    is still answered, as it was before any bound existed (OPTIMALITY-GAP.md § 1.5).
+
+    A function of the request alone, computed independently of the solver and deadline.
+    Emitting its prefix also checks the result's score and the portable gap ceiling.
+    """
+    order = OBJECTIVE_ORDERS.get(objective)
+    if order is None:
+        return None
+    if any(container.made_to_measure is not None for container in containers):
+        return None
+    try:
+        vector = compute(instances, containers).as_tuple()
+    except BoundOverflowError:
+        return None
+    return tuple(vector[position] for position in order)
+
+
+def compute(instances: Sequence[ItemInstance], containers: Sequence[Container]) -> Bounds:
+    """Every bound for one request, in the default objective's key order.
+
+    The instances are every quantity-expanded instance the request declares -- free and
+    fixed alike -- and the containers are the types it may open, both exactly as the request
+    declares them, before any placement decision has been taken. Raises
+    `BoundOverflowError` where the one refusal predicate of docs/OPTIMALITY-CERTIFICATES.md
+    says the request is past a ceiling.
     """
     volumes = sorted(instance.item.dimensions.volume for instance in instances)
     weights = sorted(instance.weight.ticks for instance in instances)
@@ -326,16 +370,22 @@ def _cost_bound(costs, quantities, opened) -> int:
     still holds.
 
     Inventory is respected rather than assumed unlimited. Charging the cheapest type `L1`
-    times would also be a bound, and a weaker one whenever that type is nearly exhausted;
-    the difference costs one sort.
+    times would also be a bound, and a weaker one whenever that type is nearly exhausted.
+
+    The types are sorted by cost once and taken greedily, `min(quantity, still needed)` of
+    each, which is the sum of the `L1` cheapest entries of the per-unit multiset without
+    building it: `O(c log c)` rather than the `O(c · L1 log(c · L1))` of materialising up to
+    `L1` copies of every type and sorting those (finding F6).
     """
-    if opened <= 0:
-        return 0
-    available: list[int] = []
-    for cost, quantity in zip(costs, quantities):
-        available.extend([cost] * (opened if quantity is None else min(quantity, opened)))
-    available.sort()
-    return _guard(sum(available[:opened]), "opening cost")
+    needed = opened
+    total = 0
+    for cost, quantity in sorted(zip(costs, quantities), key=lambda pair: pair[0]):
+        if needed <= 0:
+            break
+        taken = needed if quantity is None else min(quantity, needed)
+        total += cost * taken
+        needed -= taken
+    return _guard(total, "opening cost")
 
 
 def _unused_volume_bound(volumes, nests, placed, inner, opened) -> int:
@@ -393,3 +443,33 @@ def gap(score: Sequence[int], bound: Bounds) -> Gap:
             absolute = achieved - least
             return Gap(index, absolute, (absolute, least) if least > 0 else None)
     return Gap(None, 0, None)
+
+
+def statement(score: Sequence[int], bound: Sequence[int]) -> "Dict[str, object] | None":
+    """The `optimality` fields one result states against its request's bound (OPTIMALITY-GAP.md
+    § 1.1), or `None` where § 1.5 withholds them.
+
+    `bound` is in the result's own score order. The prefix runs through the first position the
+    score misses, or is the whole bound when nothing is missed -- the attained case, which
+    carries no gap at all rather than a zero one. A score below its bound means the bound is
+    wrong, and an engine must not publish a claim it has just refuted, so nothing is stated.
+    A gap past the portable result ceiling also withholds the whole statement.
+    At most five comparisons, `O(1)`.
+    """
+    for index, (achieved, least) in enumerate(zip(score, bound)):
+        if achieved < least:
+            return None
+        if achieved > least:
+            absolute = achieved - least
+            if absolute > MAX_BOUND_VALUE:
+                return None
+            fields: Dict[str, object] = {
+                "lower_bound": list(bound[:index + 1]),
+                "gap_key": index,
+                "absolute_gap": absolute,
+            }
+            if least > 0:
+                # Unreduced, so the pair reads as (score - bound, bound) by eye.
+                fields["relative_gap"] = {"numerator": absolute, "denominator": least}
+            return fields
+    return {"lower_bound": list(bound)}

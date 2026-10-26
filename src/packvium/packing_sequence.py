@@ -511,16 +511,21 @@ def verify_loading_prefix_business_rules(
     for step, index in enumerate(order):
         present.append(placements[index])
         units = load_units(present)
-        problem = overloaded(units) or stack_limit_exceeded(units) or stack_density_exceeded(units, max_density_ticks)
+        graph = LoadSupportGraph(units)
+        problem = (
+            overloaded(units, graph)
+            or stack_limit_exceeded(units, graph)
+            or stack_density_exceeded(units, max_density_ticks, graph)
+        )
         if problem is None:
-            counts = stacked_counts(units)
+            counts = stacked_counts(units, graph)
             for unit_index, unit in enumerate(units):
                 item = present[unit_index].instance.item
                 if not item.stackable and counts[unit_index] > 0:
                     problem = ("non_stackable_item_has_load", unit.label)
                     break
         if problem is None and grouped:
-            refusal = non_stackable_failure(present, present[-1].instance, LoadSupportGraph(units),
+            refusal = non_stackable_failure(present, present[-1].instance, graph,
                                             len(present) - 1)
             if refusal is not None:
                 problem = (refusal.code, refusal.detail)

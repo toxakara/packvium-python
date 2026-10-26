@@ -161,6 +161,83 @@ def test_null_optionals_are_absent_and_a_valid_request_passes():
     check_request(data)
 
 
+def test_a_request_parses_each_spelling_once(monkeypatch):
+    """The check hands its parses to deserialisation. A value already parsed passes
+    through `parse` untouched and is not counted."""
+    parsed = []
+
+    def spy(kind, parse):
+        def counted(cls, value, *rest):
+            if not isinstance(value, kind):
+                parsed.append((kind.__name__, value))
+            return parse(cls, value, *rest)
+        return classmethod(counted)
+
+    monkeypatch.setattr(Length, "parse", spy(Length, Length.parse.__func__))
+    monkeypatch.setattr(Weight, "parse", spy(Weight, Weight.parse.__func__))
+    pack_from_dict(request())
+    assert sorted(parsed, key=str) == sorted([("Length", "100"), ("Length", "200"), ("Length", 0),
+                                              ("Weight", "1000"), ("Weight", 0)], key=str)
+
+
+def exact_fit_with_object_measures() -> tuple[dict, list[dict]]:
+    """The exact-fit scene (eight 100 mm cubes in a 200 mm box) with its six sides written as `{value, unit}`."""
+    def sides(value: str) -> dict:
+        return {side: {"value": value, "unit": "mm"} for side in ("length", "width", "height")}
+    data = {"configuration": {"solver_profile": "fast"},
+            "items": [{"id": "cube", "quantity": 8, "dimensions": sides("100")}],
+            "containers": [{"id": "box", "inner_dimensions": sides("200")}]}
+    objects = [*data["items"][0]["dimensions"].values(), *data["containers"][0]["inner_dimensions"].values()]
+    return data, objects
+
+
+def counted_length_parses(monkeypatch) -> list:
+    parsed: list = []
+    parse = Length.parse.__func__
+
+    def counted(cls, value, *rest):
+        parsed.append(value)
+        return parse(cls, value, *rest)
+    monkeypatch.setattr(Length, "parse", classmethod(counted))
+    return parsed
+
+
+def test_a_request_parses_each_object_measure_once(monkeypatch):
+    """An object spelling is parsed once per request, as a string is; before, the check
+    and deserialisation parsed each of these six objects once each. Equal objects share it."""
+    data, objects = exact_fit_with_object_measures()
+    parsed = counted_length_parses(monkeypatch)
+    answer = pack_from_dict(data)
+    assert answer["status"] == "optimal"
+    by_object = [sum(value is spelt for value in parsed) for spelt in objects]
+    assert by_object == [1, 0, 0, 1, 0, 0]
+    assert [value for value in parsed if isinstance(value, dict)] == [objects[0], objects[3]]
+
+
+def test_a_refused_object_measure_is_refused_with_the_same_error_every_time():
+    data, _ = exact_fit_with_object_measures()
+    data["containers"][0]["inner_dimensions"]["width"] = {"value": "-1", "unit": "mm"}
+    data["items"][0]["dimensions"]["width"] = {"value": "-1", "unit": "mm"}
+    for _ in range(2):
+        with pytest.raises(InvalidRequestError) as caught:
+            pack_from_dict(data)
+        assert (caught.value.reason, caught.value.field, caught.value.detail) == (
+            "negative_measure", "/items/0/dimensions/width", "cannot be negative")
+
+
+def test_string_and_object_spellings_of_one_value_are_parsed_once_each(monkeypatch):
+    data, objects = exact_fit_with_object_measures()
+    data["items"][0]["dimensions"]["width"] = "100"
+    data["containers"][0]["inner_dimensions"].update(width="200 mm", height={"value": 200})
+    parsed = counted_length_parses(monkeypatch)
+    answer = pack_from_dict(data)
+    assert answer["status"] == "optimal"
+    spellings = [value if isinstance(value, str) else (value["value"], value.get("unit"))
+                 for value in parsed if not isinstance(value, (int, Length))]
+    assert sorted(spellings, key=str) == sorted(
+        ["100", "200 mm", ("100", "mm"), ("200", "mm"), (200, None)], key=str)
+
+
 def test_a_pointer_escapes_tilde_and_slash():
     assert pointer("containers", 0, "tag_limits", "a/b~c") == "/containers/0/tag_limits/a~1b~0c"
 
@@ -169,6 +246,28 @@ def test_a_units_object_without_a_length_keeps_millimetres():
     data = request()
     data["units"] = {}
     check_request(data)
+
+
+@pytest.mark.parametrize("units, output", [(None, None), ({"length": None}, None),
+                                           ({}, {"length_unit": None, "weight_unit": None})])
+def test_a_null_unit_is_the_default_when_packing(units, output):
+    """Null is the schema's default in `units` and `output` too: before, the rule table admitted
+    it and deserialisation read it as a unit code, an AttributeError."""
+    data = request()
+    data.update(units=units, output=output)
+    placed = pack_from_dict(data)["containers"][0]["placements"][0]
+    assert placed["position"]["x"]["unit"] == "mm"
+
+
+@pytest.mark.parametrize("length", [25, True, {"unit": "mm"}, ["mm"], "", "furlong"])
+def test_a_units_length_that_is_no_known_code_is_an_unknown_unit(length):
+    """The schema types `units.length` by its enum alone, so a number or an object is an unknown
+    unit, as at every measure's own `unit`, not `wrong_type`."""
+    data = request()
+    data["units"] = {"length": length}
+    with pytest.raises(InvalidRequestError) as caught:
+        pack_from_dict(data)
+    assert (caught.value.reason, caught.value.field) == ("invalid_unit", "/units/length")
 
 
 def test_an_unparsable_fixed_coordinate_is_named():

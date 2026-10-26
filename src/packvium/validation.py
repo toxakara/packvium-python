@@ -56,7 +56,8 @@ class IndependentSolutionValidator:
                                         or p.instance.item.ground_contact_rule not in (None, "free")
                                         for p in placements))
             stack_sensitive = any(is_stack_sensitive(p.instance.item) for p in placements)
-            stack_graph = LoadSupportGraph(load_units(placements)) if stack_sensitive else None
+            units = load_units(placements)
+            stack_graph = LoadSupportGraph(units) if stack_sensitive else None
             for left, right in self._collision_pairs(placements):
                 issues.append(ValidationIssue(
                     "collision",
@@ -101,11 +102,14 @@ class IndependentSolutionValidator:
                         issues.append(ValidationIssue(result.code, f"{item_id}: {result.detail}"))
             # A second, whole-container bearing pass: the per-placement check above
             # reports the first offender it meets, this one is anchored on the container.
-            units = load_units(packed.placements)
             density_limit = None if packed.container.max_stack_density is None else packed.container.max_stack_density.ticks
-            failure = (overloaded(units) or crushed(units) or stack_limit_exceeded(units)
-                       or stack_density_exceeded(units, density_limit))
-            if failure is not None: issues.append(ValidationIssue(failure[0], f"{packed.id}: {failure[1]}"))
+            if stack_sensitive or density_limit is not None:
+                if stack_graph is None:
+                    stack_graph = LoadSupportGraph(units)
+                failure = (overloaded(units, stack_graph) or crushed(units, stack_graph)
+                           or stack_limit_exceeded(units, stack_graph)
+                           or stack_density_exceeded(units, density_limit, stack_graph))
+                if failure is not None: issues.append(ValidationIssue(failure[0], f"{packed.id}: {failure[1]}"))
             if packed.container.axles is not None:
                 axle_failure = axle_load_exceeded(
                     packed.container.axles,

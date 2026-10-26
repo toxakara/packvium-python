@@ -13,9 +13,11 @@ name: release
 # wants. The environment is what turns "anyone who can push a tag" into "a release a
 # named person approved".
 
+# A pre-release tag (`v1.9.0-rc.1`) never reaches the production registries: the negated
+# pattern must follow the positive one, and `rc.yml` takes those tags instead.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "!v*-*"]
 
 permissions:
   contents: read

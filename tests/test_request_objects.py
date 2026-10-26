@@ -143,6 +143,11 @@ ON_ITS_OWN = [
      lambda r: r["configuration"].update(max_candidate_points=8)),
     ("zero effort limit", lambda: EffortBudget(max_restarts=0),
      lambda r: r["configuration"].update(effort_budget={"max_restarts": 0})),
+    # A truthy value is not `True`.
+    *[(f"{name} not a boolean", lambda n=name: cube(**{n: "no"}), lambda r, n=name: r["items"][0].update({n: "no"}))
+      for name in ("keep_upright", "stackable", "must_be_on_floor")],
+    ("require_placement_coordinates not a boolean", lambda: PackingConfig.fast(require_placement_coordinates=0),
+     lambda r: r["configuration"].update(require_placement_coordinates=0)),
 ]
 
 
@@ -176,6 +181,11 @@ def test_accepted_stacking_groups_are_checked_in_code_point_order() -> None:
 def test_a_mistyped_measure_is_still_a_type_error() -> None:
     with pytest.raises(TypeError):
         Length.mm(1.5)
+
+
+def test_a_mistyped_flag_is_also_a_type_error() -> None:
+    with pytest.raises(TypeError, match="stackable must be a boolean"):
+        cube(stackable="no")
 
 
 def test_a_constructor_refusal_keeps_its_own_message() -> None:

@@ -41,6 +41,12 @@ LENGTH_TICKS = {
     "ft": 4_876_800, "tick": 1, "ticks": 1,
 }
 
+#: Every name the engines read in `units.length`, after stripping ASCII whitespace and lowering
+#: ASCII case, to the `LENGTH_TICKS` key it means.
+REQUEST_LENGTH_UNITS = {**{name: name for name in LENGTH_TICKS}, "millimeter": "mm", "millimeters": "mm"}
+
+_ASCII_SPACE = " \t\n\r\x0b\x0c"
+
 #: Weight ticks per unit. One tick is 1/8 microgram.
 WEIGHT_TICKS = {
     "mg": 8_000, "g": 8_000_000, "kg": 8_000_000_000,
@@ -247,20 +253,53 @@ class ContainerSpec:
     made_to_measure: "MachineSpec | None" = None
 
 
+def _flag(raw: dict, key: str, default: bool, where: str) -> bool:
+    """A field the request schema types boolean: absent or null is its default, and any other
+    non-boolean is refused, as every engine refuses it, rather than read by truthiness."""
+    value = raw.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise MalformedResult(f"{where}.{key} must be a boolean")
+    return value
+
+
+def _length_unit(request: dict) -> str:
+    """`units.length` as every engine reads it: `units` or `units.length` absent or
+    null is millimetres; `units` that is not an object, or a length unit the engines do not
+    know, is refused naming the field rather than failing inside the arithmetic."""
+    units = request.get("units")
+    if units is None:
+        return "mm"
+    if not isinstance(units, dict):
+        raise MalformedResult("units must be an object")
+    length = units.get("length")
+    if length is None:
+        return "mm"
+    key = length.strip(_ASCII_SPACE) if isinstance(length, str) else ""
+    if not key.isascii() or key.lower() not in REQUEST_LENGTH_UNITS:
+        raise MalformedResult("units.length must be one of mm, cm, m, in, ft")
+    return REQUEST_LENGTH_UNITS[key.lower()]
+
+
 def _parse_items(request: dict, unit: str) -> dict[str, ItemSpec]:
     items = {}
-    for raw in request["items"]:
+    for index, raw in enumerate(request["items"]):
+        where = f"items[{index}]"
+        keep_upright = _flag(raw, "keep_upright", False, where)
+        stackable = _flag(raw, "stackable", True, where)
+        must_be_on_floor = _flag(raw, "must_be_on_floor", False, where)
         rotations = raw.get("allowed_rotations")
         if rotations is None:
-            rotations = UPRIGHT_ROTATIONS if raw.get("keep_upright") else tuple(ROTATIONS)
+            rotations = UPRIGHT_ROTATIONS if keep_upright else tuple(ROTATIONS)
         items[raw["id"]] = ItemSpec(
             id=raw["id"],
             dimensions=dimensions_to_ticks(raw["dimensions"], unit),
             weight=to_ticks(raw.get("weight", 0), "g", WEIGHT_TICKS),
             quantity=raw.get("quantity", 1),
             allowed_rotations=tuple(rotations),
-            stackable=raw.get("stackable", True),
-            must_be_on_floor=raw.get("must_be_on_floor", False),
+            stackable=stackable,
+            must_be_on_floor=must_be_on_floor,
             max_top_load=(
                 None if raw.get("max_top_load") is None
                 else to_ticks(raw["max_top_load"], "g", WEIGHT_TICKS)
@@ -397,7 +436,7 @@ def _envelope(placement: dict, clearance: int) -> Box:
 
 
 def _materialize_lattice_summaries(
-    request: dict,
+    coordinates_required: bool,
     result: dict,
     items: dict[str, ItemSpec],
     containers: dict[str, ContainerSpec],
@@ -415,16 +454,13 @@ def _materialize_lattice_summaries(
         return result
 
     expanded = deepcopy(result)
-    coordinates_optional = (
-        request.get("configuration", {}).get("require_placement_coordinates") is False
-    )
     for packed in expanded["containers"]:
         summary = packed.get("lattice_summary")
         if summary is None:
             continue
 
         container_id = packed.get("id", "?")
-        if not coordinates_optional:
+        if coordinates_required:
             issues.append(Issue(
                 "unexpected_lattice_summary",
                 f"{container_id}: request requires explicit placement coordinates",
@@ -1213,10 +1249,10 @@ def _check_container(
         left, left_placement, left_spec = left_value
         right, right_placement, right_spec = right_value
         if (left.intersects(right)
-                and _solids_overlap(_placed_hull(left, left_placement, left_spec),
-                                    _placed_hull(right, right_placement, right_spec))
                 and not _valid_nesting(
-                    left, left_placement, left_spec, right, right_placement, right_spec)):
+                    left, left_placement, left_spec, right, right_placement, right_spec)
+                and _solids_overlap(_placed_hull(left, left_placement, left_spec),
+                                    _placed_hull(right, right_placement, right_spec))):
             issues.append(Issue("collision", f"{left_id} with {right_id} in {packed['id']}"))
         if (
             left_spec is not None and right_spec is not None
@@ -1231,8 +1267,9 @@ def _check_container(
     _check_support_and_load(
         packed, envelopes, supporters, direct_above, global_support, issues
     )
-    _check_stack_density(packed, envelopes, supporters, spec.max_stack_density, issues)
-    _check_crush(packed, envelopes, supporters, issues)
+    loads = _propagate_load(envelopes, supporters)
+    _check_stack_density(packed, envelopes, loads, spec.max_stack_density, issues)
+    _check_crush(packed, envelopes, loads, issues)
     _check_route_removal_order(packed, envelopes, direct_above, spec.inner,
                                spec.access_directions, issues)
 
@@ -1259,18 +1296,19 @@ def _check_container(
                 f"{packed['id']}: {tag} count {count} > limit {limit}",
             ))
 
-    loads = _propagate_load(envelopes, supporters)
     used = sum(
         _occupied_volume(envelopes[p["item_id"]][0], p, items.get(p["item_type"]),
                          loads[p["item_id"]])
         for p in packed["placements"]
     )
-    for (_, left_value), (_, right_value) in combinations(envelopes.items(), 2):
-        left, left_placement, left_spec = left_value
-        right, right_placement, right_spec = right_value
-        if _valid_nesting(left, left_placement, left_spec, right, right_placement, right_spec):
-            assert left_spec is not None and left_spec.nesting_height is not None
-            used -= left_spec.nesting_height * left.length * left.width
+    if any(item_spec is not None and item_spec.nesting_height is not None
+           for _, _, item_spec in envelopes.values()):
+        for (_, left_value), (_, right_value) in combinations(envelopes.items(), 2):
+            left, left_placement, left_spec = left_value
+            right, right_placement, right_spec = right_value
+            if _valid_nesting(left, left_placement, left_spec, right, right_placement, right_spec):
+                assert left_spec is not None and left_spec.nesting_height is not None
+                used -= left_spec.nesting_height * left.length * left.width
     reported_volume = packed.get("used_volume_ticks3")
     if reported_volume is not None and int(reported_volume) != used:
         issues.append(Issue("used_volume_mismatch",
@@ -1379,11 +1417,11 @@ def _valid_nesting(
 ) -> bool:
     if (
         left_spec is None
+        or left_spec.nesting_height is None
         or right_spec is None
+        or right_spec.nesting_height != left_spec.nesting_height
         or left_spec.id != right_spec.id
         or left_placement["item_type"] != right_placement["item_type"]
-        or left_spec.nesting_height is None
-        or right_spec.nesting_height != left_spec.nesting_height
     ):
         return False
     if (left.x, left.y, left.x2, left.y2) != (right.x, right.y, right.x2, right.y2):
@@ -1587,7 +1625,7 @@ def _propagate_load(
 def _check_crush(
     packed: dict,
     envelopes: dict[str, tuple[Box, dict, "ItemSpec | None"]],
-    supporters: dict[str, list[tuple[str, int]]],
+    loads: dict[str, int],
     issues: list[Issue],
 ) -> None:
     """No `compressible` item may carry more pressure than it declared.
@@ -1604,7 +1642,6 @@ def _check_crush(
     if all(spec is None or spec.max_compression_pressure_kpa is None
            for _, _, spec in envelopes.values()):
         return
-    loads = _propagate_load(envelopes, supporters)
     for item_id, (envelope, _, spec) in envelopes.items():
         if spec is None or spec.max_compression_pressure_kpa is None:
             continue
@@ -1625,7 +1662,7 @@ def _check_crush(
 def _check_stack_density(
     packed: dict,
     envelopes: dict[str, tuple[Box, dict, ItemSpec | None]],
-    supporters: dict[str, list[tuple[str, int]]],
+    loads: dict[str, int],
     max_density: int | None,
     issues: list[Issue],
 ) -> None:
@@ -1636,7 +1673,6 @@ def _check_stack_density(
     """
     if max_density is None:
         return
-    loads = _propagate_load(envelopes, supporters)
     for item_id, (envelope, _, spec) in envelopes.items():
         if spec is None:
             continue
@@ -1790,8 +1826,9 @@ def validate(request: dict, result: dict) -> list[Issue]:
         if key not in result:
             raise MalformedResult(f"result is missing {key!r}")
 
-    unit = request.get("units", {}).get("length", "mm")
+    unit = _length_unit(request)
     configuration = request.get("configuration", {})
+    coordinates_required = _flag(configuration, "require_placement_coordinates", True, "configuration")
     clearance = to_ticks(configuration.get("clearance", 0), unit, LENGTH_TICKS)
     global_support = Fraction(str(configuration.get("minimum_support_ratio", 0)))
 
@@ -1800,7 +1837,7 @@ def validate(request: dict, result: dict) -> list[Issue]:
 
     issues: list[Issue] = []
     validated_result = _materialize_lattice_summaries(
-        request, result, items, containers, clearance, issues
+        coordinates_required, result, items, containers, clearance, issues
     )
     _check_structure(validated_result, issues)
     _check_algorithm_metrics(validated_result, issues)
@@ -1851,7 +1888,9 @@ def validate(request: dict, result: dict) -> list[Issue]:
     _check_fixed_placements(request, validated_result, unit, issues)
     _check_groups(request, validated_result, issues)
     _check_solver_selection(request, validated_result, issues)
-    _check_objective(request, validated_result, containers, items, clearance, issues, fabricated)
+    score = _check_objective(request, validated_result, containers, items, clearance, issues,
+                             fabricated)
+    _check_optimality_bound(request, validated_result, items, containers, score, issues)
     return issues
 
 
@@ -2310,7 +2349,8 @@ def _landed_charge_minor(spec: "ContainerSpec", billed_weight_ticks: int) -> int
 
 def _check_objective(request: dict, result: dict, containers: dict[str, ContainerSpec],
                      items: dict[str, ItemSpec], clearance: int, issues: list[Issue],
-                     fabricated: dict[str, ContainerSpec] | None = None) -> None:
+                     fabricated: dict[str, ContainerSpec] | None = None) -> list[int]:
+    """Check the reported score against the recomputed one; return the reported score."""
     configuration = request.get("configuration", {})
     selected = configuration.get("objective", "default")
     reported_name = result.get("objective")
@@ -2329,6 +2369,7 @@ def _check_objective(request: dict, result: dict, containers: dict[str, Containe
     )
     if reported != recomputed:
         issues.append(Issue("score_mismatch", f"reported {reported}, recomputed {recomputed}"))
+    return reported
 
 
 def _check_solver_selection(request: dict, result: dict, issues: list[Issue]) -> None:
@@ -2374,3 +2415,360 @@ def _check_groups(request: dict, result: dict, issues: list[Issue]) -> None:
         if packed.get(group, 0) != expected[group]:
             issues.append(Issue("group_partially_packed",
                                 f"{group}: {packed.get(group, 0)} of {expected[group]} placed"))
+
+
+# ------------------------------------------------------------- optimality bound
+
+#: Where each covered objective reads `(L0, L1, L2, L3, L4)` in its own score order
+#: (docs/OPTIMALITY-CERTIFICATES.md, "Per-objective vectors"). Any other objective has no bound.
+BOUND_ORDERS: dict[str, tuple[int, ...]] = {
+    "default": (0, 1, 2, 3, 4),
+    "lowest_cost": (0, 2, 1, 3, 4),
+}
+
+#: The one refusal predicate's two ceilings.
+MAX_BOUND_SUM = 10 ** 30
+MAX_BOUND_VALUE = 2 ** 53 - 1
+
+#: Values sorted ascending, each with how many instances carry it. Formed per item type rather
+#: than per instance, so a quantity of a million costs one entry.
+Runs = tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class BoundContainer:
+    """One container type as the bound reads it, `None` wherever the request sets no limit."""
+
+    inner_volume: int
+    base_area: int
+    height: int
+    usable: int
+    cost_minor: int
+    payload: int | None
+    max_items: int | None
+    quantity: int | None
+
+
+def _runs(pairs: Sequence[tuple[int, int]]) -> Runs:
+    return tuple(sorted(pairs, key=lambda pair: pair[0]))
+
+
+def _run_count(runs: Runs) -> int:
+    return sum(count for _, count in runs)
+
+
+def _fit(runs: Runs, capacity: int | None) -> int:
+    """How many of the smallest values sum to at most `capacity`; all of them when unlimited."""
+    if capacity is None:
+        return _run_count(runs)
+    if capacity < 0:
+        return 0
+    taken = used = 0
+    for value, count in runs:
+        room = count if value == 0 else min(count, (capacity - used) // value)
+        taken += room
+        used += value * room
+        if room < count:
+            break
+    return taken
+
+
+def _smallest(runs: Runs, count: int) -> int:
+    """The sum of the `count` smallest values."""
+    total = 0
+    for value, available in runs:
+        if count <= 0:
+            break
+        taken = min(available, count)
+        total += value * taken
+        count -= taken
+    return total
+
+
+def _largest(runs: Runs, count: int) -> int:
+    return _smallest(tuple(reversed(runs)), count)
+
+
+def _capacity_total(values: Sequence[int | None], quantities: Sequence[int | None]) -> int | None:
+    """`Σ value × quantity`, or `None` when it is unbounded: some type sets no limit, or an
+    unlimited quantity of a type whose limit is positive. A type that holds nothing adds 0."""
+    total = 0
+    for value, quantity in zip(values, quantities):
+        if value is None:
+            return None
+        if quantity is None:
+            if value > 0:
+                return None
+            continue
+        total += value * quantity
+    return total
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return -(-numerator // denominator)
+
+
+def _container_bound(volumes: Runs, weights: Runs, shrinks: bool, placed: int,
+                     containers: Sequence[BoundContainer]) -> int:
+    """`L1`, given `L0`: the largest capacity of every kind granted to every container."""
+    if placed <= 0 or not containers:
+        return 0
+    bound = 1
+    largest_volume = max(container.usable for container in containers)
+    if not shrinks and largest_volume > 0:
+        bound = max(bound, _ceil_div(_smallest(volumes, placed), largest_volume))
+    payloads = [container.payload for container in containers]
+    if all(payload is not None for payload in payloads):
+        largest_payload = max(payload for payload in payloads if payload is not None)
+        if largest_payload > 0:
+            bound = max(bound, _ceil_div(_smallest(weights, placed), largest_payload))
+    slots = [container.max_items for container in containers]
+    if all(slot is not None for slot in slots):
+        largest_slots = max(slot for slot in slots if slot is not None)
+        if largest_slots > 0:
+            bound = max(bound, _ceil_div(placed, largest_slots))
+    return bound
+
+
+def _cost_bound(containers: Sequence[BoundContainer], opened: int) -> int:
+    """`L2`: the `opened` cheapest containers the inventory holds, greedily by cost."""
+    total = 0
+    for container in sorted(containers, key=lambda container: container.cost_minor):
+        if opened <= 0:
+            break
+        taken = opened if container.quantity is None else min(container.quantity, opened)
+        total += container.cost_minor * taken
+        opened -= taken
+    return total
+
+
+def _unused_bound(volumes: Runs, shrinks: bool, placed: int,
+                  containers: Sequence[BoundContainer], opened: int) -> int:
+    """`L3`: the summed per-container ppm, less the `opened - 1` the ceilings can lose."""
+    inner = [container.inner_volume for container in containers if container.inner_volume > 0]
+    if opened <= 0 or shrinks or not inner:
+        return 0
+    filled = _ceil_div(_largest(volumes, placed) * SCORE_SCALE, min(inner))
+    return max(0, opened * SCORE_SCALE - filled - (opened - 1))
+
+
+def _height_bound(volumes: Runs, shrinks: bool, placed: int,
+                  containers: Sequence[BoundContainer], opened: int) -> int:
+    """`L4`: the placed volume over the widest floor, in the tallest container, less the
+    `opened - 1` the per-container floors can lose."""
+    floors = [container.base_area for container in containers if container.base_area > 0]
+    heights = [container.height for container in containers if container.height > 0]
+    if opened <= 0 or shrinks or not floors or not heights:
+        return 0
+    required = _ceil_div(_smallest(volumes, placed), max(floors))
+    return max(0, required * SCORE_SCALE // max(heights) - (opened - 1))
+
+
+def lower_bound(volumes: Runs, weights: Runs, shrinks: bool,
+                containers: Sequence[BoundContainer]) -> tuple[int, ...] | None:
+    """`(L0, L1, L2, L3, L4)` of docs/OPTIMALITY-CERTIFICATES.md, or `None` where its one
+    refusal predicate withholds the bound.
+
+    The validator's own copy, written from that document and held to its oracle
+    (`scripts/optimality_bounds.py`) on the shared scene: the engines' copies are what it
+    checks. `shrinks` drops every volume term, because an instance that can occupy less than
+    its box stops nominal volumes summing. Over `t` value runs and `c` container types it costs
+    O(t + c log c) after the runs are sorted, and O(t + c) memory.
+    """
+    quantities = [container.quantity for container in containers]
+    guarded = (
+        sum(value * count for value, count in volumes),
+        sum(value * count for value, count in weights),
+        _capacity_total([container.usable for container in containers], quantities),
+        _capacity_total([container.payload for container in containers], quantities),
+        _capacity_total([container.max_items for container in containers], quantities),
+    )
+    if any(total is not None and total > MAX_BOUND_SUM for total in guarded):
+        return None
+    count = _run_count(volumes)
+    placeable = count
+    if containers:
+        if not shrinks:
+            placeable = min(placeable, _fit(volumes, guarded[2]))
+        placeable = min(placeable, _fit(weights, guarded[3]))
+        if guarded[4] is not None:
+            placeable = min(placeable, guarded[4])
+    else:
+        placeable = 0
+    opened = _container_bound(volumes, weights, shrinks, placeable, containers)
+    bound = (
+        count - placeable,
+        opened,
+        _cost_bound(containers, opened),
+        _unused_bound(volumes, shrinks, placeable, containers, opened),
+        _height_bound(volumes, shrinks, placeable, containers, opened),
+    )
+    return None if any(value > MAX_BOUND_VALUE for value in bound) else bound
+
+
+def _bound_inputs(items: dict[str, ItemSpec], containers: dict[str, ContainerSpec],
+                  ) -> tuple[Runs, Runs, bool, tuple[BoundContainer, ...]]:
+    """The request as the bound reads it: every instance, fixed placements included (they are
+    part of their item's quantity), and every declared container type."""
+    volumes = _runs([(spec.dimensions[0] * spec.dimensions[1] * spec.dimensions[2], spec.quantity)
+                     for spec in items.values()])
+    weights = _runs([(spec.weight, spec.quantity) for spec in items.values()])
+    shrinks = any(spec.quantity > 0 and (spec.nesting_height is not None
+                                         or spec.shape_type in ("convex_hull", "compressible"))
+                  for spec in items.values())
+    bound_containers = []
+    for spec in containers.values():
+        volume = spec.inner[0] * spec.inner[1] * spec.inner[2]
+        scaled = _ratio_ppm(spec.void_fill_reserve_ratio)
+        reserved = (volume // SCORE_SCALE) * scaled + ((volume % SCORE_SCALE) * scaled) // SCORE_SCALE
+        bound_containers.append(BoundContainer(
+            inner_volume=volume, base_area=spec.inner[0] * spec.inner[1], height=spec.inner[2],
+            usable=volume - reserved, cost_minor=spec.cost_minor, payload=spec.max_payload,
+            max_items=spec.max_items, quantity=spec.quantity,
+        ))
+    return volumes, weights, shrinks, tuple(bound_containers)
+
+
+def objective_lower_bound(request: dict) -> tuple[int, ...] | None:
+    """The lower bound a result for `request` may state, in its objective's score order, or
+    `None` where docs/OPTIMALITY-GAP.md § 1.5 says no bound is stated."""
+    unit = _length_unit(request)
+    items = _parse_items(request, unit)
+    containers = _parse_containers(request, unit)
+    return _stated_bound(request, "feasible", items, containers)[0]
+
+
+def _stated_bound(request: dict, status: Any, items: dict[str, ItemSpec],
+                  containers: dict[str, ContainerSpec]) -> tuple[tuple[int, ...] | None, str]:
+    """The bound in the objective's score order, or `None` with the reason none is stated
+    (docs/OPTIMALITY-GAP.md § 1.5)."""
+    objective_name = request.get("configuration", {}).get("objective", "default")
+    order = BOUND_ORDERS.get(objective_name)
+    if order is None:
+        return None, f"objective {objective_name!r} has no bound"
+    if any(spec.made_to_measure is not None for spec in containers.values()):
+        return None, "a container is made to measure"
+    if status == "infeasible":
+        return None, "status is 'infeasible'"
+    if status == "invalid_result":
+        return None, "status is 'invalid_result'"
+    bound = lower_bound(*_bound_inputs(items, containers))
+    if bound is None:
+        return None, "the request is past a declared ceiling"
+    return tuple(bound[position] for position in order), ""
+
+
+def _departure(score: Sequence[int], bound: Sequence[int]) -> tuple[int, int] | None:
+    """The first position where `score` leaves `bound`, with the sign of the difference.
+
+    Lexicographic, because each bound holds only over packings attaining the ones before it:
+    once a position is missed, the later positions say nothing.
+    """
+    for index, (achieved, floor) in enumerate(zip(score, bound)):
+        if achieved != floor:
+            return index, 1 if achieved > floor else -1
+    return None
+
+
+def _is_count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _expected_gap(score: Sequence[int], bound: Sequence[int],
+                  departure: tuple[int, int] | None) -> tuple[int, dict[str, Any]]:
+    """The prefix length and the three gap fields a correct result carries (§ 1.1)."""
+    if departure is None:
+        return len(bound), {"gap_key": None, "absolute_gap": None, "relative_gap": None}
+    key = departure[0]
+    absolute = score[key] - bound[key]
+    relative = None if bound[key] == 0 else (absolute, bound[key])
+    return key + 1, {"gap_key": key, "absolute_gap": absolute, "relative_gap": relative}
+
+
+def _gap_field_matches(name: str, actual: Any, expected: Any) -> bool:
+    if expected is None:
+        return actual is None
+    if name != "relative_gap":
+        return type(actual) is int and actual == expected
+    return (isinstance(actual, dict) and len(actual) == 2
+            and type(actual.get("numerator")) is int and actual["numerator"] == expected[0]
+            and type(actual.get("denominator")) is int and actual["denominator"] == expected[1])
+
+
+def _gap_text(name: str, expected: Any) -> str:
+    if expected is None:
+        return "absent"
+    return f"{expected[0]}/{expected[1]}" if name == "relative_gap" else str(expected)
+
+
+def _check_reported_bound(emitted: list[int], score: Sequence[int], bound: Sequence[int],
+                          departure: tuple[int, int] | None, fact: dict,
+                          issues: list[Issue]) -> None:
+    """`lower_bound` is the recomputed prefix, and the gap agrees with it and the score."""
+    if emitted != list(bound[:len(emitted)]):
+        issues.append(Issue("optimality_bound_mismatch",
+                            f"reported {emitted}, recomputed {list(bound[:len(emitted)])}"))
+    length, gap = _expected_gap(score, bound, departure)
+    if len(emitted) != length:
+        issues.append(Issue("optimality_gap_mismatch",
+                            f"lower_bound has {len(emitted)} entries, expected {length}"))
+    for name, expected in gap.items():
+        if not _gap_field_matches(name, fact.get(name), expected):
+            issues.append(Issue("optimality_gap_mismatch",
+                                f"{name} should be {_gap_text(name, expected)}"))
+
+
+def _check_optimality_bound(request: dict, result: dict, items: dict[str, ItemSpec],
+                            containers: dict[str, ContainerSpec], score: list[int],
+                            issues: list[Issue]) -> None:
+    """The bound and the gap of docs/OPTIMALITY-GAP.md § 6.2, recomputed from the
+    request, and the one route to `optimal` they open (§ 1.3, Q1).
+
+    Absence is never an issue: it makes no claim, so it cannot make a false one, and results
+    from producers that predate the field stay valid. O(t log t + c log c) for `t` item types
+    and `c` container types, once per result.
+    """
+    fact = result["optimality"]
+    bound, withheld = _stated_bound(request, result["status"], items, containers)
+    departure = None if bound is None else _departure(score, bound)
+    below = bound is not None and departure is not None and departure[1] < 0
+    if bound is not None and departure is not None and below:
+        key = departure[0]
+        issues.append(Issue("score_below_bound",
+                            f"score[{key}] is {score[key]}, below its lower bound {bound[key]}"))
+
+    emitted = fact.get("lower_bound")
+    if (emitted is not None and bound is not None and departure is not None
+            and score[departure[0]] - bound[departure[0]] > MAX_BOUND_VALUE):
+        issues.append(Issue("optimality_gap_mismatch", "the gap exceeds the portable result ceiling"))
+    well_formed = (isinstance(emitted, list) and 1 <= len(emitted) <= 5
+                   and all(_is_count(value) for value in emitted))
+    if emitted is None:
+        if any(fact.get(name) is not None for name in ("gap_key", "absolute_gap", "relative_gap")):
+            issues.append(Issue("optimality_gap_mismatch", "a gap is reported without lower_bound"))
+    elif not well_formed:
+        issues.append(Issue("optimality_bound_mismatch",
+                            "lower_bound must be a list of 1 to 5 non-negative integers"))
+    elif bound is None:
+        issues.append(Issue("optimality_bound_mismatch",
+                            f"lower_bound is reported where no bound is stated: {withheld}"))
+    elif below:
+        issues.append(Issue("optimality_bound_mismatch",
+                            "lower_bound is reported for a score below the recomputed bound"))
+    else:
+        _check_reported_bound(emitted, score, bound, departure, fact, issues)
+
+    attained = bound is not None and departure is None
+    complete = bool(result["complete"])
+    if result["status"] == "optimal" and not (complete and attained):
+        issues.append(Issue("result_fact_mismatch",
+                            "status 'optimal' requires a complete result that attains the "
+                            "recomputed lower bound"))
+    claims_attainment = well_formed and emitted == list(score)
+    if result["status"] == "feasible" and complete and claims_attainment:
+        issues.append(Issue("result_fact_mismatch",
+                            "status is 'feasible', but the result attains its lower_bound; "
+                            "expected 'optimal'"))
+    if fact.get("code") == "proven_optimal" and not claims_attainment:
+        issues.append(Issue("unproven_optimality_claim",
+                            "optimality.code is 'proven_optimal' without an attained lower_bound"))

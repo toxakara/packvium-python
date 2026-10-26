@@ -3,14 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 
+from . import bounds
 from .config import PackingConfig
 from .extensions import (ExtensionRegistry, SolutionScorer, UnknownObjectiveError,
                          resolve_objective_scorer, unpriceable_container)
 from .fixed_placements import admit_fixed_placements
 from .models import Container, Item, PackingRequest, UnratedWeightError
 from .request_objects import check_objects
-from .result import AlgorithmReport, PackingResult, PackingStatus
-from .result import aggregate_termination, unsupported_placements_warning
+from .result import AlgorithmReport, PackingResult, PackingStatus, ResultFact
+from .result import aggregate_termination, derive_result_facts, unsupported_placements_warning
 from .solvers import Deadline, SolverOrchestrator
 from contextlib import nullcontext
 
@@ -33,6 +34,16 @@ class Packer:
         self.solution_scorer = solution_scorer
         self.clock = clock
         self.trace = trace
+
+    def _objective_bound(self, request: PackingRequest) -> "tuple[int, ...] | None":
+        """The request's lower bound in the objective's score order, or `None`.
+
+        Over every instance, fixed placements included. A custom solution scorer
+        ranks by positions the bound knows nothing about, so it gets none.
+        """
+        if self.solution_scorer is not None:
+            return None
+        return bounds.for_request(request.instances, request.containers, self.config.objective)
 
     def pack(self, items, containers, fixed_placements=()) -> PackingResult:
         items, containers, fixed_placements = tuple(items), tuple(containers), tuple(fixed_placements)
@@ -68,6 +79,10 @@ class Packer:
             request, self.config.minimum_support_ratio, self.config.clearance,
             self.config.max_containers,
         )
+        # Once per pack, from the request alone and before the first solver runs, so that
+        # computing the bound never depends on which solver won, how many starts ran or
+        # how much of the deadline was left (OPTIMALITY-GAP.md F3).
+        objective_bound = self._objective_bound(request)
         deadline = (
             Deadline(self.config.time_limit_ms, clock=self.clock)
             if self.clock is not None
@@ -89,7 +104,6 @@ class Packer:
             score = scorer.score(raw)
             if raw.unpacked and raw.time_limit_reached: status = PackingStatus.TIME_LIMIT
             elif raw.unpacked: status = PackingStatus.BEST_FOUND
-            elif raw.exhaustive: status = PackingStatus.OPTIMAL
             else: status = PackingStatus.FEASIBLE
             warnings = ()
             if self.config.validate_result:
@@ -140,6 +154,7 @@ class Packer:
                 termination.attributes["global_deadline_reached"]
                 or raw.time_limit_reached
             )
+            status, optimality = _stated_optimality(status, score, objective_bound, raw.unpacked)
             ranked.append(PackingResult(
                 status,
                 raw.containers,
@@ -158,6 +173,7 @@ class Packer:
                 score,
                 warnings,
                 termination=termination,
+                optimality=optimality,
                 objective=self.config.objective,
             ))
         if not ranked:
@@ -203,3 +219,27 @@ class Packer:
             best.optimality,
             best.objective,
         )
+
+
+def _stated_optimality(
+    status: PackingStatus,
+    score: "tuple[int, ...]",
+    objective_bound: "tuple[int, ...] | None",
+    unpacked: "tuple[object, ...]",
+) -> "tuple[PackingStatus, ResultFact | None]":
+    """The status and `optimality` fact one ranked result states (OPTIMALITY-GAP.md § 1.3).
+
+    Attainment is the only route to `optimal`: a complete result whose score meets the bound
+    on every position is proven, and nothing else is -- an exhausted candidate set covers only
+    the points it generated. `None` keeps the fact derived from the status alone, which is
+    every result the bound does not speak for (§ 1.5).
+    """
+    if objective_bound is None or status is PackingStatus.INVALID_RESULT:
+        return status, None
+    fields = bounds.statement(score, objective_bound)
+    if fields is None:
+        return status, None
+    if not unpacked and "gap_key" not in fields:
+        status = PackingStatus.OPTIMAL
+    code = derive_result_facts(status, not unpacked, False)[2].code
+    return status, ResultFact(code, fields)

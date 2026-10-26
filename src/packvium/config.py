@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ._request_error import refused
+from ._request_error import refused, refused_type
 from ._compat import dataclass
 from enum import Enum
 
@@ -81,6 +81,9 @@ class PackingConfig:
             raise refused(reason, "minimum_support_ratio must be between 0 and 1")
         if self.dimensional_weight_divisor is not None and self.dimensional_weight_divisor <= 0:
             raise refused("below_minimum", "dimensional_weight_divisor must be positive")
+        if not isinstance(self.require_placement_coordinates, bool):
+            # A truthiness reading would take `"no"` as yes.
+            raise refused_type("require_placement_coordinates must be a boolean")
         for name, allowed in (("dimensional_weight_length_unit", LENGTH_UNIT_CODES),
                               ("dimensional_weight_weight_unit", WEIGHT_UNIT_CODES)):
             if getattr(self, name) not in allowed:

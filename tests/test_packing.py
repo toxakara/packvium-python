@@ -541,34 +541,40 @@ def test_incompatible_items_are_separated():
 
 # ------------------------------------------------------------------- reporting
 
-def test_exact_small_does_not_claim_global_optimality_without_a_certificate():
-    """The discrete search stops at its first full packing and has no lower-bound
-    certificate for the remaining objective keys."""
+def test_exact_small_claims_optimality_only_through_the_bound():
+    """The discrete search proves nothing by stopping; the request's lower bound does when
+    the packing attains it on every key (OPTIMALITY-GAP.md § 1.3). A perfect fill of one
+    container attains it, and the result carries the bound it attained."""
     items = [item("a", 100, 100, 100, quantity=2), item("b", 100, 100, 100, quantity=2)]
     containers = [container("box", 200, 200, 100)]
     result = pack(items, containers, PackingConfig.exact_small(time_limit_ms=5_000))
 
     assert result.complete
-    assert result.status is PackingStatus.FEASIBLE
+    assert result.status is PackingStatus.OPTIMAL
+    assert result.to_dict()["optimality"] == {"code": "proven_optimal",
+                                              "lower_bound": list(result.score)}
 
 
-def test_a_single_item_type_takes_the_lattice_path_and_claims_no_proof():
-    """The lattice cannot prove optimality, so it must not be reported as optimal even
-    when it happens to fill the container perfectly."""
+def test_a_single_item_type_on_the_lattice_path_is_proven_by_the_bound_alone():
+    """The lattice cannot prove optimality itself; a perfect fill is proven by the bound,
+    whichever solver produced it, and by nothing else."""
     items = [item("cube", 100, 100, 100, quantity=4)]
     containers = [container("box", 200, 200, 100)]
     result = pack(items, containers, PackingConfig.exact_small(time_limit_ms=5_000))
 
     assert result.complete
-    assert result.status is PackingStatus.FEASIBLE
+    assert result.status is PackingStatus.OPTIMAL
 
 
-def test_a_complete_heuristic_answer_reports_feasible_not_optimal():
-    """A heuristic that filled the order still has not proved it could not do better."""
-    items = [item("cube", 50, 50, 50, quantity=16)]
+def test_a_complete_heuristic_answer_that_misses_its_bound_reports_feasible_not_optimal():
+    """A heuristic that filled the order has not proved it could not do better unless it
+    attains the bound: one layer of 30 mm cubes stands 30 mm tall where the volume alone
+    needs 11, so the stack-height key is missed and the gap says by how much."""
+    items = [item("cube", 30, 30, 30, quantity=16)]
     containers = [container("box", 200, 200, 200)]
     result = pack(items, containers, PackingConfig.balanced())
     assert result.status is PackingStatus.FEASIBLE
+    assert result.to_dict()["optimality"]["gap_key"] == 4
 
 
 def test_an_incomplete_answer_within_the_budget_reports_best_found():
@@ -697,7 +703,8 @@ def test_quantity_compression_still_validates_end_to_end_when_requested():
 
     result = pack(items, containers, config)
 
-    assert result.status is PackingStatus.FEASIBLE
+    # Two hundred cubes fill a fifth of the bin; the bound proves nothing beats one bin.
+    assert result.status is PackingStatus.OPTIMAL
     assert result.warnings == ()
     assert result.containers[0].placements == ()
     assert result.containers[0].lattice_summary is not None

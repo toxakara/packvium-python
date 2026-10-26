@@ -15,6 +15,7 @@ from packvium import (Container, Dimensions, EffortBudget, InvalidRequestError, 
 from packvium.made_to_measure import (MAX_EXACT_INTEGER, SQUARE_METRE_TICKS2, box_cost_minor,
                                       fabricate, icbrt_ceil, instance_edges, per_square_metre,
                                       solving_envelopes)
+from packvium import bounds
 from packvium.models import PackedContainer, PackingRequest, Placement
 from packvium.solvers import (ContainerState, Deadline, ExtremePointSolver, SearchStats,
                               SingleContainerSolution, SolverOrchestrator, TimeLimitReached)
@@ -276,11 +277,8 @@ def test_an_exact_search_is_never_reported_optimal_and_sets_no_root_bound():
     data["configuration"]["solver_profile"] = "exact_small"
     data["items"][0]["quantity"] = 2
     assert pack_from_dict(data)["optimality"]["code"] == "not_proven"
-    stats = SearchStats()
     declared = Container("machine", Dimensions.mm(1510, 1510, 1510), made_to_measure=machine())
-    SolverOrchestrator._record_root_bound(ExtremePointSolver(), True, (), (declared,),
-                                          PackingConfig.quality(), stats)
-    assert stats.objective_lower_bound is None
+    assert bounds.for_request((), (declared,), "default") is None
 
 
 def test_a_load_larger_than_the_machine_opens_a_second_compact_box():
