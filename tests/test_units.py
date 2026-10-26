@@ -13,8 +13,8 @@ from fractions import Fraction
 
 import pytest
 
-from packvium import Length, Rounding, Weight
-from packvium.units import _fraction, _rounded
+from packvium import InvalidRequestError, Length, Rounding, Weight
+from packvium.units import ParsedMeasures, _fraction, _rounded
 
 
 # --------------------------------------------------------------------- constants
@@ -164,6 +164,16 @@ def test_unsupported_units_are_rejected():
         Length.mm(1).as_fraction("furlong")
 
 
+@pytest.mark.parametrize("unit", [None, 5, [], {}])
+def test_a_unit_that_is_no_code_is_an_unknown_unit(unit):
+    """Refused as the JSON path refuses it, never an AttributeError from the lookup."""
+    for build in (lambda: Length.of(1, unit), lambda: Length.parse("1", unit),
+                  lambda: Weight.of(1, unit), lambda: Weight.parse("1", unit)):
+        with pytest.raises(InvalidRequestError) as caught:
+            build()
+        assert caught.value.reason == "invalid_unit"
+
+
 def test_negative_measures_are_rejected():
     with pytest.raises(ValueError):
         Length(-1)
@@ -205,3 +215,75 @@ def test_decimal_rendering_round_trips(text):
 def test_to_dict_carries_the_exact_ticks_alongside_the_display_value():
     assert Length.inches(1).to_dict("mm") == {"ticks": 406_400, "value": "25.4", "unit": "mm"}
     assert Weight.of(1, "kg").to_dict("g") == {"ticks": 8_000_000_000, "value": "1000", "unit": "g"}
+
+
+# ---------------------------------------------------------------------- parsed once per request
+
+def test_parsed_measures_answer_a_repeated_spelling_with_the_first_parse():
+    measures = ParsedMeasures()
+    first = measures.read(Length, "500", "mm")
+    assert measures.read(Length, "500", "mm") is first
+    assert measures.read(Length, "500", "cm") == Length.of(500, "cm")
+    assert measures.read(Weight, "500", "g") == Weight.of(500, "g")
+
+
+def test_parsed_measures_never_answer_a_boolean_with_an_integer():
+    measures = ParsedMeasures()
+    assert measures.read(Length, 1, "mm") == Length.mm(1)
+    with pytest.raises(TypeError):
+        measures.read(Length, True, "mm")
+
+
+def test_parsed_measures_refuse_a_bad_spelling_on_every_read():
+    measures = ParsedMeasures()
+    for _ in range(2):
+        with pytest.raises(ValueError, match="cannot be negative"):
+            measures.read(Length, "-1", "mm")
+
+
+def test_parsed_measures_answer_a_repeated_object_with_the_first_parse():
+    measures = ParsedMeasures()
+    first = measures.read(Length, {"value": "2", "unit": "in"}, "mm")
+    assert first == Length.inches(2)
+    assert measures.read(Length, {"value": "2", "unit": "in"}, "mm") is first
+    assert measures.read(Length, {"value": "2"}, "in") is first
+    assert measures.read(Length, {"value": "2"}, "mm") == Length.mm(2)
+
+
+def test_parsed_measures_key_an_object_by_each_field_and_its_type():
+    measures = ParsedMeasures()
+    assert measures.read(Length, {"value": 1}, "mm") == Length.mm(1)
+    assert measures.read(Length, {"value": "1"}, "cm") == Length.of(1, "cm")
+    assert measures.read(Length, {"value": "1", "unit": "cm"}, "mm") == Length.of(1, "cm")
+    with pytest.raises(TypeError, match="a boolean is not a measure"):
+        measures.read(Length, {"value": True}, "mm")
+    assert measures.read(Weight, {"value": 1}, "g") == Weight.of(1, "g")
+
+
+def test_parsed_measures_leave_what_is_no_spelling_to_the_parser():
+    measures = ParsedMeasures()
+    length = Length.mm(3)
+    assert measures.read(Length, length, "mm") is length
+    assert measures.read(Length, Decimal("2.5"), "mm") == Length.of("2.5", "mm")
+    for _ in range(2):
+        with pytest.raises(KeyError):
+            measures.read(Length, {"unit": "mm"}, "mm")
+
+
+@pytest.mark.parametrize("spelling, error, message", [
+    ({"value": "-1", "unit": "mm"}, ValueError, "length cannot be negative"),
+    ({"value": "1", "unit": "furlong"}, ValueError, "unsupported length unit: furlong"),
+    ({"value": True}, TypeError, "a boolean is not a measure"),
+    ({"value": [1]}, ValueError, r"invalid decimal or fraction: \[1\]"),
+    ({"value": "1", "unit": ["mm"]}, ValueError, r"unsupported length unit: \['mm'\]"),
+])
+def test_parsed_measures_refuse_a_bad_object_on_every_read(spelling, error, message):
+    """A refused object is never kept, and one the table cannot hash is the parser's to refuse,
+    so every read raises what `parse` raises."""
+    measures = ParsedMeasures()
+    with pytest.raises(error, match=message) as direct:
+        Length.parse(spelling, "mm")
+    for _ in range(2):
+        with pytest.raises(type(direct.value), match=message) as caught:
+            measures.read(Length, spelling, "mm")
+        assert str(caught.value) == str(direct.value)

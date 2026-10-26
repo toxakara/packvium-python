@@ -10,7 +10,7 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.7.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.8.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -71,7 +71,8 @@ Item.create("mug", Dimensions.mm("100", "100", "120"), "12 oz")
 ```
 
 A JSON request refuses a float measure rather than rounding it: send `"160.5"`, not
-`160.5`. See
+`160.5`. Its `units` sets only the length unit; a weight takes its unit from the measure or is
+grams, and `units.weight` is ignored today. See
 [docs/UNITS-AND-NUMERICS.md](https://github.com/toxakara/packvium-python/blob/main/docs/UNITS-AND-NUMERICS.md).
 
 ## Getting the same answer every time
@@ -100,6 +101,11 @@ The result says what stopped the search: `result.termination.code` is `complete`
 replay_level` (a submodule `import packvium` does not load), gives the same verdict as
 `exact` or `not_guaranteed`. `reproducibility.py` shows four simulated machines giving four
 different answers under a clock, and one answer under a budget.
+
+`effort_limit` means the budget stopped work the search still had: a search that finishes on
+exactly its budget reads `complete`, and under a budget `time_limit_ms` is one fuse for the
+whole solve, not a slice per start. `termination.any_start_truncated` says whether the budget
+cut a start that might have won.
 
 ## Solver profiles
 
@@ -244,6 +250,10 @@ instead: `PYTHONPATH=src python3 examples/trucking.py`.
   maximal-space and bounded exact search, selected by problem shape and profile.
 - **Answers you can check.** Every solution is re-validated by logic independent of the
   search. Unplaced items come back with a reason code, not silently missing.
+- **A proof, or the distance to one.** Under the `default` and `lowest_cost` objectives every
+  result states `optimality.lower_bound`. A complete result that attains it reports `optimal`,
+  which proves no packing obeying the request's rules scores better; any other carries the gap
+  to the bound (`gap_key`, `absolute_gap`, `relative_gap`).
 - **Deterministic when you ask for it.** The same request with an `effort_budget` gives the
   same result on every run and machine. A search stopped by `time_limit_ms` keeps what it
   reached, which can differ between runs; `termination` says which happened.
@@ -300,7 +310,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.7"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.8"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -322,7 +332,7 @@ CodeMeta form.
 @software{packvium_python,
   author  = {{Packvium contributors}},
   title   = {Packvium for Python},
-  version = {1.7.0},
+  version = {1.8.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

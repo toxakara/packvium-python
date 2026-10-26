@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from fractions import Fraction
 import re
-from typing import Any
+from typing import Any, Optional, Tuple, Type, TypeVar
 
 
 class Rounding(str, Enum):
@@ -50,6 +50,12 @@ def _fraction(value: int | str | Decimal | Fraction) -> Fraction:
         return Fraction(Decimal(text))
     except InvalidOperation as error:
         raise refused("wrong_type", f"invalid decimal or fraction: {text}") from error
+
+
+def _unit_key(unit: object) -> str | None:
+    """A unit code as the tables key it, or None for a value that is no code at all: `None` or
+    a number is an unknown unit, as the JSON path refuses it, not an AttributeError."""
+    return unit.lower().strip() if isinstance(unit, str) else None
 
 
 def _non_negative(ticks: int, kind: str) -> int:
@@ -111,7 +117,7 @@ class Length:
 
     @classmethod
     def of(cls, value: int | str | Decimal | Fraction, unit: str = "mm", rounding: Rounding = Rounding.NEAREST) -> "Length":
-        key = unit.lower().strip()
+        key = _unit_key(unit)
         if key not in cls._MULTIPLIERS:
             raise refused("invalid_unit", f"unsupported length unit: {unit}")
         return cls(_non_negative(_rounded(_fraction(value) * cls._MULTIPLIERS[key], rounding), "length"))
@@ -183,7 +189,7 @@ class Weight:
 
     @classmethod
     def of(cls, value: Any, unit: str = "g", rounding: Rounding = Rounding.NEAREST) -> "Weight":
-        key = unit.lower().strip()
+        key = _unit_key(unit)
         if key not in cls._MULTIPLIERS:
             raise refused("invalid_unit", f"unsupported weight unit: {unit}")
         return cls(_non_negative(_rounded(_fraction(value) * cls._MULTIPLIERS[key], rounding), "weight"))
@@ -213,6 +219,60 @@ class Weight:
 
     def to_dict(self, unit: str = "g") -> dict[str, int | str]:
         return {"ticks": self.ticks, "value": self.decimal(unit), "unit": unit}
+
+
+_Measure = TypeVar("_Measure", Length, Weight)
+
+
+class ParsedMeasures:
+    """The measures one request spells, each spelling parsed once.
+
+    The request check parses every measure to refuse a bad one, and deserialisation reads the
+    same spellings again to build the model. A parse is a pure function of the spelling, its
+    kind and the default unit, so a repeated read returns the first one's value. The key carries
+    the spelling's type, so `True` never answers for `1`; a `{value, unit}` object is keyed by
+    the two fields `parse` reads, each with its type, so `{"value": 1}` never answers for
+    `{"value": "1"}`. A refused spelling is not kept, so it is refused again with the same
+    error, and an object with a field the key cannot hash is parsed on every read. Lives for one request: O(1) per
+    read, O(distinct spellings) memory."""
+
+    __slots__ = ("_parsed",)
+
+    def __init__(self) -> None:
+        self._parsed: dict[tuple[Any, ...], Any] = {}
+
+    def read(self, kind: Type[_Measure], value: Any, default_unit: str) -> _Measure:
+        if not isinstance(value, (str, int, float)):
+            return self._read_object(kind, value, default_unit)
+        key = (kind, type(value), value, default_unit)
+        parsed = self._parsed.get(key)
+        if parsed is None:
+            parsed = self._parsed[key] = kind.parse(value, default_unit)
+        return parsed
+
+    def _read_object(self, kind: Type[_Measure], value: Any, default_unit: str) -> _Measure:
+        key = _object_key(kind, value, default_unit)
+        if key is None:
+            return kind.parse(value, default_unit)
+        try:
+            parsed = self._parsed.get(key)
+        except TypeError:
+            # An unhashable field (a list as `value`) is the parser's to refuse, as it was
+            # before objects were kept.
+            return kind.parse(value, default_unit)
+        if parsed is None:
+            parsed = self._parsed[key] = kind.parse(value, default_unit)
+        return parsed
+
+
+def _object_key(kind: type, value: Any, default_unit: str) -> Optional[Tuple[Any, ...]]:
+    """The two fields `kind.parse` reads from a `{value, unit}` object, each with its type, or
+    None for anything else, which is parsed on every read. An object without `value` is left
+    to `parse` to refuse."""
+    if not isinstance(value, dict) or "value" not in value:
+        return None
+    field, unit = value["value"], value.get("unit", default_unit)
+    return (kind, dict, type(field), field, type(unit), unit)
 
 
 def output_length_unit(request_unit: str) -> str:

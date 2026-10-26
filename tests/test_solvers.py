@@ -813,12 +813,15 @@ def test_selection_counts_and_answers_as_the_full_sorted_scan_does(width):
     assert (stats.placements_attempted, stats.collision_checks) == pair_by_pair_counts(state, item)
 
 
-def pair_by_pair_counts(state, item):
-    """Attempts and collision checks counted one (point, rotation) pair at a time."""
+def pair_by_pair_counts(state, item, limit=None):
+    """Attempts and collision checks counted one (point, rotation) pair at a time, stopping
+    before the attempt past `limit`."""
     inner = state.container.inner_dimensions
     attempts = checks = 0
     for point in state.ordered_points:
         for _, dims in item.dimensions.unique_rotations(item.item.allowed_rotations):
+            if attempts == limit:
+                return attempts, checks
             attempts += 1
             x2, y2, z2 = point.x + dims.length.ticks, point.y + dims.width.ticks, point.z + dims.height.ticks
             if x2 > inner.length.ticks or y2 > inner.width.ticks or z2 > inner.height.ticks:
@@ -831,12 +834,16 @@ def pair_by_pair_counts(state, item):
     return attempts, checks
 
 
-def test_a_stop_mid_scan_leaves_every_counter_where_the_scanned_points_put_it():
+def test_a_stop_mid_scan_lands_on_the_limit_and_only_a_stop_is_recorded():
+    """The scan stops on the attempt past the limit, inside a point if need be, so the
+    counter ends on the limit and never past it, with every other counter where the attempted
+    pairs put it. A scan that finishes on exactly its limit was not stopped."""
     config, constraints = config_and_constraints()
     state = populated_state(config)
     item, = instances("x", 30, 20, 10)
     full = SearchStats()
     find_candidates(state, item, config, constraints, full, generous(), 1)
+    assert full.placements_attempted % len(item.dimensions.unique_rotations(item.item.allowed_rotations)) == 0
     stops = 0
     for limit in range(1, full.placements_attempted + 1):
         stats = SearchStats()
@@ -845,11 +852,10 @@ def test_a_stop_mid_scan_leaves_every_counter_where_the_scanned_points_put_it():
             find_candidates(state, item, config, constraints, stats, deadline, 1)
         except TimeLimitReached:
             stops += 1
-        scanned = state.ordered_points[:stats.candidate_points_considered]
-        reference = SearchStats()
-        find_candidates(state, item, config, constraints, reference, generous(), 1, points=scanned)
-        assert stats == reference
-    assert stops > 1
+        assert stats.placements_attempted == limit
+        assert (stats.placements_attempted, stats.collision_checks) == pair_by_pair_counts(state, item, limit)
+        assert deadline.effort_stopped == (limit < full.placements_attempted)
+    assert stops == full.placements_attempted - 1
 
 
 def _hull_wedge(id, quantity):
@@ -1645,6 +1651,30 @@ def test_the_fast_block_start_enumerates_one_mode_and_balanced_both():
     assert orchestrator._block_start(cartons, PackingConfig.fast(), box).modes == ("count",)
     assert orchestrator._block_start(cartons, PackingConfig.fast(objective="maximum_volume"), box).modes == ("volume",)
     assert orchestrator._block_start(cartons, PackingConfig.balanced(), box).modes == ("count", "volume")
+
+
+@pytest.mark.parametrize("config", [
+    PackingConfig.fast(solvers=("homogeneous_blocks",)),
+    PackingConfig.balanced(solvers=("homogeneous_blocks",)),
+])
+def test_a_named_block_solver_outside_quality_carries_the_block_start_bound(config):
+    # Both profiles leave `container_plan_node_limit` at one, short of the first block.
+    box = Container.create("box", Dimensions.mm(600, 400, 250))
+    solution = HomogeneousBlockSolver().pack_one(
+        box, 1, _four_similar_cartons(), config, SearchStats(), generous(),
+    )
+    assert solution.unpacked == ()
+    assert not solution.time_limit_reached
+
+
+def test_a_node_limit_stop_is_the_search_answer_not_a_time_limit():
+    box = Container.create("box", Dimensions.mm(600, 400, 250))
+    config = PackingConfig.quality(container_plan_node_limit=1)
+    solution = HomogeneousBlockSolver().pack_one(
+        box, 1, _four_similar_cartons(), config, SearchStats(), generous(),
+    )
+    assert len(solution.unpacked) == 4
+    assert not solution.time_limit_reached
 
 
 @pytest.mark.parametrize(("order_name", "greedy"), [

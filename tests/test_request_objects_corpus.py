@@ -42,6 +42,9 @@ _NEGATIVE_POSITION = ("a Point cannot hold a negative coordinate; the measure it
 
 _AS_LETTERS = "the deserializer reads text as the sequence of its letters, so the objects hold other values"
 _OUTPUT = "the output units are arguments of PackingResult.to_dict, not part of the objects packed"
+_UNITS = "the request's length unit is an argument of each measure, not an object packed"
+_UNIT_KEY = ("the deserializer's parse cache is keyed by the unit, which an object or a list cannot key; "
+             "Length.of refuses one as invalid_unit (test_units.py)")
 
 #: Cases with no object form: the value cannot be held, or the deserializer changes it.
 NOT_OBJECTS: dict[str, str] = {
@@ -92,6 +95,11 @@ NOT_OBJECTS: dict[str, str] = {
     "output-length-unit-unknown": _OUTPUT,
     "output-weight-unit-unknown": _OUTPUT,
     "output-before-configuration": _OUTPUT,
+    # The request's length unit is an argument of each measure, not an object of its own.
+    "units-not-object": _UNITS,
+    "units-list": _UNITS,
+    "units-length-object": _UNIT_KEY,
+    "units-length-list": _UNIT_KEY,
 }
 
 #: Cases the object path answers differently on purpose (docs/ERRORS.md).
@@ -103,10 +111,12 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
     "an-item-id-before-its-quantity": _CONSTRUCTOR_FIRST,
     "item-ids-before-containers": _CONSTRUCTOR_FIRST,
     "container-ids-before-fixed-placements": _CONSTRUCTOR_FIRST,
+    "configuration-boolean-before-effort-budget": ("two faults: the EffortBudget is built, and refuses "
+                                                   "its own value, before the PackingConfig that holds it"),
 }
 
 #: Pinned, so the skip set cannot grow without this line changing too.
-SKIPPED = 57
+SKIPPED = 62
 
 
 @dataclass(frozen=True)

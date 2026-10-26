@@ -376,9 +376,11 @@ def resolve_with_locks(request: Mapping[str, Any], locks: Sequence[PlacementLock
     and `docs/EXECUTION-PLAN.md` makes the direction of that dependency a rule.
     """
     from .serialization import _item, pack_from_dict
+    from .request_errors import _check_units
 
     locks = tuple(locks)
-    unit = (request.get("units") or {}).get("length", "mm")
+    # Admit the unit before reading measures, with the ordinary request's error and field.
+    unit = _check_units(request.get("units"))
     _refuse_a_contradictory_set(locks, {
         raw["id"]: _item(raw, unit) for raw in request.get("items") or ()
     })

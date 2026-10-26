@@ -1,10 +1,11 @@
-"""The root lower bound is actually computed where the task says it is.
+"""The request-level bound is computed where the design says, once per pack.
 
 The cross-implementation agreement and corpus soundness live in
 `conformance/tests/test_optimality_bounds_engine.py`. What is asserted here is the wiring:
-that an `exact_small` or global-beam solve really does record a bound, that it stays out of
-the serialised result, and that the number it records is sound against the packing that
-solve produced.
+that the packer computes the bound exactly once per pack, before the first solver, for every
+solver and every covered objective, from every instance of the request; that the result
+states it as OPTIMALITY-GAP.md § 1.1 says; and that the number is sound against
+the packing that pack produced.
 
 That last part is why this is not a mock test. `hull_refinements` set the precedent for an
 internal counter and nothing ever asserted it fired, so "internal" quietly became
@@ -23,10 +24,11 @@ sys.path.insert(0, str(ROOT / "packvium-python" / "src"))
 
 import packvium  # noqa: E402
 from packvium import bounds, solvers  # noqa: E402
+from packvium.extensions import DefaultSolutionScorer  # noqa: E402
 
 #: Four differently-shaped items. Identical items reach `GridSolver`'s quantity-compression
-#: fast path, which answers before either target solver is consulted -- a request that never
-#: exercises the code under test while looking like it does.
+#: fast path, which answers before most solvers are consulted -- a request that would make
+#: "for every solver" true of only one of them.
 ITEMS = [
     {
         "id": f"i{index}",
@@ -41,106 +43,242 @@ ITEMS = [
 ]
 CONTAINERS = [{"id": "c", "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
 
-
-def _pack(monkeypatch, configuration):
-    """Pack, and return the result together with every bound the solve computed."""
-    recorded: list[tuple] = []
-    original = bounds.compute
-
-    def spy(instances, containers):
-        computed = original(instances, containers)
-        recorded.append(computed.as_tuple())
-        return computed
-
-    monkeypatch.setattr(solvers.bounds, "compute", spy)
-    result = packvium.pack_from_dict({
-        "containers": CONTAINERS,
-        "items": ITEMS,
-        "configuration": dict(configuration, time_limit_ms=20000),
-    })
-    return result, recorded
-
-
-@pytest.mark.parametrize("configuration,expected_solver", [
-    ({"solver_profile": "exact_small"}, "exact_small"),
-    ({"container_plan_beam_width": 4}, None),
-])
-def test_a_bound_is_recorded_for_the_solvers_the_task_names(monkeypatch, configuration,
-                                                            expected_solver):
-    """`exact_small` and the global container-set beam each reach the root bound."""
-    result, recorded = _pack(monkeypatch, configuration)
-    assert recorded, f"no lower bound was computed for {configuration}"
-    if expected_solver is not None:
-        assert result["algorithm"]["solver"].startswith(expected_solver)
-
-
-@pytest.mark.parametrize("configuration", [
+#: Every built-in profile, and the global container-set beam, which the old per-start bound
+#: was confined to together with `exact_small`.
+SOLVES = [
+    {"solver_profile": "fast"},
+    {"solver_profile": "balanced"},
+    {"solver_profile": "quality"},
     {"solver_profile": "exact_small"},
     {"container_plan_beam_width": 4},
-    {"solver_profile": "exact_small", "container_plan_beam_width": 4},
-])
-def test_the_recorded_bound_is_sound_against_the_packing_it_bounded(monkeypatch,
-                                                                    configuration):
-    """The bound and the arrangement come from the same solve, so they must agree.
+]
 
-    `gap` raises on a score below its bound rather than returning a negative number, so
-    calling it is the assertion.
+
+#: Taken once, so that a second `_pack` in one test wraps the real functions rather than the
+#: first call's spies.
+_FOR_REQUEST = bounds.for_request
+_SOLVE = solvers.SolverOrchestrator.solve
+
+
+def _spy(monkeypatch):
+    """Record every request-level bound, and its order against the solves."""
+    recorded: list = []
+    events: list[str] = []
+
+    def spy_bound(instances, containers, objective):
+        computed = _FOR_REQUEST(instances, containers, objective)
+        recorded.append(computed)
+        events.append("bound")
+        return computed
+
+    def spy_solve(self, *arguments, **keywords):
+        events.append("solve")
+        return _SOLVE(self, *arguments, **keywords)
+
+    monkeypatch.setattr(bounds, "for_request", spy_bound)
+    monkeypatch.setattr(solvers.SolverOrchestrator, "solve", spy_solve)
+    return recorded, events
+
+
+def _pack(monkeypatch, configuration, request=None):
+    """Pack, and return the result with every request-level bound and when it was taken.
+
+    `events` interleaves "bound" with "solve" so that "before the first solver" is read from
+    the order of calls rather than assumed.
     """
-    result, recorded = _pack(monkeypatch, configuration)
-    score = [int(component) for component in result["score"]]
-    for bound in recorded:
-        bounds.gap(score, bounds.Bounds(*bound))
+    recorded, events = _spy(monkeypatch)
+    document = request or {"containers": CONTAINERS, "items": ITEMS}
+    document = dict(document, configuration={"time_limit_ms": 20000, **configuration})
+    return packvium.pack_from_dict(document), recorded, events
 
 
-def test_the_bound_does_not_reach_the_serialised_result(monkeypatch):
-    """Reporting a gap to a caller is a new public result field, and this project reserves
-    and rejects such a field before a contract freeze rather than adding it mid-line.
-
-    Also the practical half: `algorithm.metrics` is serialised into every result, so a new
-    key there changes the bytes of every committed golden and would have to land in all four
-    engines at once.
-    """
-    result, recorded = _pack(monkeypatch, {"solver_profile": "exact_small"})
-    assert recorded, "the guard below would pass vacuously if nothing was computed"
-    metrics = result["algorithm"]["metrics"]
-    leaked = [key for key in metrics if "bound" in key or "gap" in key]
-    assert not leaked, f"the internal bound leaked into algorithm.metrics as {leaked}"
+@pytest.mark.parametrize("configuration", SOLVES, ids=lambda c: str(next(iter(c.values()))))
+def test_one_bound_per_pack_before_the_first_solver_for_every_solver(monkeypatch, configuration):
+    """F3: the old bound was taken per start, and only on the beam or `exact_small`."""
+    result, recorded, events = _pack(monkeypatch, configuration)
+    assert events[0] == "bound" and events.count("bound") == 1, events
+    assert recorded[0] is not None
+    assert tuple(int(c) for c in result["score"]) >= recorded[0]
 
 
-def test_an_ordinary_solve_computes_no_bound(monkeypatch):
-    """The constructive heuristics have nothing to add to it and do not pay for it.
-
-    A capacity relaxation says the same thing whoever asks, so computing it for `grid` or
-    `layer` would be arithmetic nobody reads -- and this stays true until a caller-facing
-    field exists to read it.
-    """
-    _result, recorded = _pack(monkeypatch, {"solver_profile": "fast"})
-    assert not recorded
+def test_the_bound_does_not_depend_on_the_deadline(monkeypatch):
+    """A start the deadline never reaches used to record nothing, so presence followed the
+    clock. Computed from the request alone, the bound is the same under any budget."""
+    _, generous, _ = _pack(monkeypatch, {"solver_profile": "quality"})
+    _, starved, _ = _pack(monkeypatch, {"solver_profile": "quality", "time_limit_ms": 1})
+    assert generous == starved and generous[0] is not None
 
 
-def test_a_non_default_objective_records_no_bound(monkeypatch):
-    """`lowest_cost` orders its score keys differently, so a bound vector compared against
-    it would line up cost against container count.
-
-    Recording nothing is the honest answer; recording a vector that cannot be compared is
-    how a wrong gap gets published later.
-    """
-    _result, recorded = _pack(
+def test_lowest_cost_gets_the_same_bound_in_its_own_order(monkeypatch):
+    """`lowest_cost` scores `(count, cost, containers, unused, height)`; the bound is the same
+    five numbers moved to those positions, and still never above the packing."""
+    _, default, _ = _pack(monkeypatch, {"solver_profile": "exact_small"})
+    result, cheapest, _ = _pack(
         monkeypatch, {"solver_profile": "exact_small", "objective": "lowest_cost"})
-    assert not recorded
+    unpacked, count, cost, unused, height = default[0]
+    assert cheapest[0] == (unpacked, cost, count, unused, height)
+    assert tuple(int(c) for c in result["score"]) >= cheapest[0]
 
 
-def test_the_bound_survives_into_the_stats_object():
-    """The field exists and carries the vector, which is what "internally available" means.
+@pytest.mark.parametrize("objective", ["maximum_value", "maximum_volume",
+                                       "open_dimension_height"])
+def test_an_objective_without_a_bound_gets_none(monkeypatch, objective):
+    """Their score positions rank other quantities, so a vector compared against them would
+    line up different things -- recording nothing is the honest answer."""
+    _, recorded, _ = _pack(monkeypatch, {"solver_profile": "exact_small", "objective": objective})
+    assert recorded == [None]
 
-    Asserted directly rather than through a solve so that a rename of the field fails here
-    with a clear message instead of silently making every spy-based test above vacuous.
+
+def test_a_custom_solution_scorer_gets_no_bound():
+    """A caller-defined score's positions are not the bound's quantities."""
+    request = packvium.PackingRequest(
+        tuple(packvium.Item.create(f"i{n}", packvium.Dimensions.mm(10, 10, 10)) for n in range(2)),
+        (packvium.Container.create("c", packvium.Dimensions.mm(100, 100, 100)),))
+    assert packvium.Packer()._objective_bound(request) is not None
+    custom = packvium.Packer(solution_scorer=DefaultSolutionScorer())
+    assert custom._objective_bound(request) is None
+
+
+def test_a_request_past_the_ceiling_withholds_the_bound_and_is_still_answered(monkeypatch):
+    """F5's Python half: the refusal declines to state a bound; it never refuses the pack."""
+    recorded, _ = _spy(monkeypatch)
+    heavy = packvium.Item.create("heavy", packvium.Dimensions.mm(10, 10, 10), weight=10 ** 31)
+    result = packvium.Packer(packvium.PackingConfig.quality(time_limit_ms=20000)).pack(
+        [heavy], [packvium.Container.create("c", packvium.Dimensions.mm(100, 100, 100))])
+    assert recorded == [None]
+    assert result.complete
+
+
+#: Finding F1, reproduced end to end. A 100 mm cube holds a fixed 100 x 100 x 50 mm slab and
+#: one free slab of the same size, so the only packing fills it exactly.
+FIXED_SLAB = {
+    "items": [{"id": "slab", "quantity": 2,
+               "dimensions": {"length": "100", "width": "100", "height": "50"}}],
+    "containers": [{"id": "cube", "quantity": 1,
+                    "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}],
+    "fixed_placements": [{"item_type": "slab", "container_type": "cube", "container_instance": 1,
+                          "position": {"x": "0", "y": "0", "z": "0"}, "orientation": "LWH"}],
+}
+
+
+def test_a_fixed_placement_is_counted_by_the_bound(monkeypatch):
+    """F1: the bound used to see only the free slab and claim half the cube must stay empty.
+
+    That was 500000 ppm on key 3 against a packing scoring 0 -- a lower bound above a packing
+    that exists. Over every instance the bound is the packing's own score: attained, and so a
+    proof.
     """
-    stats = solvers.SearchStats()
-    assert stats.objective_lower_bound is None
-    stats.objective_lower_bound = (0, 1, 2, 3, 4)
-    assert stats.objective_lower_bound == (0, 1, 2, 3, 4)
-    assert "objective_lower_bound" not in stats.to_metrics().to_dict()
+    result, recorded, _ = _pack(monkeypatch, {"solver_profile": "quality"}, FIXED_SLAB)
+    score = tuple(int(c) for c in result["score"])
+    assert score == (0, 1, 0, 0, 1_000_000)
+    assert recorded == [score]
+    assert bounds.gap(score, bounds.Bounds(*recorded[0])).attained
+
+    slab = packvium.Item.create("slab", packvium.Dimensions.mm(100, 100, 50), quantity=2)
+    cube = packvium.Container.create("cube", packvium.Dimensions.mm(100, 100, 100), quantity=1)
+    free_only = bounds.compute(slab.instances()[1:], (cube,))
+    with pytest.raises(bounds.UnsoundBoundError):
+        bounds.gap(score, free_only)
+
+
+def test_the_result_states_the_bound_it_was_given(monkeypatch):
+    """The one bound per pack is what the result states, prefix-truncated at the
+    first position its score misses, with the gap there (OPTIMALITY-GAP.md § 1.1).
+
+    Also the practical half: `algorithm.metrics` is serialised into every result, so the
+    bound belongs in `optimality` and nowhere else.
+    """
+    result, recorded, _ = _pack(monkeypatch, {"solver_profile": "exact_small"})
+    assert recorded[0] is not None, "the assertions below would pass vacuously"
+    leaked = [key for key in result["algorithm"]["metrics"] if "bound" in key or "gap" in key]
+    assert not leaked, f"the bound leaked into algorithm.metrics as {leaked}"
+    score = tuple(int(c) for c in result["score"])
+    stated = bounds.statement(score, recorded[0])
+    assert {key: value for key, value in result["optimality"].items() if key != "code"} == stated
+    for alternative in result["alternatives"]:
+        assert {key: value for key, value in alternative["optimality"].items()
+                if key != "code"} == bounds.statement(
+                    tuple(int(c) for c in alternative["score"]), recorded[0])
+
+
+def test_exhausting_a_search_is_no_longer_a_proof():
+    """Q1: `exact_small` exhausting its candidates on one container used to set `optimal`.
+    Its candidates are only the points it generated, so that is not a proof; attainment is.
+    Four unlike items cannot fill the cube, so the bound is missed and the result says so."""
+    result = packvium.pack_from_dict({"containers": CONTAINERS, "items": ITEMS,
+                                      "configuration": {"solver_profile": "exact_small",
+                                                        "time_limit_ms": 20000}})
+    assert result["complete"] and len(result["containers"]) == 1
+    assert result["status"] == "feasible"
+    assert result["optimality"]["code"] == "not_proven" and "gap_key" in result["optimality"]
+
+
+def test_a_complete_result_that_attains_its_bound_is_proven_optimal():
+    """Q1: attainment sets `optimal` and `proven_optimal`, and the field carries the whole
+    bound with no gap: absence of a gap, next to a bound, is the proof."""
+    result = packvium.pack_from_dict(FIXED_SLAB)
+    assert result["status"] == "optimal"
+    assert result["optimality"] == {"code": "proven_optimal", "lower_bound": [0, 1, 0, 0, 1_000_000]}
+
+
+def test_an_incomplete_result_that_attains_its_bound_keeps_best_found():
+    """§ 1.3: `code` is defined by completeness for an incomplete result; the proof is still
+    readable from `lower_bound` without `gap_key`."""
+    result = packvium.pack_from_dict({
+        "items": [{"id": "i", "quantity": 3,
+                   "dimensions": {"length": "100", "width": "100", "height": "100"}}],
+        "containers": [{"id": "c", "quantity": 1,
+                        "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}],
+    })
+    assert result["status"] == "best_found" and not result["complete"]
+    assert result["optimality"] == {"code": "best_found", "lower_bound": [2, 1, 0, 0, 1_000_000]}
+
+
+def test_a_statement_stops_at_the_first_missed_position():
+    """The prefix, the unreduced relative gap, its absence on a zero bound, and nothing at all
+    for a score below its bound, which shows the bound wrong."""
+    bound = (0, 2, 10, 500, 7)
+    assert bounds.statement(bound, bound) == {"lower_bound": list(bound)}
+    assert bounds.statement((0, 2, 14, 0, 0), bound) == {
+        "lower_bound": [0, 2, 10], "gap_key": 2, "absolute_gap": 4,
+        "relative_gap": {"numerator": 4, "denominator": 10}}
+    assert bounds.statement((1, 0, 0, 0, 0), bound) == {
+        "lower_bound": [0], "gap_key": 0, "absolute_gap": 1}
+    assert bounds.statement((0, 1, 99, 0, 0), bound) is None
+
+
+def test_an_uncovered_objective_states_nothing():
+    """§ 1.5: absence is "no statement", never "attained"."""
+    result = packvium.pack_from_dict({"containers": CONTAINERS, "items": ITEMS,
+                                      "configuration": {"objective": "maximum_value"}})
+    assert set(result["optimality"]) == {"code"}
+
+
+def test_the_statement_does_not_depend_on_the_deadline():
+    """§ 6.3: under an effort budget the clock is only a fuse, so two different deadlines
+    give the same answer, and the field with it."""
+    def under(time_limit_ms):
+        return packvium.pack_from_dict({
+            "containers": CONTAINERS, "items": ITEMS,
+            "configuration": {"solver_profile": "quality", "time_limit_ms": time_limit_ms,
+                              "effort_budget": {"max_restarts": 4,
+                                                "max_placement_attempts": 20000}}})
+    first, second = under(60_000), under(120_000)
+    assert "lower_bound" in first["optimality"]
+    assert first["optimality"] == second["optimality"] and first["status"] == second["status"]
+
+
+def test_the_solvers_no_longer_compute_a_bound_per_start():
+    """The bound lives in the packer; a per-start copy would bring F3 back."""
+    assert not hasattr(solvers.SolverOrchestrator, "_record_root_bound")
+    assert not hasattr(solvers.SearchStats(), "objective_lower_bound")
+
+
+def test_the_cost_bound_takes_the_cheapest_types_without_expanding_them():
+    """F6: the same sum as the multiset of per-unit costs, from one sort of the types."""
+    assert bounds._cost_bound([9, 5, 7], [3, 1, None], 4) == 5 + 7 * 3
+    assert bounds._cost_bound([9, 5], [1, 1], 4) == 14
+    assert bounds._cost_bound([3], [None], 10 ** 12) == 3 * 10 ** 12
 
 
 # ----------------------------------- the degenerate inputs the guards exist for
@@ -284,3 +422,44 @@ def test_a_container_with_no_usable_volume_still_bounds_the_count_by_its_other_l
     bound has to come from that instead of from a division nobody can perform.
     """
     assert bounds._container_bound([1, 1], [5, 5], False, 2, [object()], [0], [4], [None]) == 3
+
+
+def test_a_score_below_its_bound_withholds_the_statement_rather_than_publishing_it():
+    """§ 1.5 condition 5: the bound is then the suspect, and an engine must not publish a
+    claim it has just refuted. Unreachable through a sound bound, so stood in for here."""
+    from packvium.packer import _stated_optimality
+    from packvium.result import PackingStatus
+
+    assert _stated_optimality(PackingStatus.FEASIBLE, (0, 1, 0, 0, 0), (0, 2, 0, 0, 0), ()) == (
+        PackingStatus.FEASIBLE, None)
+
+
+@pytest.mark.parametrize('cheap_cost', [0, 1])
+def test_a_gap_past_the_portable_ceiling_withholds_only_the_statement(cheap_cost):
+    request = {
+        'items': [{'id': 'i', 'quantity': 2, 'dimensions': dict.fromkeys(('length', 'width', 'height'), '10')}],
+        'containers': [
+            {'id': 'cheap', 'inner_dimensions': dict.fromkeys(('length', 'width', 'height'), '1'),
+             'cost_minor': cheap_cost, 'max_items': 1},
+            {'id': 'big', 'inner_dimensions': dict.fromkeys(('length', 'width', 'height'), '10'),
+             'cost_minor': bounds.MAX_BOUND_VALUE, 'max_items': 1},
+        ],
+    }
+    result = packvium.pack_from_dict(request)
+    assert result['score'][2] == 2 * bounds.MAX_BOUND_VALUE
+    assert result['optimality'] == {'code': 'not_proven'}
+    assert packvium.validate(request, result) == []
+    result['optimality'].update(lower_bound=[0, 2, 2 * cheap_cost], gap_key=2,
+                                absolute_gap=result['score'][2] - 2 * cheap_cost)
+    if cheap_cost:
+        result['optimality']['relative_gap'] = {
+            'numerator': result['optimality']['absolute_gap'], 'denominator': 2 * cheap_cost}
+    assert 'optimality_gap_mismatch' in [issue.code for issue in packvium.validate(request, result)]
+
+
+@pytest.mark.parametrize('least', [0, 1])
+def test_the_portable_gap_ceiling_is_inclusive(least):
+    bound = (0, 1, least, 0, 0)
+    statement = bounds.statement((0, 1, least + bounds.MAX_BOUND_VALUE, 0, 0), bound)
+    assert statement['absolute_gap'] == bounds.MAX_BOUND_VALUE
+    assert bounds.statement((0, 1, least + bounds.MAX_BOUND_VALUE + 1, 0, 0), bound) is None

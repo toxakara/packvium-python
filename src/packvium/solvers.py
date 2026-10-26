@@ -22,7 +22,7 @@ from .constraints import (AxleLoadConstraint, CompatibilityConstraint, Constrain
                           StopAccessibilityConstraint, SupportConstraint,
                           TagCountConstraint, TopLoadConstraint, active_constraints, direct_support_view,
                           is_position_independent, load_units, top_loads, usable_volume)
-from . import bounds, hull, made_to_measure
+from . import hull, made_to_measure
 from .geometry import (AxisAlignedBox, Dimensions, Point, Rotation, ShapeType,
                        dimensional_weight)
 from .flat_bag import as_dimensions, fits_alone
@@ -59,15 +59,6 @@ class SearchStats:
     # at once. This one stays internal, where tests can prove the refinement actually fired
     # rather than infer it from a placement that might have succeeded anyway.
     hull_refinements: int = 0
-    # The request-level lower bound on the objective vector, computed once at the root of an
-    # `exact_small` or global-beam solve. Internal for the same reason as
-    # `hull_refinements` above, and for one more: reporting a gap to a caller is a new public
-    # result field, and this project reserves and rejects such a field before a contract
-    # freeze rather than adding it mid-line, following the precedent set for the reserved
-    # container field and restated by the objective-bound wave.
-    # `None` when no bound was computed -- a non-default objective keys its score vector
-    # differently, so a bound compared against it would compare different quantities.
-    objective_lower_bound: "tuple[int, ...] | None" = None
 
     def to_metrics(self) -> SolverMetrics:
         return SolverMetrics(
@@ -89,9 +80,15 @@ class Deadline:
     existing call site already polls `expired`/`check()`, so attaching an effort
     budget (via `with_effort`) needs no changes anywhere else; leaving it unattached
     (the default) reproduces the exact prior time-only behaviour.
+
+    A spent budget answers `True` to a poll, and that poll is a search refusing further work:
+    the deadline records it (`effort_stopped`), so the effort flag says the budget stopped the
+    search, not that a counter equals its limit afterwards. A search that used exactly
+    its budget and finished was not stopped. Code asking afterwards whether a search was cut
+    reads `stopped`, which records nothing.
     """
 
-    __slots__ = ("started", "limit_ns", "_clock", "_effort_budget", "_stats")
+    __slots__ = ("started", "limit_ns", "_clock", "_effort_budget", "_stats", "effort_stopped")
 
     def __init__(
         self,
@@ -107,6 +104,9 @@ class Deadline:
         self.limit_ns = limit_ms * 1_000_000 if limit_ns is None else limit_ns
         self._effort_budget = effort_budget
         self._stats = stats
+        # Per-solve state: set once a poll found the effort budget spent and the search
+        # stopped there.
+        self.effort_stopped = False
 
     @property
     def elapsed_ms(self) -> int: return int((self._clock() - self.started) / 1_000_000)
@@ -114,9 +114,30 @@ class Deadline:
     def remaining_ns(self) -> int: return self.limit_ns - (self._clock() - self.started)
     @property
     def effort_exceeded(self) -> bool:
+        """Whether the budget is spent; a query that records nothing."""
         return self._effort_budget is not None and self._stats is not None and self._effort_budget.exceeded(self._stats)
+
+    def effort_stops(self) -> bool:
+        """Whether the effort budget stops the search at this poll, recording that it did.
+
+        Only a caller about to do more work asks: asking is refusing it."""
+        if not self.effort_exceeded:
+            return False
+        self.effort_stopped = True
+        return True
+
     @property
-    def expired(self) -> bool: return self.effort_exceeded or self.remaining_ns <= 0
+    def stopped(self) -> bool:
+        """Whether the search was cut, by the effort budget at a poll or by the clock; records nothing."""
+        return self.effort_stopped or self.remaining_ns <= 0
+    @property
+    def expired(self) -> bool:
+        # `effort_stops()` inlined: this is polled per lattice group and per item.
+        budget = self._effort_budget
+        if budget is not None and self._stats is not None and budget.exceeded(self._stats):
+            self.effort_stopped = True
+            return True
+        return self.limit_ns - (self._clock() - self.started) <= 0
 
     def slice(self, parts: int) -> "Deadline":
         remaining = self.remaining_ns
@@ -139,6 +160,29 @@ class Deadline:
             return None
         return budget.max_search_nodes
 
+    def placement_ceilings(self, stats: "SearchStats") -> tuple[int | None, int | None]:
+        """The `placements_attempted` and `candidates_evaluated` values of `stats` at which the
+        budget stops a search, `None` for a counter no limit reads. A scan compares a counter
+        with its ceiling before each step, so the counter never passes its limit. O(1)."""
+        budget = self._effort_budget
+        if budget is None or self._stats is not stats:
+            return None, None
+        return budget.max_placement_attempts, budget.max_candidates_evaluated
+
+    def effort_room(self, stats: "SearchStats", candidates: int, placements: int, nodes: int) -> bool:
+        """Whether the budget leaves room for `candidates`, `placements` and `nodes` more counted
+        steps on `stats`, so a solver that counts a run of steps at once never passes a limit;
+        a query that records nothing. O(1)."""
+        budget = self._effort_budget
+        if budget is None or self._stats is not stats:
+            return True
+        return ((budget.max_candidates_evaluated is None
+                 or stats.candidates_evaluated + candidates <= budget.max_candidates_evaluated)
+                and (budget.max_placement_attempts is None
+                     or stats.placements_attempted + placements <= budget.max_placement_attempts)
+                and (budget.max_search_nodes is None
+                     or stats.search_nodes_expanded + nodes <= budget.max_search_nodes))
+
     def with_effort(self, effort_budget: "EffortBudget | None", stats: "SearchStats") -> "Deadline":
         """Bind an effort budget to this start's own stats, keeping the same time bound."""
         return Deadline(0, limit_ns=self.remaining_ns, clock=self._clock, effort_budget=effort_budget, stats=stats)
@@ -148,6 +192,7 @@ class Deadline:
         # chained property calls that made it measurable there.
         budget = self._effort_budget
         if budget is not None and self._stats is not None and budget.exceeded(self._stats):
+            self.effort_stopped = True
             raise TimeLimitReached("packing time limit reached")
         if self.limit_ns - (self._clock() - self.started) <= 0:
             raise TimeLimitReached("packing time limit reached")
@@ -664,7 +709,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
         if container.axles is not None:
             ordered = _append_unseen(ordered, _axle_balanced_points(state, item, forms, limit_x))
     else:
-        ordered = sorted(points, key=lambda p: (p.z, p.y, p.x))
+        ordered = list(points) if len(points) <= 1 else sorted(points, key=lambda p: (p.z, p.y, p.x))
     candidates: list[Candidate] = []
     best: Candidate | None = None
     retained: list[tuple[tuple[int, ...], int, Candidate]] = []
@@ -676,14 +721,29 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     form_count = len(forms)
     query = index.query
     collision_checks = 0
+    # The point's check alone let a point's rotations run a counter past its limit, so a point
+    # tries only the rotations the budget has room for, and a feasible candidate is compared
+    # with its ceiling before it is counted; reaching either stops the scan through the same
+    # check, which records the stop.
+    attempt_ceiling, candidate_ceiling = deadline.placement_ceilings(stats)
+    # Only this scan moves `placements_attempted` while it runs, so the room is kept locally.
+    attempts_left = (attempt_ceiling - stats.placements_attempted
+                     if attempt_ceiling is not None else form_count * len(ordered))
     for point in ordered:
         stats.collision_checks += collision_checks
         collision_checks = 0
         deadline.check()
         stats.candidate_points_considered += 1
-        stats.placements_attempted += form_count
+        if attempts_left < form_count:
+            point_forms = forms[:attempts_left]
+            stats.placements_attempted += attempts_left
+            attempts_left = 0
+        else:
+            point_forms = forms
+            stats.placements_attempted += form_count
+            attempts_left -= form_count
         x1, y1, z1 = point.x, point.y, point.z
-        for rotation, physical, envelope, dx, dy, dz, shape in forms:
+        for rotation, physical, envelope, dx, dy, dz, shape in point_forms:
             x2, y2, z2 = x1 + dx, y1 + dy, z1 + dz
             # Conditional expressions rather than `max()`: the builtin call made this test
             # four times dearer per bag candidate (75 ns against 309 ns, CPython 3.11).
@@ -760,6 +820,10 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                     )
                 if projected_volume > usable:
                     continue
+            if candidate_ceiling is not None and stats.candidates_evaluated >= candidate_ceiling:
+                stats.collision_checks += collision_checks
+                collision_checks = 0
+                deadline.check()
             stats.candidates_evaluated += 1
             score: tuple[int, ...] | None = None
             if tracing:
@@ -800,6 +864,10 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                 else:
                     heapq.heapreplace(retained, entry)
             else: candidates.append(candidate)
+        if point_forms is not forms:
+            stats.collision_checks += collision_checks
+            collision_checks = 0
+            deadline.check()
     stats.collision_checks += collision_checks
     if max_candidates == 1: return [] if best is None else [best]
     if bounded:
@@ -1069,6 +1137,12 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
             expansions: list[tuple[ContainerState, tuple[ItemInstance, ...]]] = []
             exhausted = False
             for state, unplaced in beam:
+                # A spent budget would stop this node before its first counted step, so it
+                # is not counted either: a counter never passes its limit.
+                if deadline.effort_stops():
+                    exhausted = True
+                    expansions.append((state, (*unplaced, *batch)))
+                    continue
                 stats.search_nodes_expanded += 1
                 try:
                     children = list(
@@ -1131,6 +1205,10 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
             if node_limit is not None and nodes >= node_limit:
                 exhausted = True
                 break
+            if deadline.effort_stops():
+                exhausted = True
+                expansions.append((_BeamChild.built(state, _placement_signature(state)), (*unplaced, *batch)))
+                continue
             nodes += 1
             stats.search_nodes_expanded += 1
             signature = _placement_signature(state)
@@ -1175,7 +1253,7 @@ def beam_pack(container: Container, sequence: int, items: Sequence[ItemInstance]
             # Consequently a larger counted node limit replays the same prefix and can
             # only retain or improve this incumbent.
             state, unplaced = incumbent
-            return SingleContainerSolution(state, unplaced, False, deadline.expired)
+            return SingleContainerSolution(state, unplaced, False, deadline.stopped)
     completed = min(beam, key=lambda node: _node_key(node, by_volume=by_volume)) if beam else incumbent
     state, unplaced = completed if _node_key(completed, by_volume=by_volume) <= incumbent_key else incumbent
     return SingleContainerSolution(state, unplaced)
@@ -1378,6 +1456,10 @@ class GridSolver:
         if (
             total > 0 and not config.require_placement_coordinates and nesting_ticks == 0
             and len({i.item.id for i in items[:total]}) == 1
+            # The fast path counts the whole lattice in one step, so it is taken only when
+            # the budget covers it; otherwise the per-item loop below places the same lattice
+            # one counted item at a time and stops on the limit, never past it.
+            and deadline.effort_room(stats, total, total, 1)
         ):
             # Quantity-compression fast path: the lattice parameters above
             # already fully determine every coordinate in O(r); skip the O(n) loop
@@ -1513,17 +1595,17 @@ def subtract_all(
 
 
 def _is_contained(extents: Sequence[tuple[int, int, int, int, int, int]], index: int) -> bool:
-    """Whether another extent contains `extents[index]`, for extents ordered by origin z.
+    """Whether another extent contains `extents[index]`, for extents ordered by
+    `(z1, y1, x1, -volume)`.
 
-    A container starts at or below what it contains, so the scan stops at the first
-    extent that starts higher: `O(prefix)` instead of `O(s)`, with no index to build.
+    A containing extent starts at or before `extents[index]` on every axis and has strictly
+    larger volume when origins match, so it always appears at a position `< index` with
+    `other[2] <= z1` already guaranteed.
     """
-    x1, y1, z1, x2, y2, z2 = extents[index]
-    for position, other in enumerate(extents):
-        if other[2] > z1:
-            return False
-        if (position != index and other[0] <= x1 and other[1] <= y1
-                and x2 <= other[3] and y2 <= other[4] and z2 <= other[5]):
+    x1, y1, _, x2, y2, z2 = extents[index]
+    for position in range(index):
+        other = extents[position]
+        if other[3] >= x2 and other[4] >= y2 and other[5] >= z2 and other[0] <= x1 and other[1] <= y1:
             return True
     return False
 
@@ -1562,6 +1644,10 @@ class MaximalSpaceSolver:
             placed = True
             try:
                 for item in batch:
+                    # An item past a full container reaches no check of its own, so a spent
+                    # budget is checked before its node is counted.
+                    if deadline.effort_stops():
+                        raise TimeLimitReached("effort budget spent")
                     stats.search_nodes_expanded += 1
                     chosen = self._choose(state, spaces, item, config, constraints, stats, deadline)
                     if chosen is None:
@@ -1678,8 +1764,9 @@ class HomogeneousBlockSolver:
                  modes: tuple[str, ...] = MODES, node_limit: int | None = None):
         self.constraints = tuple(constraints)
         self.modes = modes
-        # `fast` and `balanced` leave `container_plan_node_limit` at one, which would stop
-        # the lattice enumeration before its first block; their start carries its own bound.
+        # Every profile but `quality` leaves `container_plan_node_limit` at one, which would
+        # stop the lattice enumeration before its first block, so under them the solver
+        # carries its own bound (`_node_limit`); the start `fast` and `balanced` add passes it.
         self.node_limit = node_limit
 
     def pack_one(self, container, sequence, items, config, stats, deadline):
@@ -1687,16 +1774,14 @@ class HomogeneousBlockSolver:
             return ExtremePointSolver(self.constraints).pack_one(
                 container, sequence, items, config, stats, deadline
             )
-        if self.node_limit is not None:
-            config = replace(config, container_plan_node_limit=self.node_limit)
+        if (node_limit := self._node_limit(config)) != config.container_plan_node_limit:
+            config = replace(config, container_plan_node_limit=node_limit)
         best: SingleContainerSolution | None = None
-        reached = False
         # Group enumerations are pure arithmetic, so `balanced`'s second mode and every
         # later round reuse them (see `_lattice`).
         lattices: dict[tuple[int, int, int, int], tuple[int, int, int, int, int]] = {}
         for mode in self.modes:
             if deadline.expired:
-                reached = True
                 break
             solution = self._pack_mode(
                 container, sequence, items, config, stats, deadline, mode, lattices
@@ -1705,15 +1790,25 @@ class HomogeneousBlockSolver:
                 solution = self._lookahead(
                     container, sequence, items, config, stats, deadline, mode, lattices, solution
                 )
-            reached = reached or solution.time_limit_reached
             by_volume = _ranks_by_volume(config)
             if best is None or self._solution_key(solution, by_volume) < self._solution_key(best, by_volume):
                 best = solution
+        # Only the deadline or the effort budget marks the answer as stopped by a limit: the
+        # node limit is a search bound, and the answer it leaves is the search's own.
         if best is None:
             return SingleContainerSolution(
-                ContainerState(container, sequence), tuple(items), False, reached
+                ContainerState(container, sequence), tuple(items), False, deadline.stopped
             )
-        return SingleContainerSolution(best.state, best.unpacked, False, reached)
+        return SingleContainerSolution(best.state, best.unpacked, False, deadline.stopped)
+
+    def _node_limit(self, config: PackingConfig) -> int:
+        """Lattice nodes one mode may enumerate: the start's own bound, `quality`'s
+        `container_plan_node_limit`, or `BLOCK_START_NODE_LIMIT` under any other profile."""
+        if self.node_limit is not None:
+            return self.node_limit
+        if config.profile.value == "quality":
+            return config.container_plan_node_limit
+        return BLOCK_START_NODE_LIMIT
 
     def _supports(self, container, items, config) -> bool:
         if (self.constraints or container.obstacles or container.preloaded
@@ -1814,7 +1909,7 @@ class HomogeneousBlockSolver:
             lattices, 0,
         )
         return SingleContainerSolution(
-            solution.state, solution.unpacked, False, reached or deadline.expired
+            solution.state, solution.unpacked, False, reached or deadline.stopped
         )
 
     def _complete(self, container, state, spaces, remaining, forms, config, stats, deadline,
@@ -1831,7 +1926,9 @@ class HomogeneousBlockSolver:
             )
             if not leading or reached:
                 break
-            self._commit(state, leading[0], remaining, config, stats)
+            if not self._commit(state, leading[0], remaining, config, stats, deadline):
+                reached = True
+                break
             spaces = subtract_all(spaces, [leading[0].box], stats)
         unpacked = tuple(
             instance
@@ -1892,10 +1989,11 @@ class HomogeneousBlockSolver:
             chosen_key, known, block = chosen
             if chosen_key < best_key:
                 best, best_key = known, chosen_key
-            self._commit(state, block, remaining, config, stats)
+            if not self._commit(state, block, remaining, config, stats, deadline):
+                break
             spaces = subtract_all(spaces, [block.box], stats)
         return SingleContainerSolution(
-            best.state, best.unpacked, False, best.time_limit_reached or deadline.expired
+            best.state, best.unpacked, False, best.time_limit_reached or deadline.stopped
         )
 
     def _completion(self, container, state, spaces, remaining, forms, config, stats, deadline,
@@ -1903,7 +2001,8 @@ class HomogeneousBlockSolver:
         """The greedy completion after committing `block`, on copies of the round's state."""
         trial_state = state.copy()
         trial_remaining = {item_id: list(available) for item_id, available in remaining.items()}
-        self._commit(trial_state, block, trial_remaining, config, stats)
+        if not self._commit(trial_state, block, trial_remaining, config, stats, deadline):
+            return None, nodes, True
         return self._complete(
             container, trial_state, subtract_all(spaces, [block.box], stats), trial_remaining,
             forms, config, stats, deadline, mode, lattices, nodes,
@@ -1954,6 +2053,7 @@ class HomogeneousBlockSolver:
                         budget = min(budget, node_ceiling - stats.search_nodes_expanded)
                     if group_nodes > budget:
                         stats.search_nodes_expanded += budget
+                        deadline.effort_stops()
                         return leading, nodes + budget, True
                     nodes += group_nodes
                     stats.search_nodes_expanded += group_nodes
@@ -1973,38 +2073,48 @@ class HomogeneousBlockSolver:
                             del leading[leaders:]
         return leading, nodes, False
 
-    def _commit(self, state, best, remaining, config, stats) -> None:
-        """Place every member of the chosen block, bottom layer first."""
-        chosen = remaining[best.item_id][:best.count]
-        del remaining[best.item_id][:best.count]
+    def _commit(self, state, best, remaining, config, stats, deadline) -> bool:
+        """Place the chosen block's members, bottom layer first; `False` when the budget stopped it.
+
+        Each member is one counted candidate and placement. When the effort budget has room
+        for fewer than the whole block, the members it has room for are placed, the budget
+        records the stop, and the search ends here: a counter never passes its limit.
+        Members go x fastest, then y, then z, so a layer is filled before the one above it and
+        a member above the bottom layer rests on the member beneath it."""
+        members = best.count
+        attempt_ceiling, candidate_ceiling = deadline.placement_ceilings(stats)
+        if attempt_ceiling is not None:
+            members = min(members, attempt_ceiling - stats.placements_attempted)
+        if candidate_ceiling is not None:
+            members = min(members, candidate_ceiling - stats.candidates_evaluated)
+        members = max(0, members)
+        chosen = remaining[best.item_id][:members]
+        del remaining[best.item_id][:members]
         clearance = config.clearance.ticks
-        index = 0
-        for z in range(best.nz):
-            for y in range(best.ny):
-                for x in range(best.nx):
-                    point = Point(
-                        best.space.origin.x + x * best.envelope.length.ticks,
-                        best.space.origin.y + y * best.envelope.width.ticks,
-                        best.space.origin.z + z * best.envelope.height.ticks,
-                    )
-                    position = Point(
-                        point.x + clearance,
-                        point.y + clearance,
-                        point.z + clearance,
-                    )
-                    state.add_direct(
-                        Placement(
-                            chosen[index], position, best.rotation, best.physical,
-                            point, best.envelope,
-                            # Above its bottom layer a member rests on an identical
-                            # footprint; the bottom layer rests on whatever is there.
-                            self._member_support(state, chosen[index], point, best.envelope)
-                            if z == 0 else 1.0,
-                        )
-                    )
-                    index += 1
-                    stats.candidates_evaluated += 1
-                    stats.placements_attempted += 1
+        per_layer = best.nx * best.ny
+        for index in range(members):
+            x, y, z = index % best.nx, (index // best.nx) % best.ny, index // per_layer
+            point = Point(
+                best.space.origin.x + x * best.envelope.length.ticks,
+                best.space.origin.y + y * best.envelope.width.ticks,
+                best.space.origin.z + z * best.envelope.height.ticks,
+            )
+            position = Point(point.x + clearance, point.y + clearance, point.z + clearance)
+            state.add_direct(
+                Placement(
+                    chosen[index], position, best.rotation, best.physical, point, best.envelope,
+                    # Above its bottom layer a member rests on an identical footprint; the
+                    # bottom layer rests on whatever is there.
+                    self._member_support(state, chosen[index], point, best.envelope)
+                    if z == 0 else 1.0,
+                )
+            )
+            stats.candidates_evaluated += 1
+            stats.placements_attempted += 1
+        if members < best.count:
+            deadline.effort_stops()
+            return False
+        return True
 
 
 def _placed_volume(state: ContainerState) -> int:
@@ -2145,7 +2255,7 @@ class ExactSmallSolver:
             best,
             tuple(i for i in items if i.id not in packed),
             False,
-            deadline.expired,
+            deadline.stopped,
         )
 
 
@@ -2377,7 +2487,40 @@ def _run_concurrent_start(solver, order, containers, config, container_selector,
     packed, unpacked, exhaustive, reached, dominant_lattice = orchestrator._across_containers(
         solver, order, containers, config, stats, budget, preloaded
     )
-    return packed, unpacked, exhaustive, reached, dominant_lattice, stats
+    return packed, unpacked, exhaustive, reached, dominant_lattice, stats, budget.effort_stopped
+
+
+def _start_budget(deadline: Deadline, effort_budget: EffortBudget | None, stats: SearchStats,
+                  starts_left: int) -> Deadline:
+    """The deadline one start runs under.
+
+    Without an effort budget each start gets an even share of what is left, so a slow start
+    cannot starve the rest. Under one the clock is only the request's fuse: every start gets
+    all that is left, and the clock stops the search only as a whole, so the portfolio-wide
+    deadline and `time_limit_reached` say it did. A slice would let a start the clock cut
+    lose quietly, making a budgeted answer depend on the machine's speed.
+    """
+    if effort_budget is None:
+        return deadline.slice(starts_left)
+    return deadline.with_effort(effort_budget, stats)
+
+
+def _limits_reached(reached: bool, effort_stopped: bool, remaining_ns: int) -> tuple[bool, bool]:
+    """Which limit cut a start, as `(wall clock, effort budget)`: at most one, and only for a
+    start that was cut. The effort budget is named only when a poll found it spent and the
+    search stopped there, not when a finished start used exactly its budget."""
+    effort_reached = reached and effort_stopped
+    return reached and not effort_reached and remaining_ns <= 0, effort_reached
+
+
+def _effort_limited(unpacked: tuple[UnpackedItem, ...], effort_reached: bool) -> tuple[UnpackedItem, ...]:
+    if not effort_reached:
+        return unpacked
+    return tuple(
+        UnpackedItem(item.instance, "effort_limit", item.details)
+        if item.reason == "time_limit" else item
+        for item in unpacked
+    )
 
 
 class SolverOrchestrator:
@@ -2602,19 +2745,11 @@ class SolverOrchestrator:
                 else:
                     order_name = f"{base_name}:beam"
             stats = SearchStats()
-            budget = deadline.slice(len(starts) - position)
-            if effort_budget is not None:
-                budget = budget.with_effort(effort_budget, stats)
+            budget = _start_budget(deadline, effort_budget, stats, len(starts) - position)
             start_config = _start_config(order_name, config)
             packed, unpacked, exhaustive, reached, dominant_lattice = self._across_containers(solver, order, containers, start_config, stats, budget, preloaded)
-            effort_reached = budget.effort_exceeded
-            wall_reached = reached and budget.remaining_ns <= 0
-            if effort_reached:
-                unpacked = tuple(
-                    UnpackedItem(item.instance, "effort_limit", item.details)
-                    if item.reason == "time_limit" else item
-                    for item in unpacked
-                )
+            wall_reached, effort_reached = _limits_reached(reached, budget.effort_stopped, budget.remaining_ns)
+            unpacked = _effort_limited(unpacked, effort_reached)
             start_id = f"{solver.name}:{order_name}"
             results.append(RawSolution(
                 start_id, packed, unpacked, stats, wall_reached, effort_reached, exhaustive
@@ -2702,18 +2837,10 @@ class SolverOrchestrator:
 
         solver0, order_name0, order0 = starts[0]
         stats0 = SearchStats()
-        budget0 = deadline.slice(len(starts))
-        if effort_budget is not None:
-            budget0 = budget0.with_effort(effort_budget, stats0)
+        budget0 = _start_budget(deadline, effort_budget, stats0, len(starts))
         packed0, unpacked0, exhaustive0, reached0, dominant_lattice0 = self._across_containers(solver0, order0, containers, config, stats0, budget0, preloaded)
-        effort_reached0 = budget0.effort_exceeded
-        wall_reached0 = reached0 and budget0.remaining_ns <= 0
-        if effort_reached0:
-            unpacked0 = tuple(
-                UnpackedItem(item.instance, "effort_limit", item.details)
-                if item.reason == "time_limit" else item
-                for item in unpacked0
-            )
+        wall_reached0, effort_reached0 = _limits_reached(reached0, budget0.effort_stopped, budget0.remaining_ns)
+        unpacked0 = _effort_limited(unpacked0, effort_reached0)
         start_id0 = f"{solver0.name}:{order_name0}"
         results[0] = RawSolution(start_id0, packed0, unpacked0, stats0, wall_reached0, effort_reached0, exhaustive0)
         records[0] = StartRecord(start_id0, True, not reached0, reached0)
@@ -2738,15 +2865,10 @@ class SolverOrchestrator:
                 }
                 outcomes = {futures[future]: future.result() for future in futures}
             for position, (solver, order_name, order) in remaining:
-                packed, unpacked, exhaustive, reached, dominant_lattice, stats = outcomes[position]
-                effort_reached = effort_budget is not None and effort_budget.exceeded(stats)
-                wall_reached = reached and (absolute_deadline_ns - monotonic_ns()) <= 0
-                if effort_reached:
-                    unpacked = tuple(
-                        UnpackedItem(item.instance, "effort_limit", item.details)
-                        if item.reason == "time_limit" else item
-                        for item in unpacked
-                    )
+                packed, unpacked, exhaustive, reached, dominant_lattice, stats, effort_stopped = outcomes[position]
+                wall_reached, effort_reached = _limits_reached(
+                    reached, effort_stopped, absolute_deadline_ns - monotonic_ns())
+                unpacked = _effort_limited(unpacked, effort_reached)
                 start_id = f"{solver.name}:{order_name}"
                 results[position] = RawSolution(start_id, packed, unpacked, stats, wall_reached, effort_reached, exhaustive)
                 records[position] = StartRecord(start_id, True, not reached, reached)
@@ -2957,7 +3079,6 @@ class SolverOrchestrator:
             config.container_plan_beam_width > 1
             and isinstance(self.container_selector, DefaultContainerSelector)
         )
-        self._record_root_bound(solver, beam, items, containers, config, stats)
         opened = self._open_preloaded(solver, preloaded, items, containers, config, stats, deadline)
         if beam:
             return self._across_containers_beam(
@@ -3077,44 +3198,6 @@ class SolverOrchestrator:
         packing_signature = tuple(container.id for container in plan.packed)
         return (*partial, remaining_signature, packing_signature)
 
-    @staticmethod
-    def _record_root_bound(solver, beam, items, containers, config, stats) -> None:
-        """Compute the request-level lower bound once, at the root.
-
-        The plan beam already computes the same relaxation *per node* to prune with -- the
-        request-level bound is that formula with the state empty, which is why this costs one
-        sort rather than a second search. `exact_small` gets it for the opposite reason: it
-        exhausts its candidate set and can say the incumbent is optimal over that set, and a
-        bound is what turns "I stopped looking" into a statement about the request.
-
-        Only for the default objective. `lowest_cost` and `maximum_value` order their score
-        keys differently, so a bound vector compared against them would line up cost against
-        container count -- not a weaker claim, a meaningless one.
-
-        Nothing downstream reads this yet, and that is deliberate: the number is visible to
-        the engines and to nothing else until a contract freeze decides whether a caller ever
-        sees a gap.
-        """
-        if stats.objective_lower_bound is not None:
-            return
-        if not (beam or getattr(solver, "name", None) == "exact_small"):
-            return
-        if config.objective != "default":
-            return
-        # Its unused-volume and height keys are ratios against a declared size, and a
-        # made-to-measure box has none until it is cut: the bound would not be admissible.
-        if any(container.made_to_measure is not None for container in containers):
-            return
-        try:
-            stats.objective_lower_bound = bounds.compute(items, containers).as_tuple()
-        except bounds.BoundOverflowError:
-            # The bound refuses past its declared ceiling. Nothing reads it yet, so
-            # a refusal leaves it unset rather than failing a pack that is otherwise fine --
-            # the refusal is the bound declining to answer, not the request being invalid.
-            # When a caller-facing gap field exists, that field carries the refusal instead.
-            stats.objective_lower_bound = None
-
-
     def _across_containers_beam(self, solver, items, containers, config, stats, deadline, opened):
         """Bounded deterministic beam over partial multi-container plans.
 
@@ -3130,6 +3213,7 @@ class SolverOrchestrator:
         initial, reached = opened
         beam = [] if reached else [initial]
         incumbent = initial
+        incumbent_score = self._score_plan(incumbent.packed, incumbent.remaining, config)
         plan_nodes = 0
 
         while beam and plan_nodes < config.container_plan_node_limit:
@@ -3178,10 +3262,10 @@ class SolverOrchestrator:
                         plan.dominant_lattice and one.dominant_lattice,
                     )
                     expansions.append(child)
-                    if self._score_plan(child.packed, child.remaining, config) < self._score_plan(
-                        incumbent.packed, incumbent.remaining, config
-                    ):
+                    child_score = self._score_plan(child.packed, child.remaining, config)
+                    if child_score < incumbent_score:
                         incumbent = child
+                        incumbent_score = child_score
                     if reached:
                         break
                 if reached:
@@ -3192,19 +3276,18 @@ class SolverOrchestrator:
             # Exact dominance: same remaining instances plus the same inventory means
             # the continuation set is identical.  A worse closed prefix can never catch
             # up because every objective component is additive and non-negative.
-            dominant: dict[tuple, _ContainerPlan] = {}
+            dominant: dict[tuple, tuple[tuple[int, ...], _ContainerPlan]] = {}
             for plan in expansions:
                 signature = (
                     tuple(item.id for item in plan.remaining),
                     tuple((key, plan.inventory[key]) for key in sorted(plan.inventory)),
                 )
+                partial_score = self._score_plan(plan.packed, (), config)
                 previous = dominant.get(signature)
-                if previous is None or self._score_plan(plan.packed, (), config) < self._score_plan(
-                    previous.packed, (), config
-                ):
-                    dominant[signature] = plan
+                if previous is None or partial_score < previous[0]:
+                    dominant[signature] = (partial_score, plan)
             beam = sorted(
-                dominant.values(),
+                (pair[1] for pair in dominant.values()),
                 key=lambda plan: self._plan_bound_key(plan, containers, config),
             )[:config.container_plan_beam_width]
 
@@ -3384,7 +3467,7 @@ class SolverOrchestrator:
             if reason == "no_feasible_placement":
                 reason = self._limit_reason(instance, containers, opened, config) or reason
             unpacked.append(UnpackedItem(instance, reason, details))
-        # Optimality may only be claimed when an exhaustive search filled a single
-        # container -- the cheapest one, since containers are tried in cost order.
+        # `RawSolution.exhaustive` is a hint for extension scorers, not a proof: the result's
+        # `optimal` status comes only from attaining the lower bound (`packer._stated_optimality`).
         proven = exhaustive and not reached and not unpacked and len(packed) == 1
         return tuple(packed), tuple(unpacked), proven, reached, dominant_lattice

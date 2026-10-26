@@ -25,6 +25,7 @@ from packvium.solvers import (ContainerState, Deadline, DefaultContainerSelector
                               SolverOrchestrator, Space, TimeLimitReached, _ContainerPlan,
                               _nesting_points, _run_concurrent_start, _subtract, beam_pack,
                               default_constraints, find_candidates)
+from packvium import bounds
 from support import assert_sound, container, item
 
 GENEROUS_MS = 60_000
@@ -158,13 +159,22 @@ def test_a_fixed_item_in_an_unlimited_container_type_opens_that_container_first(
     assert [placement.fixed for placement in first.placements] == [True, False]
 
 
-def test_a_custom_solver_that_proves_its_search_exhaustive_is_reported_optimal():
-    items, containers = [item("a", 50, 100, 100, quantity=2)], [container("c", 100, 100, 100)]
+def test_a_custom_solver_claiming_its_search_exhaustive_proves_nothing_by_that_claim():
+    """OPTIMALITY-GAP.md Q1: exhaustion covers only the candidates a search generated, so it
+    is not a proof. The bound is: a perfect fill attains it and is optimal whatever the solver
+    claimed, and an answer that misses it is not, however exhaustive."""
     config = counted(solvers=("extreme_points",))
-    result = packer(config, solvers=(ClaimsExhaustive(),)).pack(items, containers)
-    assert result.algorithm.solver.startswith("a_claims_exhaustive")
-    assert result.status is PackingStatus.OPTIMAL
-    assert result.to_dict()["optimality"] == {"code": "proven_optimal"}
+    fills = packer(config, solvers=(ClaimsExhaustive(),)).pack(
+        [item("a", 50, 100, 100, quantity=2)], [container("c", 100, 100, 100)])
+    assert fills.algorithm.solver.startswith("a_claims_exhaustive")
+    assert fills.status is PackingStatus.OPTIMAL
+    assert fills.to_dict()["optimality"] == {"code": "proven_optimal",
+                                             "lower_bound": [0, 1, 0, 0, 1000000]}
+    misses = packer(config, solvers=(ClaimsExhaustive(),)).pack(
+        [item("a", 30, 30, 30, quantity=2)], [container("c", 100, 100, 100)])
+    assert misses.algorithm.solver.startswith("a_claims_exhaustive")
+    assert misses.status is PackingStatus.FEASIBLE
+    assert "gap_key" in misses.to_dict()["optimality"]
 
 
 def test_a_custom_solution_the_validator_rejects_never_beats_a_valid_one():
@@ -245,12 +255,13 @@ def test_the_concurrent_portfolio_stops_after_a_lattice_that_placed_everything()
 def test_a_worker_start_counts_its_own_effort_against_the_shared_budget():
     instances = items_of([item("a", 40, 40, 40, quantity=4)])
     budget = EffortBudget(max_candidates_evaluated=1)
-    _, unpacked, _, reached, _, stats = _run_concurrent_start(
+    _, unpacked, _, reached, _, stats, effort_stopped = _run_concurrent_start(
         ExtremePointSolver(), instances, (container("c", 100, 100, 100),), PackingConfig.balanced(),
         DefaultContainerSelector(), budget, generous().started + GENEROUS_MS * 1_000_000,
     )
     assert reached
-    assert budget.exceeded(stats)
+    assert effort_stopped
+    assert stats.candidates_evaluated == 1
     assert len(unpacked) > 0
 
 
@@ -282,21 +293,11 @@ def test_the_container_lower_bound_ignores_payload_when_no_container_accepts_any
     assert SolverOrchestrator._additional_container_lower_bound(plan(cube.instances(), [box]), [box]) == 2
 
 
-def test_a_root_bound_already_recorded_is_not_recomputed():
-    stats = SearchStats()
-    stats.objective_lower_bound = (1, 2, 3)
-    instances = items_of([item("a", 10, 10, 10)])
-    SolverOrchestrator()._record_root_bound(ExtremePointSolver(), True, instances,
-                                            (container("c", 100, 100, 100),), PackingConfig.balanced(), stats)
-    assert stats.objective_lower_bound == (1, 2, 3)
-
-
 def test_a_root_bound_past_its_ceiling_is_left_unset_and_the_pack_still_succeeds():
+    # F5's counterpart here: past the declared ceiling the bound is withheld, never raised.
     heavy = Item.create("heavy", Dimensions.mm(10, 10, 10), weight=10**31)
-    stats = SearchStats()
-    SolverOrchestrator()._record_root_bound(ExtremePointSolver(), True, heavy.instances(),
-                                            (container("c", 100, 100, 100),), PackingConfig.balanced(), stats)
-    assert stats.objective_lower_bound is None
+    assert bounds.for_request(heavy.instances(), (container("c", 100, 100, 100),),
+                              "default") is None
     result = Packer(counted(solvers=("exact_small",))).pack([heavy], [container("c", 100, 100, 100)])
     assert result.complete
 

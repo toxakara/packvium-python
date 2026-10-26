@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, Optional
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -18,7 +18,7 @@ from ._request_error import ObjectRefusal
 from .request_errors import InvalidRequestError, check_request
 from .packer import Packer
 from .policy import PolicyRuleSet
-from .units import Length, Weight, output_length_unit
+from .units import Length, ParsedMeasures, Weight, output_length_unit
 
 
 def _axles(raw: list | None, unit: str) -> tuple[Axle, Axle] | None:
@@ -59,19 +59,38 @@ def _hull_vertices(raw, unit: str) -> "tuple[tuple[int, int, int], ...] | None":
     )
 
 
-def _item(raw: dict, unit: str) -> Item:
+def _flag(raw: Mapping[str, Any], name: str, default: bool) -> Any:
+    """A boolean field as written, null or absent read as its default. Never cast: the model
+    refuses a value that is not a boolean, where `bool("no")` would read it as yes."""
+    value = raw.get(name)
+    return default if value is None else value
+
+
+def _or_fresh(measures: Optional[ParsedMeasures]) -> ParsedMeasures:
+    """The request check's parsed measures (`pack_from_dict`), or a fresh set for a caller that
+    builds one record without them."""
+    return ParsedMeasures() if measures is None else measures
+
+
+def _dimensions(raw: Mapping[str, Any], unit: str, measures: ParsedMeasures) -> Dimensions:
+    return Dimensions._read(*(measures.read(Length, raw[side], unit) for side in ("length", "width", "height")))
+
+
+def _item(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) -> Item:
+    measures = _or_fresh(measures)
     rotations = tuple(Rotation(v) for v in raw.get("allowed_rotations", [r.value for r in Rotation.all()]))
     return Item(
-        id=str(raw["id"]), dimensions=Dimensions.from_dict(raw["dimensions"], unit), weight=Weight.parse(raw.get("weight", 0)),
-        quantity=int(raw.get("quantity", 1)), allowed_rotations=rotations, keep_upright=bool(raw.get("keep_upright", False)),
-        stackable=bool(raw.get("stackable", True)), must_be_on_floor=bool(raw.get("must_be_on_floor", False)),
-        max_top_load=None if raw.get("max_top_load") is None else Weight.parse(raw["max_top_load"]),
+        id=str(raw["id"]), dimensions=_dimensions(raw["dimensions"], unit, measures),
+        weight=measures.read(Weight, raw.get("weight", 0), "g"),
+        quantity=int(raw.get("quantity", 1)), allowed_rotations=rotations, keep_upright=_flag(raw, "keep_upright", False),
+        stackable=_flag(raw, "stackable", True), must_be_on_floor=_flag(raw, "must_be_on_floor", False),
+        max_top_load=None if raw.get("max_top_load") is None else measures.read(Weight, raw["max_top_load"], "g"),
         max_stacked_items=raw.get("max_stacked_items"),
         minimum_support_ratio=float(raw.get("minimum_support_ratio", 0)), group=raw.get("group"), tags=frozenset(raw.get("tags", [])),
         incompatible_tags=frozenset(raw.get("incompatible_tags", [])), priority=int(raw.get("priority", 0)),
         eligible_container_tags=frozenset(raw.get("eligible_container_tags", [])),
         ground_contact_rule=raw.get("ground_contact_rule"), metadata=raw.get("metadata", {}),
-        nesting_height=None if raw.get("nesting_height") is None else Length.parse(raw["nesting_height"], unit),
+        nesting_height=None if raw.get("nesting_height") is None else measures.read(Length, raw["nesting_height"], unit),
         stop_index=raw.get("stop_index"),
         value=raw.get("value"),
         shape_type=ShapeType(raw.get("shape_type", ShapeType.RIGID_CUBOID.value)),
@@ -84,15 +103,16 @@ def _item(raw: dict, unit: str) -> Item:
     )
 
 
-def _point_ticks(raw: dict, unit: str) -> tuple[int, int, int]:
-    return (Length.parse(raw.get("x", 0), unit).ticks, Length.parse(raw.get("y", 0), unit).ticks,
-            Length.parse(raw.get("z", 0), unit).ticks)
+def _point_ticks(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) -> tuple[int, int, int]:
+    measures = _or_fresh(measures)
+    return (measures.read(Length, raw.get("x", 0), unit).ticks, measures.read(Length, raw.get("y", 0), unit).ticks,
+            measures.read(Length, raw.get("z", 0), unit).ticks)
 
 
-def _box(raw: dict, unit: str) -> AxisAlignedBox:
+def _box(raw: dict, unit: str, measures: ParsedMeasures) -> AxisAlignedBox:
     return AxisAlignedBox(
-        Point(*_point_ticks(raw.get("origin", {}), unit)),
-        Dimensions.from_dict(raw["dimensions"], unit),
+        Point(*_point_ticks(raw.get("origin", {}), unit, measures)),
+        _dimensions(raw["dimensions"], unit, measures),
     )
 
 
@@ -120,29 +140,32 @@ def _rate_table(raw: dict | None) -> RateTable | None:
     )
 
 
-def _container(raw: dict, unit: str) -> Container:
+def _container(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) -> Container:
+    measures = _or_fresh(measures)
     obstacles = tuple(
-        Obstacle(str(o["id"]), _box(o, unit), additional_boxes=tuple(_box(b, unit) for b in o.get("additional_boxes", [])))
+        Obstacle(str(o["id"]), _box(o, unit, measures),
+                 additional_boxes=tuple(_box(b, unit, measures) for b in o.get("additional_boxes", [])))
         for o in raw.get("obstacles", [])
     )
     return Container(
-        id=str(raw["id"]), inner_dimensions=Dimensions.from_dict(raw["inner_dimensions"], unit),
-        outer_dimensions=None if raw.get("outer_dimensions") is None else Dimensions.from_dict(raw["outer_dimensions"], unit),
-        tare_weight=Weight.parse(raw.get("tare_weight", 0)), max_payload=None if raw.get("max_payload") is None else Weight.parse(raw["max_payload"]),
+        id=str(raw["id"]), inner_dimensions=_dimensions(raw["inner_dimensions"], unit, measures),
+        outer_dimensions=None if raw.get("outer_dimensions") is None else _dimensions(raw["outer_dimensions"], unit, measures),
+        tare_weight=measures.read(Weight, raw.get("tare_weight", 0), "g"),
+        max_payload=None if raw.get("max_payload") is None else measures.read(Weight, raw["max_payload"], "g"),
         cost_minor=int(raw.get("cost_minor", 0)), rate_table=_rate_table(raw.get("rate_table")),
         quantity=None if raw.get("quantity") is None else int(raw["quantity"]),
         obstacles=obstacles, tags=frozenset(raw.get("tags", [])), max_items=None if raw.get("max_items") is None else int(raw["max_items"]),
         void_fill_reserve_ratio=float(raw.get("void_fill_reserve_ratio", 0)),
         tag_limits={str(k): int(v) for k, v in raw.get("tag_limits", {}).items()}, metadata=raw.get("metadata", {}),
-        max_stack_density=None if raw.get("max_stack_density") is None else Weight.parse(raw["max_stack_density"]),
+        max_stack_density=None if raw.get("max_stack_density") is None else measures.read(Weight, raw["max_stack_density"], "g"),
         axles=_axles(raw.get("axles"), unit),
         access_directions=tuple(str(d) for d in raw.get("access_directions", ())),
         deformable_boundary=None if raw.get("deformable_boundary") is None else raw["deformable_boundary"]["kind"],
-        made_to_measure=_made_to_measure(raw.get("made_to_measure"), unit),
+        made_to_measure=_made_to_measure(raw.get("made_to_measure"), unit, measures),
     )
 
 
-def _made_to_measure(raw: dict | None, unit: str) -> MadeToMeasure | None:
+def _made_to_measure(raw: dict | None, unit: str, measures: ParsedMeasures) -> MadeToMeasure | None:
     if raw is None:
         return None
 
@@ -150,14 +173,14 @@ def _made_to_measure(raw: dict | None, unit: str) -> MadeToMeasure | None:
         value = raw.get(name)
         if value is None:
             return (0, 0, 0)
-        return tuple(Length.parse(value[axis], unit).ticks for axis in ("length", "width", "height"))
+        return tuple(measures.read(Length, value[axis], unit).ticks for axis in ("length", "width", "height"))
 
     tare = raw.get("tare_per_square_metre")
     return MadeToMeasure(
         minimum=sides("minimum"),
         increment=sides("increment"),
         cost_per_square_metre_minor=int(raw.get("cost_per_square_metre_minor") or 0),
-        tare_per_square_metre=0 if tare is None else Weight.parse(tare).ticks,
+        tare_per_square_metre=0 if tare is None else measures.read(Weight, tare, "g").ticks,
         outer_allowance=sides("outer_allowance"),
     )
 
@@ -288,15 +311,15 @@ def pack_from_dict(data: dict, *,
     if not isinstance(data, Mapping):
         raise InvalidRequestError("wrong_type", "", "must be an object")
     reject_unsupported(data)
-    check_request(data)
+    measures = check_request(data)
     data = _without_null_optionals(data)
     with _as_request_error():
         unit = (data.get("units") or {}).get("length", "mm")
-        config = _config(data.get("configuration") or {}, unit)
+        config = _config(data.get("configuration") or {}, unit, measures)
         references = _catalog_versions_used(data.get("catalog_versions_used", []))
         extensions = _extensions(data, extensions)
-        items = [_item(i, unit) for i in data["items"]]
-        containers = [_container(c, unit) for c in data["containers"]]
+        items = [_item(i, unit, measures) for i in data["items"]]
+        containers = [_container(c, unit, measures) for c in data["containers"]]
         fixed = _fixed_placements(data.get("fixed_placements"), unit)
     result = Packer(config, extensions).pack(items, containers, fixed)
     result = replace(result, catalog_versions_used=references)
@@ -310,11 +333,14 @@ def _without_null_optionals(data: Mapping[str, Any]) -> dict:
     reached them would be read as a value. Only the request's own records are cleaned --
     `metadata` and the like are echoed back and keep their nulls."""
     request = _without_nulls(data)
-    if isinstance(request.get("configuration"), Mapping):
-        configuration = _without_nulls(request["configuration"])
-        if isinstance(configuration.get("effort_budget"), Mapping):
-            configuration["effort_budget"] = _without_nulls(configuration["effort_budget"])
-        request["configuration"] = configuration
+    # `units.length: null` is millimetres and `output.length_unit: null` the request's unit,
+    # as in every other engine; read as a value, either was an AttributeError.
+    for block in ("units", "output", "configuration"):
+        if isinstance(request.get(block), Mapping):
+            request[block] = _without_nulls(request[block])
+    configuration = request.get("configuration")
+    if isinstance(configuration, Mapping) and isinstance(configuration.get("effort_budget"), Mapping):
+        configuration["effort_budget"] = _without_nulls(configuration["effort_budget"])
     # The rule table has already required both lists and every entry in them to be objects.
     for key in ("items", "containers"):
         request[key] = [_record_without_nulls(entry) for entry in request[key]]
@@ -352,13 +378,14 @@ def _as_request_error() -> Iterator[None]:
         raise InvalidRequestError("invalid_value", "", str(error)) from error
 
 
-def _config(cfg: dict, unit: str) -> PackingConfig:
+def _config(cfg: dict, unit: str, measures: Optional[ParsedMeasures] = None) -> PackingConfig:
+    measures = _or_fresh(measures)
     profile = SolverProfile(cfg.get("solver_profile", "balanced"))
     quality = profile is SolverProfile.QUALITY
     return PackingConfig(
         profile=profile, time_limit_ms=int(cfg.get("time_limit_ms", 1000)),
         top_k=int(cfg.get("alternatives", 3)), seed=int(cfg.get("seed", 42)), max_containers=cfg.get("max_containers"),
-        clearance=Length.parse(cfg.get("clearance", 0), unit), minimum_support_ratio=float(cfg.get("minimum_support_ratio", 0)),
+        clearance=measures.read(Length, cfg.get("clearance", 0), unit), minimum_support_ratio=float(cfg.get("minimum_support_ratio", 0)),
         exact_item_limit=int(cfg.get("exact_item_limit", 7)), multi_start_orders=int(cfg.get("multi_start_orders", 8)),
         max_candidates_per_item=int(cfg.get("max_candidates_per_item", 16 if quality else 1)),
         max_candidate_points=int(cfg.get("max_candidate_points", 4096)),
@@ -368,7 +395,7 @@ def _config(cfg: dict, unit: str) -> PackingConfig:
         dimensional_weight_divisor=cfg.get("dimensional_weight_divisor"),
         dimensional_weight_length_unit=str(cfg.get("dimensional_weight_length_unit", "in")),
         dimensional_weight_weight_unit=str(cfg.get("dimensional_weight_weight_unit", "lb")),
-        require_placement_coordinates=bool(cfg.get("require_placement_coordinates", True)),
+        require_placement_coordinates=_flag(cfg, "require_placement_coordinates", True),
         container_plan_beam_width=int(cfg.get("container_plan_beam_width", 16 if quality else 1)),
         container_plan_node_limit=int(cfg.get("container_plan_node_limit", 100_000 if quality else 1)),
     )

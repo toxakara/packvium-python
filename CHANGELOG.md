@@ -4,6 +4,44 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0]
+
+Results now say how far they can be from the best possible answer, `optimal` means a proof,
+and a mistyped flag is refused instead of guessed.
+
+### Added
+
+- **`optimality.lower_bound` and the gap** under the `default` and `lowest_cost` objectives.
+  `packvium.validate` checks them; `packvium.result_validation.objective_lower_bound(request)`
+  computes the bound.
+
+### Changed
+
+- **Attaining the bound, not search exhaustion, sets `optimal`** (`proven_optimal`).
+- **An effort budget names a stop:** a run that ends on exactly its budget is `complete`, and
+  `time_limit_ms` is no longer split across starts. Check `termination.any_start_truncated`.
+- **`keep_upright`, `stackable`, `must_be_on_floor` and `require_placement_coordinates` must
+  be booleans.** `"no"` or `1` is `invalid_request` / `wrong_type`; `Item` and `PackingConfig`
+  refuse it when built.
+  `validate` refuses such a request as `MalformedResult` naming the field, and reads `null` as
+  the default.
+- **Faster, identical answers:** loading-order check about 30%, `validate` about 20%.
+- **Each measure is parsed once per request:** the request check hands its parsed values to
+  deserialisation, whether a measure is written as a string, a number or a `{value, unit}` object.
+  The measured macOS unpackable-request paired wall-time median improved about 8%.
+- **Placement under axle limits is about 4x faster:** each candidate's axle check is O(1).
+
+### Fixed
+
+- **`solvers=["homogeneous_blocks"]` packs under `fast` and `balanced`**, and a node-limit
+  stop is no longer reported as `time_limit`.
+- **`units.length: null` and `output.*_unit: null` mean the default** instead of raising
+  `AttributeError`; `Length.of`/`Weight.of` refuse a unit that is not a string as `invalid_unit`.
+- **`validate` reads `units: null` and `units.length: null` as millimetres**, as the engines do,
+  and refuses a `units` that is not an object, or an unknown `units.length`, as a `contract`
+  `MalformedResult` naming the field. `units.weight` is not a field and is ignored: put the unit
+  on each weight.
+
 ## [1.7.0]
 
 The reference validator ships in the package, `quality` looks ahead in its block solver, and a
