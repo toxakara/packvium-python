@@ -37,9 +37,9 @@ from __future__ import annotations
 from ._compat import dataclass
 from typing import Sequence
 
-from .constraints import (LoadSupportGraph, _touches_corners, direct_support_view, load_units,
-                          non_stackable_failure, overloaded, stack_density_exceeded,
-                          stack_limit_exceeded, stacked_counts)
+from .constraints import (SQUARE_METRE_TICKS, LoadSupportGraph, LoadUnit, _touches_corners,
+                          direct_support_view, load_units, non_stackable_failure, overloaded,
+                          stack_density_exceeded, stack_limit_exceeded, stacked_counts)
 from .contact import ContactGraph
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions,
                        InvalidDirectionError, sweep_intersects, swept_volume)
@@ -502,38 +502,82 @@ def verify_loading_prefix_business_rules(
     """
     if sorted(order) != list(range(len(placements))):
         raise SequenceReplayError(-1, -1, "order is not a permutation of every placement index exactly once")
+    if not placements:
+        return
     max_density_ticks = None if container.max_stack_density is None else container.max_stack_density.ticks
     # A caller may hand this any scene, validated or not, so the stacking-group rule is
     # re-checked here too -- only when some item declares a list, and only on the edges
     # of the step's own new placement, since every earlier edge was judged at its step.
     grouped = any(placement.instance.item.accepts_stacking_groups for placement in placements)
-    present: list[Placement] = []
-    for step, index in enumerate(order):
-        present.append(placements[index])
-        units = load_units(present)
-        graph = LoadSupportGraph(units)
-        problem = (
-            overloaded(units, graph)
-            or stack_limit_exceeded(units, graph)
-            or stack_density_exceeded(units, max_density_ticks, graph)
+    has_non_stackable = any(not placement.instance.item.stackable for placement in placements)
+    has_load_rules = (
+        max_density_ticks is not None
+        or grouped
+        or has_non_stackable
+        or any(
+            placement.instance.item.max_top_load is not None
+            or placement.instance.item.max_stacked_items is not None
+            for placement in placements
         )
-        if problem is None:
-            counts = stacked_counts(units, graph)
-            for unit_index, unit in enumerate(units):
-                item = present[unit_index].instance.item
-                if not item.stackable and counts[unit_index] > 0:
-                    problem = ("non_stackable_item_has_load", unit.label)
-                    break
-        if problem is None and grouped:
-            refusal = non_stackable_failure(present, present[-1].instance, graph,
-                                            len(present) - 1)
-            if refusal is not None:
-                problem = (refusal.code, refusal.detail)
-        if problem is None:
-            candidate = present[-1]
+    )
+    has_ground_rules = any(
+        placement.instance.item.ground_contact_rule not in (None, "free")
+        and placement.envelope_box.origin.z != 0
+        for placement in placements
+    )
+    if not has_load_rules and not has_ground_rules:
+        return
+    all_units = load_units(placements)
+    present: list[Placement] = []
+    units: list[LoadUnit] = []
+    elevated_bases: set[int] = set()
+    any_nesting = False
+    for step, index in enumerate(order):
+        candidate = placements[index]
+        unit = all_units[index]
+        present.append(candidate)
+        units.append(unit)
+        candidate_box = candidate.envelope_box
+        if candidate_box.origin.z != 0:
+            elevated_bases.add(candidate_box.origin.z)
+        if unit.nesting_item_id is not None:
+            any_nesting = True
+        problem = None
+        isolated_floor_step = (
+            candidate_box.origin.z == 0
+            and not any_nesting
+            and candidate_box.z2 not in elevated_bases
+        )
+        if isolated_floor_step:
+            if (
+                max_density_ticks is not None
+                and unit.weight_ticks * SQUARE_METRE_TICKS
+                > max_density_ticks * candidate_box.dimensions.base_area
+            ):
+                problem = ("stack_density_exceeded", unit.label)
+        elif has_load_rules:
+            graph = LoadSupportGraph(units)
+            problem = (
+                overloaded(units, graph)
+                or stack_limit_exceeded(units, graph)
+                or stack_density_exceeded(units, max_density_ticks, graph)
+            )
+            if problem is None and has_non_stackable:
+                counts = stacked_counts(units, graph)
+                for unit_index, u in enumerate(units):
+                    item = present[unit_index].instance.item
+                    if not item.stackable and counts[unit_index] > 0:
+                        problem = ("non_stackable_item_has_load", u.label)
+                        break
+            if problem is None and grouped:
+                refusal = non_stackable_failure(
+                    present, candidate.instance, graph, len(present) - 1
+                )
+                if refusal is not None:
+                    problem = (refusal.code, refusal.detail)
+        if problem is None and has_ground_rules:
             rule = candidate.instance.item.ground_contact_rule
-            if rule is not None and rule != "free" and candidate.envelope_box.origin.z != 0:
-                candidate_box = candidate.envelope_box
+            if rule is not None and rule != "free" and candidate_box.origin.z != 0:
                 support = direct_support_view(present[:-1], candidate.instance, candidate_box)
                 supporters = [entry.box for entry in support.supporters]
                 violated = (

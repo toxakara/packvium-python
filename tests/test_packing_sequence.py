@@ -645,6 +645,17 @@ def test_a_loading_prefix_that_stacks_onto_a_non_stackable_item_is_caught():
     assert "non_stackable_item_has_load" in excinfo.value.reason
 
 
+def test_a_non_stackable_item_that_carries_nothing_passes_the_prefix_replay():
+    base = Item.create("base", Dimensions.mm(10, 10, 5))
+    lid = Item.create("lid", Dimensions.mm(10, 10, 5), stackable=False)
+    placements = [stacked_placement(base, 0, 0, 0), stacked_placement(lid, 0, 0, 5)]
+    verify_loading_prefix_business_rules(placements, [0, 1], Container.create("c", Dimensions.mm(10, 10, 20)))
+
+
+def test_an_empty_scene_passes_the_prefix_replay():
+    verify_loading_prefix_business_rules([], [], Container.create("c", Dimensions.mm(10, 10, 20)))
+
+
 def test_a_loading_prefix_that_breaks_the_stacking_group_rule_is_caught():
     base = Item.create("base", Dimensions.mm(10, 10, 5), accepts_stacking_groups=["A"])
     rider = Item.create("rider", Dimensions.mm(10, 10, 5), stacking_group="C")

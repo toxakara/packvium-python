@@ -378,3 +378,14 @@ class TestPublishRevalidatesSmuggledPredicates:
         )
 
         assert rule.version == 1, "the guard must not reject the ordinary case"
+
+    def test_a_later_version_with_an_earlier_effective_date_does_not_displace_the_newer_one(self):
+        registry = PolicyRegistry()
+        registry.publish("r", scope=PolicyScope.HAZMAT, action=PolicyAction.REJECT,
+                         predicates=(predicate(),), priority=0, effective_at=10)
+        registry.publish("r", scope=PolicyScope.HAZMAT, action=PolicyAction.ALLOW,
+                         predicates=(predicate(),), priority=0, effective_at=5)
+
+        decision = registry.evaluate(PolicyScope.HAZMAT, {"f": 1}, as_of=20)
+
+        assert decision.citation.version == 1, "the latest effective date wins, not the latest version"

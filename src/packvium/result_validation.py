@@ -1084,7 +1084,9 @@ def _occupied_volume(
     and a compressible one never shows the height it gave up under load.
     """
     if spec is not None and spec.max_compression_pressure_kpa is not None:
-        return envelope.base_area * _compressed_height(envelope, spec, load)
+        # The load presses on the item itself, not on the clearance around it.
+        length, width, height = _physical_sides(placement)
+        return length * width * _compressed_height(height, length * width, spec, load)
     if spec is not None and spec.shape_type == "convex_hull" and spec.hull_vertices is not None:
         # Collision intentionally uses the box for routes and clearance. Volume is a property
         # of the physical hull and must not inherit that conservative collision fallback.
@@ -1097,7 +1099,24 @@ def _occupied_volume(
     return _hull_volume(solid)
 
 
-def _compressed_height(envelope: Box, spec: ItemSpec, load: int) -> int:
+def _physical_sides(placement: dict) -> tuple[int, int, int]:
+    """The placed item's own sides, without the clearance its envelope adds."""
+    dimensions = placement["dimensions"]
+    return (dimensions["length"]["ticks"], dimensions["width"]["ticks"],
+            dimensions["height"]["ticks"])
+
+
+def _pressure(load: int, footprint: int) -> Fraction:
+    """kPa on `footprint` square ticks under `load` weight ticks, exactly."""
+    # P(kPa) = load_ticks * g * (ticks per metre)^2 / (ticks per kg * g_denominator
+    #          * pascals per kPa * footprint_ticks^2)
+    return Fraction(
+        load * 980_665 * (LENGTH_TICKS["mm"] * 1000) ** 2,
+        WEIGHT_TICKS["kg"] * 100_000 * 1_000 * footprint,
+    )
+
+
+def _compressed_height(height: int, footprint: int, spec: ItemSpec, load: int) -> int:
     """Occupied height under load, rounded up, never below one tick.
 
     The formula of docs/IRREGULAR-ITEMS.md, in exact rationals. A crushed item keeps its
@@ -1106,15 +1125,12 @@ def _compressed_height(envelope: Box, spec: ItemSpec, load: int) -> int:
     """
     assert spec.compression_ratio_ppm is not None
     assert spec.max_compression_pressure_kpa is not None
-    pressure = Fraction(
-        load * 980_665 * (LENGTH_TICKS["mm"] * 1000) ** 2,
-        WEIGHT_TICKS["kg"] * 100_000 * 1_000 * envelope.base_area,
-    )
+    pressure = _pressure(load, footprint)
     if pressure > spec.max_compression_pressure_kpa or spec.max_compression_pressure_kpa == 0:
-        return envelope.height
+        return height
     divisor = spec.max_compression_pressure_kpa * 1_000_000 * pressure.denominator
     retained = divisor - spec.compression_ratio_ppm * pressure.numerator
-    return max(1, -(-envelope.height * retained // divisor))
+    return max(1, -(-height * retained // divisor))
 
 
 def _hull_volume(vertices: tuple[tuple[int, int, int], ...]) -> int:
@@ -1268,6 +1284,7 @@ def _check_container(
         packed, envelopes, supporters, direct_above, global_support, issues
     )
     loads = _propagate_load(envelopes, supporters)
+    _check_stack_top_load(envelopes, loads, issues)
     _check_stack_density(packed, envelopes, loads, spec.max_stack_density, issues)
     _check_crush(packed, envelopes, loads, issues)
     _check_route_removal_order(packed, envelopes, direct_above, spec.inner,
@@ -1308,7 +1325,11 @@ def _check_container(
             right, right_placement, right_spec = right_value
             if _valid_nesting(left, left_placement, left_spec, right, right_placement, right_spec):
                 assert left_spec is not None and left_spec.nesting_height is not None
-                used -= left_spec.nesting_height * left.length * left.width
+                # The envelopes sink by the nesting height; the items themselves overlap by
+                # twice the clearance less, over their own footprint.
+                overlap = left_spec.nesting_height - 2 * clearance
+                if overlap > 0:
+                    used -= overlap * (left.length - 2 * clearance) * (left.width - 2 * clearance)
     reported_volume = packed.get("used_volume_ticks3")
     if reported_volume is not None and int(reported_volume) != used:
         issues.append(Issue("used_volume_mismatch",
@@ -1503,6 +1524,41 @@ def _support_graph(
     return supporters, direct_above
 
 
+def _hull_cross(o: tuple[int, int], a: tuple[int, int], b: tuple[int, int]) -> int:
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _centroid_supported(envelope: Box, surfaces: Sequence[Box]) -> bool:
+    """Whether the base centroid lies in the convex hull of the contact areas.
+
+    The rule the four searches apply once a support ratio is enforced, and
+    only reached here at or below half the base, where it can refuse: above half a centrally
+    symmetric footprint keeps its centroid in the hull. Coordinates are doubled so
+    the centroid is an integer for odd extents. The corners come four to a positive-area
+    overlap, so the hull is empty or has at least three vertices. O(s log s) time and O(s)
+    space for s supporters.
+    """
+    points = sorted({
+        (2 * x, 2 * y)
+        for surface in surfaces
+        for x in (max(envelope.x, surface.x), min(envelope.x2, surface.x2))
+        for y in (max(envelope.y, surface.y), min(envelope.y2, surface.y2))
+    })
+    lower: list[tuple[int, int]] = []
+    upper: list[tuple[int, int]] = []
+    for chain, order in ((lower, points), (upper, reversed(points))):
+        for point in order:
+            while len(chain) >= 2 and _hull_cross(chain[-2], chain[-1], point) <= 0:
+                chain.pop()
+            chain.append(point)
+    hull = lower[:-1] + upper[:-1]
+    centroid = (envelope.x + envelope.x2, envelope.y + envelope.y2)
+    return bool(hull) and all(
+        _hull_cross(hull[index], hull[(index + 1) % len(hull)], centroid) >= 0
+        for index in range(len(hull))
+    )
+
+
 def _check_support_and_load(
     packed: dict,
     envelopes: dict[str, tuple[Box, dict, ItemSpec | None]],
@@ -1558,6 +1614,11 @@ def _check_support_and_load(
                 ratio = Fraction(area, envelope.base_area)
                 issues.append(Issue("insufficient_support",
                                     f"{item_id}: {float(ratio):.6f} < {float(required):.6f}"))
+            elif area * 2 <= envelope.base_area and not _centroid_supported(
+                envelope, [surface for _, surface, _, _ in supporting]
+            ):
+                issues.append(Issue("centre_of_gravity_unsupported",
+                                    f"{item_id}: centroid outside its support hull"))
 
         for lower_id, _, lower_spec, _ in supporting:
             if lower_spec is None:
@@ -1567,10 +1628,6 @@ def _check_support_and_load(
             elif (lower_spec.accepts_stacking_groups
                   and spec.stacking_group not in lower_spec.accepts_stacking_groups):
                 issues.append(Issue("stacking_group_incompatible", f"{item_id} rests on {lower_id}"))
-            if lower_spec.max_top_load is not None and spec.weight > lower_spec.max_top_load:
-                issues.append(Issue("top_load_exceeded",
-                                    f"{item_id} ({spec.weight} ticks) on {lower_id} "
-                                    f"(limit {lower_spec.max_top_load})"))
 
     for item_id, (_, _, spec) in envelopes.items():
         if spec is None or spec.max_stacked_items is None:
@@ -1622,6 +1679,26 @@ def _propagate_load(
     return loads
 
 
+def _check_stack_top_load(
+    envelopes: dict[str, tuple[Box, dict, ItemSpec | None]],
+    loads: dict[str, int],
+    issues: list[Issue],
+) -> None:
+    """`max_top_load` against the whole stack an item bears, as every engine checks it.
+
+    The only top-load rule since 1.9.0: an item resting on several bearers shares its
+    weight among them by contact area, so comparing its whole weight with each bearer's limit
+    rejected answers every engine returns. O(n) over the loads `_propagate_load` built.
+    """
+    for item_id, (_, _, spec) in envelopes.items():
+        if spec is None or spec.max_top_load is None or loads[item_id] <= spec.max_top_load:
+            continue
+        issues.append(Issue(
+            "top_load_exceeded",
+            f"{item_id} bears {loads[item_id]} ticks (limit {spec.max_top_load})",
+        ))
+
+
 def _check_crush(
     packed: dict,
     envelopes: dict[str, tuple[Box, dict, "ItemSpec | None"]],
@@ -1642,15 +1719,11 @@ def _check_crush(
     if all(spec is None or spec.max_compression_pressure_kpa is None
            for _, _, spec in envelopes.values()):
         return
-    for item_id, (envelope, _, spec) in envelopes.items():
+    for item_id, (_, placement, spec) in envelopes.items():
         if spec is None or spec.max_compression_pressure_kpa is None:
             continue
-        # P(kPa) = load_ticks * g * (ticks per metre)^2 / (ticks per kg * g_denominator
-        #          * pascals per kPa * footprint_ticks^2)
-        pressure = Fraction(
-            loads[item_id] * 980_665 * (LENGTH_TICKS["mm"] * 1000) ** 2,
-            WEIGHT_TICKS["kg"] * 100_000 * 1_000 * envelope.base_area,
-        )
+        length, width, _ = _physical_sides(placement)
+        pressure = _pressure(loads[item_id], length * width)
         if pressure > spec.max_compression_pressure_kpa:
             issues.append(Issue(
                 "crush_violation",

@@ -1714,3 +1714,17 @@ def test_a_late_type_refinement_never_widens_a_narrower_request():
     config = replace(PackingConfig.quality(), container_plan_beam_width=2, max_candidates_per_item=3)
     narrowed = _start_config("volume:greedy:late_box:beam", config)
     assert (narrowed.container_plan_beam_width, narrowed.max_candidates_per_item) == (2, 3)
+
+
+def test_late_type_neighbourhoods_weigh_one_start_together_in_the_time_slicing():
+    # 1.9.0 release frontier: twenty item types used to add twenty even shares and halve every
+    # other start's time, the first start's lattice included.
+    from packvium.solvers import _slice_weights
+    starts = [(None, "small_edge:greedy", ()), (None, "volume:greedy", ()),
+              (None, "neighborhood:a", ()), (None, "neighborhood:b", ()), (None, "best:beam", ())]
+    assert _slice_weights(starts) == [2, 2, 1, 1, 2]
+    assert _slice_weights(starts[:2]) == [1, 1]
+    frozen = Deadline(0, limit_ns=1_000_000_000, clock=lambda: 0)
+    assert frozen.share(2, 8).limit_ns == 250_000_000
+    assert frozen.share(3, 3).limit_ns == 1_000_000_000
+    assert frozen.slice(4).limit_ns == frozen.share(1, 4).limit_ns

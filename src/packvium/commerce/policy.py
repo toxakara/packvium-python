@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from .._compat import dataclass
 from enum import Enum
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 # --------------------------------------------------------------------------------- errors
@@ -158,10 +158,16 @@ class PolicyPredicate:
         if self.operator is PolicyOperator.NOT_EQUALS:
             return actual != self.value
         if self.operator is PolicyOperator.IN:
-            return actual in self.value
+            return _contains(self.value, actual)
         if self.operator is PolicyOperator.NOT_IN:
-            return actual not in self.value
+            return not _contains(self.value, actual)
         raise UnsupportedPredicateError(f"unsupported policy operator {self.operator!r}")  # pragma: no cover
+
+
+def _contains(haystack: Any, needle: Any) -> bool:
+    if isinstance(haystack, (str, Mapping)) and not isinstance(needle, str):
+        return False
+    return needle in haystack
 
 
 # ----------------------------------------------------------------------------------- rule
@@ -232,27 +238,34 @@ def _resolve_effective(versions: Sequence[PolicyRule], *, as_of: int) -> PolicyR
     `as_of` lookups: the highest `effective_at` not after `as_of`, ties broken by the
     higher (later-published) version number. `None` if no version of this rule id has
     yet taken effect by `as_of`."""
-    candidates = [v for v in versions if v.effective_at <= as_of]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda v: (v.effective_at, v.version))
+    winner = None
+    for rule in versions:
+        if rule.effective_at > as_of:
+            continue
+        if (winner is None or rule.effective_at > winner.effective_at
+                or (rule.effective_at == winner.effective_at and rule.version > winner.version)):
+            winner = rule
+    return winner
 
 
-def decide(rules: Sequence[PolicyRule], scope: PolicyScope, context: Mapping[str, Any]) -> PolicyDecision:
+def decide(rules: Iterable[PolicyRule], scope: PolicyScope, context: Mapping[str, Any]) -> PolicyDecision:
     """Evaluate an already-resolved immutable rule set.
 
     Keeping resolution separate lets a solver adapter pin exact rule versions once per
     request and reuse them for every placement candidate. Evaluation is ``O(r * p)`` in
     matching rules and predicates, with no registry lookup and no mutable state.
     """
-    matching = [rule for rule in rules if rule.scope is scope and rule.matches(context)]
-    rejects = [rule for rule in matching if rule.action is PolicyAction.REJECT]
-    allows = [rule for rule in matching if rule.action is PolicyAction.ALLOW]
-    pool = rejects or allows
-    if not pool:
+    winner = None
+    winner_key = None
+    for rule in rules:
+        if rule.scope is not scope or not rule.matches(context):
+            continue
+        key = (rule.action is not PolicyAction.REJECT, -rule.priority, rule.rule_id)
+        if winner_key is None or key < winner_key:
+            winner, winner_key = rule, key
+    if winner is None:
         return PolicyDecision(scope=scope, allowed=True, citation=None)
 
-    winner = min(pool, key=lambda rule: (-rule.priority, rule.rule_id))
     citation = PolicyCitation(
         rule_id=winner.rule_id, version=winner.version, action=winner.action,
         priority=winner.priority, reason=winner.reason,
@@ -338,12 +351,5 @@ class PolicyRegistry:
         This method has no side effect and nothing to undo, so it is itself the
         dry-run interface: dry-run evaluation is available without a second code path.
         """
-        matching: list[PolicyRule] = []
-        for rule_id, history in self._versions.items():
-            effective = _resolve_effective(history, as_of=as_of)
-            if effective is None or effective.scope is not scope:
-                continue
-            if effective.matches(context):
-                matching.append(effective)
-
-        return decide(matching, scope, context)
+        effective = (_resolve_effective(history, as_of=as_of) for history in self._versions.values())
+        return decide((rule for rule in effective if rule is not None), scope, context)

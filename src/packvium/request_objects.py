@@ -24,8 +24,8 @@ from .geometry import Point, Rotation
 from .made_to_measure import MadeToMeasure, as_triple, box_cost_minor_for
 from .models import Container, FixedPlacement, Item, RateTable
 from .request_errors import (BAG_EXCLUSIONS, InvalidRequestError, _integer, _one_of,
-                             _ratio, _set_beside_a_bag, _stacking_group_name, pointer,
-                             pointer_join)
+                             _ratio, _set_beside_a_bag, _stacking_group_name, box_ticks,
+                             length_ticks, pointer, pointer_join, total_weight_ticks, weight_ticks)
 
 #: (JSON name, PackingConfig attribute, floor), in `check_request`'s order.
 _CONFIGURATION_INTEGERS = (("time_limit_ms", "time_limit_ms", 1), ("alternatives", "top_k", 1),
@@ -51,6 +51,8 @@ def check_objects(items: Sequence[Item], containers: Sequence[Container], config
     for index, container in enumerate(containers):
         _check_container(container, pointer("containers", index))
     _require_unique_ids(containers, "containers")
+    total_weight_ticks(((item.weight.ticks, item.quantity) for item in items),
+                       (container.tare_weight.ticks for container in containers))
     for index, placement in enumerate(fixed_placements):
         _check_fixed_placement(placement, f"fixed_placements[{index}]", pointer("fixed_placements", index))
 
@@ -61,6 +63,7 @@ def _check_configuration(config: PackingConfig) -> None:
     where = "/configuration"
     for name, attribute, minimum in _CONFIGURATION_INTEGERS:
         _optional(getattr(config, attribute), pointer_join(where, name), minimum)
+    length_ticks(config.clearance.ticks, pointer_join(where, "clearance"))
     _ratio(config.minimum_support_ratio, pointer_join(where, "minimum_support_ratio"))
     if config.effort_budget is not None:
         budget = pointer_join(where, "effort_budget")
@@ -71,6 +74,10 @@ def _check_configuration(config: PackingConfig) -> None:
 def _check_item(item: Item, where: str) -> None:
     _string_id(item.id, where)
     _integer(item.quantity, pointer_join(where, "quantity"), 1)
+    box_ticks(as_triple(item.dimensions), pointer_join(where, "dimensions"))
+    if item.nesting_height is not None:
+        length_ticks(item.nesting_height.ticks, pointer_join(where, "nesting_height"))
+    _weights(item, where, ("weight", "max_top_load"))
     _optional(item.max_stacked_items, pointer_join(where, "max_stacked_items"), 1)
     _optional(item.stop_index, pointer_join(where, "stop_index"), 0)
     _optional(item.value, pointer_join(where, "value"), 0)
@@ -86,6 +93,10 @@ def _check_item(item: Item, where: str) -> None:
 def _check_container(container: Container, where: str) -> None:
     _string_id(container.id, where)
     _optional(container.quantity, pointer_join(where, "quantity"), 1)
+    box_ticks(as_triple(container.inner_dimensions), pointer_join(where, "inner_dimensions"))
+    if container.outer_dimensions is not None:
+        box_ticks(as_triple(container.outer_dimensions), pointer_join(where, "outer_dimensions"))
+    _weights(container, where, ("tare_weight", "max_payload", "max_stack_density"))
     _optional(container.max_items, pointer_join(where, "max_items"), 1)
     _integer(container.cost_minor, pointer_join(where, "cost_minor"), 0)
     _ratio(container.void_fill_reserve_ratio, pointer_join(where, "void_fill_reserve_ratio"))
@@ -98,6 +109,13 @@ def _check_container(container: Container, where: str) -> None:
         _check_flat_bag(container, where)
     if container.made_to_measure is not None:
         _check_made_to_measure(container, container.made_to_measure, where)
+
+
+def _weights(holder: object, where: str, names: Sequence[str]) -> None:
+    for name in names:
+        weight = getattr(holder, name)
+        if weight is not None:
+            weight_ticks(weight.ticks, pointer_join(where, name))
 
 
 def _check_rate_table(table: RateTable, where: str) -> None:
@@ -120,7 +138,10 @@ def _check_flat_bag(container: Container, where: str) -> None:
 def _check_made_to_measure(container: Container, machine: MadeToMeasure, where: str) -> None:
     field = pointer_join(where, "made_to_measure")
     price = pointer_join(field, "cost_per_square_metre_minor")
+    for name in ("minimum", "increment", "outer_allowance"):
+        box_ticks(getattr(machine, name), pointer_join(field, name))
     _integer(machine.cost_per_square_metre_minor, price, 0)
+    weight_ticks(machine.tare_per_square_metre, pointer_join(field, "tare_per_square_metre"))
     if container.outer_dimensions is not None:
         raise InvalidRequestError("not_allowed", pointer_join(where, "outer_dimensions"),
                                   "cannot be combined with made_to_measure")

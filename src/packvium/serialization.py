@@ -105,13 +105,14 @@ def _item(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) -> It
 
 def _point_ticks(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) -> tuple[int, int, int]:
     measures = _or_fresh(measures)
-    return (measures.read(Length, raw.get("x", 0), unit).ticks, measures.read(Length, raw.get("y", 0), unit).ticks,
-            measures.read(Length, raw.get("z", 0), unit).ticks)
+    x, y, z = (measures.read(Length, 0 if raw.get(axis) is None else raw[axis], unit).ticks
+               for axis in ("x", "y", "z"))
+    return x, y, z
 
 
 def _box(raw: dict, unit: str, measures: ParsedMeasures) -> AxisAlignedBox:
     return AxisAlignedBox(
-        Point(*_point_ticks(raw.get("origin", {}), unit, measures)),
+        Point(*_point_ticks({} if raw.get("origin") is None else raw["origin"], unit, measures)),
         _dimensions(raw["dimensions"], unit, measures),
     )
 
@@ -144,7 +145,8 @@ def _container(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) 
     measures = _or_fresh(measures)
     obstacles = tuple(
         Obstacle(str(o["id"]), _box(o, unit, measures),
-                 additional_boxes=tuple(_box(b, unit, measures) for b in o.get("additional_boxes", [])))
+                 additional_boxes=tuple(_box(b, unit, measures) for b in
+                                        (() if o.get("additional_boxes") is None else o["additional_boxes"])))
         for o in raw.get("obstacles", [])
     )
     return Container(
@@ -321,7 +323,7 @@ def pack_from_dict(data: dict, *,
         items = [_item(i, unit, measures) for i in data["items"]]
         containers = [_container(c, unit, measures) for c in data["containers"]]
         fixed = _fixed_placements(data.get("fixed_placements"), unit)
-    result = Packer(config, extensions).pack(items, containers, fixed)
+    result = Packer(config, extensions)._pack_checked(tuple(items), tuple(containers), tuple(fixed))
     result = replace(result, catalog_versions_used=references)
     output = data.get("output", {})
     return result.to_dict(output.get("length_unit", output_length_unit(unit)), output.get("weight_unit", "g"))

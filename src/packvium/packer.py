@@ -50,6 +50,12 @@ class Packer:
         # The JSON path's rules, with the JSON path's reason and field: a request
         # built from objects is refused exactly where the same request as JSON would be.
         check_objects(items, containers, self.config, fixed_placements)
+        return self._pack_checked(items, containers, fixed_placements)
+
+    def _pack_checked(self, items: tuple, containers: tuple, fixed_placements: tuple) -> PackingResult:
+        """`pack` once the request's rules have passed. `pack_from_dict` calls it directly:
+        `check_request` has walked that request already, and `check_objects` refuses only what
+        those rules refuse, so a second walk could never fire there."""
         request = PackingRequest(items, containers, fixed_placements)
         # Both weight objectives price the same billed weight, so both need the divisor
         # up front -- a wrong guess would silently misprice every shipment. And rating

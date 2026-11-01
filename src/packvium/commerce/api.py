@@ -309,6 +309,8 @@ def catalog_version_info(document: Any, request: Any) -> Dict[str, Any]:
     _keys(fields, "request", ("catalog_id", "resolved_at"), ("version", "as_of"))
     catalog_id = _text(fields["catalog_id"], "request.catalog_id")
     resolved_at = _integer(fields["resolved_at"], "request.resolved_at")
+    if resolved_at < 0:
+        _fail("request.resolved_at", "cannot be negative")
     version = None if fields.get("version") is None else _integer(fields["version"], "request.version")
     as_of = None if fields.get("as_of") is None else _integer(fields["as_of"], "request.as_of")
     if version is not None and as_of is not None:

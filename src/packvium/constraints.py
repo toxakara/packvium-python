@@ -167,6 +167,9 @@ class LoadUnit:
     # needs, so the crush check rides the graph that is built anyway rather than a second one.
     compression_ratio_ppm: int | None = None
     max_compression_pressure_kpa: int | None = None
+    # The item's own footprint, which the load presses on; `box` is its envelope, grown by the
+    # clearance, and it carries the support graph.
+    footprint_ticks2: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +201,30 @@ def _same_nesting_column(placement: Placement, item: ItemInstance, box: AxisAlig
     )
 
 
+_PlaneBuckets = dict[int, tuple[tuple[int, AxisAlignedBox, int, int, int, int], ...]]
+
+#: The last scene's top-face buckets, keyed by the placement tuple's identity. One tuple,
+#: replaced by a single assignment, so a thread never pairs one scene's key with another's
+#: buckets: concurrent starts and the hosted API pack on several threads at once.
+_TOP_PLANE_CACHE: tuple[tuple[Placement, ...] | None, _PlaneBuckets] = (None, {})
+
+
+def _top_plane_buckets(placements: tuple[Placement, ...]) -> _PlaneBuckets:
+    global _TOP_PLANE_CACHE
+    cached_placements, cached_buckets = _TOP_PLANE_CACHE
+    if cached_placements is placements:
+        return cached_buckets
+    buckets: dict[int, list[tuple[int, AxisAlignedBox, int, int, int, int]]] = {}
+    for index, placement in enumerate(placements):
+        other = placement.envelope_box
+        buckets.setdefault(other.z2, []).append(
+            (index, other, other.origin.x, other.origin.y, other.x2, other.y2)
+        )
+    frozen = {z: tuple(entries) for z, entries in buckets.items()}
+    _TOP_PLANE_CACHE = (placements, frozen)
+    return frozen
+
+
 def direct_support_view(
     placements: Sequence[Placement], item: ItemInstance, box: AxisAlignedBox
 ) -> DirectSupportView:
@@ -209,9 +236,24 @@ def direct_support_view(
     immediate predecessor becomes one full-area supporter. The list stays in
     placement-index order.
     """
+    nesting = item.item.nesting_height
+    if nesting is None and type(placements) is tuple:
+        plane = _top_plane_buckets(placements).get(box.origin.z, ())
+        if not plane:
+            return DirectSupportView(())
+        bx1, by1, bx2, by2 = box.origin.x, box.origin.y, box.x2, box.y2
+        supporters: list[DirectSupport] = []
+        for index, other, ox1, oy1, ox2, oy2 in plane:
+            dx = (bx2 if bx2 < ox2 else ox2) - (bx1 if bx1 > ox1 else ox1)
+            if dx <= 0:
+                continue
+            dy = (by2 if by2 < oy2 else oy2) - (by1 if by1 > oy1 else oy1)
+            if dy > 0:
+                supporters.append(DirectSupport(index, other, dx * dy))
+        return DirectSupportView(tuple(supporters))
+
     face_supporters: list[DirectSupport] = []
     nearest_lower: tuple[int, AxisAlignedBox] | None = None
-    nesting = item.item.nesting_height
     for index, placement in enumerate(placements):
         other = placement.envelope_box
         other_nesting = placement.instance.item.nesting_height
@@ -436,7 +478,8 @@ def load_units(placements: Sequence[Placement], extra: LoadUnit | None = None) -
                  None if p.instance.item.nesting_height is None else p.instance.item.id,
                  None if p.instance.item.nesting_height is None else p.instance.item.nesting_height.ticks,
                  p.instance.item.compression_ratio_ppm,
-                 p.instance.item.max_compression_pressure_kpa)
+                 p.instance.item.max_compression_pressure_kpa,
+                 p.dimensions.length.ticks * p.dimensions.width.ticks)
         for p in placements
     ]
     if extra is not None: units.append(extra)
@@ -492,8 +535,10 @@ def crushed(units: Sequence[LoadUnit], graph: LoadSupportGraph | None = None) ->
         limit = unit.max_compression_pressure_kpa
         if limit is None:
             continue
-        box = unit.box
-        footprint = (box.x2 - box.origin.x) * (box.y2 - box.origin.y)
+        footprint = unit.footprint_ticks2
+        if footprint is None:
+            box = unit.box
+            footprint = (box.x2 - box.origin.x) * (box.y2 - box.origin.y)
         if applied_pressure(Weight(load), footprint).exceeds_kpa(limit):
             return ("crush_violation", unit.label)
     return None
@@ -819,7 +864,8 @@ class TopLoadConstraint:
                         item.max_stacked_items, context.item.id,
                         None if item.nesting_height is None else item.id,
                         None if item.nesting_height is None else item.nesting_height.ticks,
-                        item.compression_ratio_ppm, item.max_compression_pressure_kpa)
+                        item.compression_ratio_ppm, item.max_compression_pressure_kpa,
+                        context.dimensions.length.ticks * context.dimensions.width.ticks)
         units, graph = self._support.with_candidate(context.placements, unit)
         failure = non_stackable_failure(
             context.placements, context.item, graph, len(units) - 1

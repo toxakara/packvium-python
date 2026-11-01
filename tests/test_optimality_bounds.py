@@ -142,9 +142,11 @@ def test_a_custom_solution_scorer_gets_no_bound():
 def test_a_request_past_the_ceiling_withholds_the_bound_and_is_still_answered(monkeypatch):
     """F5's Python half: the refusal declines to state a bound; it never refuses the pack."""
     recorded, _ = _spy(monkeypatch)
-    heavy = packvium.Item.create("heavy", packvium.Dimensions.mm(10, 10, 10), weight=10 ** 31)
+    # A weight cannot pass the sum ceiling since admission caps the total at 2^63 - 1 ticks
+    #, so two cubes at the 10^30 cubic-tick volume ceiling pass it instead.
+    vast = packvium.Dimensions.mm(625_000, 625_000, 625_000)
     result = packvium.Packer(packvium.PackingConfig.quality(time_limit_ms=20000)).pack(
-        [heavy], [packvium.Container.create("c", packvium.Dimensions.mm(100, 100, 100))])
+        [packvium.Item.create("vast", vast, quantity=2)], [packvium.Container.create("c", vast)])
     assert recorded == [None]
     assert result.complete
 
