@@ -197,6 +197,8 @@ def test_the_concurrent_portfolio_keeps_fixed_items():
      or d["fixed_placements"].append(fixed(instance=2)), "2 box named, 1 available"),
     (lambda d: d.update(configuration={"max_containers": 1})
      or d["fixed_placements"].append(fixed(instance=2)), "max_containers is 1"),
+    (lambda d: d.update(configuration={"minimum_support_ratio": 0.25})
+     or d["fixed_placements"].append(fixed("40", z="100")), "centre_of_gravity_unsupported"),
 ])
 def test_a_fixed_set_that_cannot_hold_is_refused_before_search(mutate, fragment):
     data = request()

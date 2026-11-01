@@ -26,6 +26,7 @@ from ._request_error import InvalidRequestError
 from .flat_bag import DEFORMABLE_BOUNDARY_KINDS
 from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, ParsedMeasures, Weight
 from .made_to_measure import box_cost_minor_for
+from .bounds import MAX_BOUND_SUM
 
 REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "negative_measure",
            "invalid_unit", "duplicate_id", "not_allowed", "invalid_value")
@@ -41,6 +42,14 @@ LENGTH_UNITS = LENGTH_UNIT_CODES
 WEIGHT_UNITS = WEIGHT_UNIT_CODES
 GROUND_CONTACT_RULES = ("free", "covered", "single", "multiple")
 SHAPE_TYPES = ("rigid_cuboid", "convex_hull", "compressible")
+#: The admission ceiling every engine refuses past. A length is a tick count
+#: every engine holds exactly, JavaScript's `Number` included; a box encloses no more than the
+#: bound path can sum, so `volume x 10^6` stays inside Rust's `i128`.
+MAX_LENGTH_TICKS = MAX_EXACT_MAGNITUDE
+MAX_VOLUME_TICKS3 = MAX_BOUND_SUM
+#: A weight, and every item's weight times its quantity plus the heaviest tare, fit a signed
+#: 64-bit integer, which is how Rust and PHP add a container's payload (R19-01).
+MAX_WEIGHT_TICKS = 2**63 - 1
 
 
 def pointer(*parts: Any) -> str:
@@ -112,9 +121,11 @@ def _list(value: Any, field: str) -> Sequence[Any]:
 
 def _measure(value: Any, field: str, kind: Type[Length] | Type[Weight], unit: str,
              measures: ParsedMeasures) -> None:
-    """A measure is an integer, a string or `{value, unit}`, and never negative."""
+    """A measure is an integer, a string or `{value, unit}`, and never negative; a length is
+    at most `MAX_LENGTH_TICKS` and a weight at most `MAX_WEIGHT_TICKS`."""
     if isinstance(value, bool) or not isinstance(value, (int, float, str, Mapping)) or (
-            isinstance(value, float) and json_integer(value) is None):
+            isinstance(value, float) and json_integer(value) is None
+            and not _whole_beyond_exact(value)):
         raise InvalidRequestError("wrong_type", field, "must be a measure")
     if isinstance(value, Mapping):
         if "value" not in value:
@@ -122,12 +133,36 @@ def _measure(value: Any, field: str, kind: Type[Length] | Type[Weight], unit: st
         stated = value.get("unit", unit)
         if not isinstance(stated, str) or stated.lower().strip() not in kind._MULTIPLIERS:
             raise InvalidRequestError("invalid_unit", field, f"has an unknown unit {json_spelling(stated)}")
+    amount = value["value"] if isinstance(value, Mapping) else value
+    if kind is Length and _whole_beyond_exact(amount):
+        # Past 2^53 - 1 a JSON number is the same whole number to every engine however its
+        # parser stored it, and its ticks are past the ceiling in every unit.
+        if amount < 0:
+            raise InvalidRequestError("negative_measure", field, "cannot be negative")
+        raise InvalidRequestError("above_maximum", field, f"must be at most {MAX_LENGTH_TICKS} ticks")
+    if kind is Weight and _whole_beyond_exact(amount):
+        # Past 2^53 - 1 JavaScript has already rounded a JSON number before it reads it, so a
+        # weight that large is written as a string, which every engine reads exactly.
+        if amount < 0:
+            raise InvalidRequestError("negative_measure", field, "cannot be negative")
+        raise InvalidRequestError("invalid_value", field,
+                                  f"must be written as a string past {MAX_EXACT_MAGNITUDE}")
     try:
-        measures.read(kind, value, unit)
+        ticks = measures.read(kind, value, unit).ticks
     except (ValueError, TypeError, ArithmeticError) as error:
         if "cannot be negative" in str(error):
             raise InvalidRequestError("negative_measure", field, "cannot be negative") from error
         raise InvalidRequestError("wrong_type", field, "must be a measure") from error
+    if kind is Length:
+        length_ticks(ticks, field)
+    else:
+        weight_ticks(ticks, field)
+
+
+def _whole_beyond_exact(value: Any) -> bool:
+    whole = not isinstance(value, bool) and (
+        isinstance(value, int) or (isinstance(value, float) and value.is_integer()))
+    return whole and abs(value) > MAX_EXACT_MAGNITUDE
 
 
 # ------------------------------------------------------------------------------ the rules
@@ -169,6 +204,7 @@ def check_request(data: Any) -> ParsedMeasures:
     for index, raw in enumerate(containers):
         _check_container(raw, pointer("containers", index), unit, measures)
     _require_unique_ids(containers, "containers")
+    _total_weight(items, containers, measures)
     return measures
 
 
@@ -267,7 +303,8 @@ def _check_container(raw: Any, where: str, unit: str, measures: ParsedMeasures) 
     _optional(container, "access_directions", where, _access_directions)
     _optional(container, "tag_limits", where, _tag_limits)
     _optional(container, "rate_table", where, _rate_table)
-    _optional(container, "obstacles", where, lambda v, f: _obstacles(v, f, unit, measures))
+    _optional(container, "obstacles", where, lambda v, f: _obstacles(
+        v, f, unit, measures, _ticks(container["inner_dimensions"], unit, measures)))
     _optional(container, "deformable_boundary", where,
               lambda v, f: _deformable_boundary(container, v, f, where))
     _optional(container, "made_to_measure", where,
@@ -304,7 +341,7 @@ def _made_to_measure(container: Mapping[str, Any], raw: Any, field: str, where: 
     for name in ("minimum", "increment"):
         _required(machine, name, field)
     for name in ("minimum", "increment", "outer_allowance"):
-        _optional(machine, name, field, lambda v, f: _dimensions(v, f, unit, measures))
+        _optional(machine, name, field, lambda v, f: _dimensions(v, f, unit, measures, positive=False))
     _optional(machine, "cost_per_square_metre_minor", field, lambda v, f: _integer(v, f, 0))
     _optional(machine, "tare_per_square_metre", field, lambda v, f: _measure(v, f, Weight, "g", measures))
     if container.get("outer_dimensions") is not None:
@@ -354,10 +391,61 @@ def _access_directions(raw: Any, where: str) -> None:
     _each_one_of(raw, where, ACCESS_DIRECTIONS)
 
 
-def _dimensions(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
+def _dimensions(raw: Any, where: str, unit: str, measures: ParsedMeasures, positive: bool = True) -> None:
+    """A box's three sides, each a measure; a box that holds or is something has no empty side
+, while a made-to-measure step states its own rule for zero."""
     sides = _object(raw, where)
     for side in _SIDES:
-        _measure(_required(sides, side, where), pointer_join(where, side), Length, unit, measures)
+        field = pointer_join(where, side)
+        value = _required(sides, side, where)
+        _measure(value, field, Length, unit, measures)
+        if positive and measures.read(Length, value, unit).ticks == 0:
+            raise InvalidRequestError("invalid_value", field, "must be positive")
+    _enclosure(_ticks(sides, unit, measures), where)
+
+
+def box_ticks(sides: Tuple[int, int, int], where: str) -> None:
+    """A box's sides in ticks, held to the admission ceiling as the request spells them: each
+    side, then what they enclose. Shared with `request_objects`. O(1)."""
+    for side, ticks in zip(_SIDES, sides):
+        length_ticks(ticks, pointer_join(where, side))
+    _enclosure(sides, where)
+
+
+def length_ticks(ticks: int, field: str) -> None:
+    """A length the object path holds as ticks, against `MAX_LENGTH_TICKS`."""
+    if ticks > MAX_LENGTH_TICKS:
+        raise InvalidRequestError("above_maximum", field, f"must be at most {MAX_LENGTH_TICKS} ticks")
+
+
+def weight_ticks(ticks: int, field: str) -> None:
+    """A weight the object path holds as ticks, against `MAX_WEIGHT_TICKS`."""
+    if ticks > MAX_WEIGHT_TICKS:
+        raise InvalidRequestError("above_maximum", field, f"must be at most {MAX_WEIGHT_TICKS} ticks")
+
+
+def total_weight_ticks(item_weights: Iterable[Tuple[int, int]], tares: Iterable[int]) -> None:
+    """Every item's weight times its quantity, plus the heaviest tare, against
+    `MAX_WEIGHT_TICKS`: no container's gross weight can pass it. Shared with
+    `request_objects`. O(items + containers)."""
+    total = sum(weight * quantity for weight, quantity in item_weights) + max(tares, default=0)
+    if total > MAX_WEIGHT_TICKS:
+        raise InvalidRequestError("above_maximum", "/items",
+                                  f"must weigh at most {MAX_WEIGHT_TICKS} ticks in all, with the heaviest tare")
+
+
+def _total_weight(items: list, containers: list, measures: ParsedMeasures) -> None:
+    def ticks(holder: Mapping[str, Any], name: str) -> int:
+        value = holder.get(name)
+        return 0 if value is None else measures.read(Weight, value, "g").ticks
+    total_weight_ticks(((ticks(item, "weight"), int(item.get("quantity", 1))) for item in items),
+                       (ticks(container, "tare_weight") for container in containers))
+
+
+def _enclosure(sides: Tuple[int, int, int], where: str) -> None:
+    length, width, height = sides
+    if length * width * height > MAX_VOLUME_TICKS3:
+        raise InvalidRequestError("above_maximum", where, "must enclose at most 10^30 cubic ticks")
 
 
 def _stacking_group_name(value: Any, field: str) -> None:
@@ -391,16 +479,36 @@ def _rate_table(raw: Any, where: str) -> None:
     _optional(table, "fuel_surcharge_permille", where, lambda v, f: _integer(v, f, 0))
 
 
-def _obstacles(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
+def _obstacles(raw: Any, where: str, unit: str, measures: ParsedMeasures,
+               inner: Tuple[int, int, int]) -> None:
     for index, entry in enumerate(_list(raw, where)):
         at = pointer_join(where, index)
         obstacle = _object(entry, at)
-        origin = obstacle.get("origin")
-        if origin is not None:
-            point = _object(origin, at + "/origin")
-            for axis in ("x", "y", "z"):
-                _optional(point, axis, at + "/origin", lambda v, f: _measure(v, f, Length, unit, measures))
-        _dimensions(_required(obstacle, "dimensions", at), at + "/dimensions", unit, measures)
+        _placed_box(obstacle, at, unit, measures, inner)
+        extra = obstacle.get("additional_boxes")
+        if extra is not None:
+            boxes = pointer_join(at, "additional_boxes")
+            for position, box in enumerate(_list(extra, boxes)):
+                part = pointer_join(boxes, position)
+                _placed_box(_object(box, part), part, unit, measures, inner)
+
+
+def _placed_box(box: Mapping[str, Any], at: str, unit: str, measures: ParsedMeasures,
+                inner: Tuple[int, int, int]) -> None:
+    """An optional `origin` and required `dimensions`: an obstacle, or one more box of it
+, whose measures are read in the request's unit like every other length, and
+    which lies inside the container."""
+    origin = {} if box.get("origin") is None else box["origin"]
+    if box.get("origin") is not None:
+        point = _object(origin, at + "/origin")
+        for axis in ("x", "y", "z"):
+            _optional(point, axis, at + "/origin", lambda v, f: _measure(v, f, Length, unit, measures))
+    _dimensions(_required(box, "dimensions", at), at + "/dimensions", unit, measures)
+    sides = _ticks(box["dimensions"], unit, measures)
+    for axis, side, room in zip(("x", "y", "z"), sides, inner):
+        start = origin.get(axis)
+        if (0 if start is None else measures.read(Length, start, unit).ticks) + side > room:
+            raise InvalidRequestError("invalid_value", at, "lies outside inner_dimensions")
 
 
 # ------------------------------------------------------------------------------ plumbing

@@ -10,6 +10,29 @@ if TYPE_CHECKING:
     from .models import ItemInstance, Placement
 
 
+def column_layer_z(layer: int, height: int, nesting: int) -> int:
+    """The bottom of layer `layer` in a column of identical envelopes `height` tall that each
+    sink `nesting` into the one beneath.
+
+    Only a directly adjacent pair may overlap. Once `2 x nesting > height` a third
+    copy sunk into the second would reach into the first, so the column nests in pairs: the
+    second sinks into the first and the third rests on the pair. O(1).
+    """
+    if 2 * nesting <= height:
+        return layer * (height - nesting)
+    return (layer // 2) * (2 * height - nesting) + (layer % 2) * (height - nesting)
+
+
+def column_layers(room: int, height: int, nesting: int) -> int:
+    """How many layers `column_layer_z` fits under `room`. O(1)."""
+    if room < height:
+        return 0
+    if 2 * nesting <= height:
+        return (room - height) // (height - nesting) + 1
+    pairs, rest = divmod(room, 2 * height - nesting)
+    return 2 * pairs + (1 if rest >= height else 0)
+
+
 def is_valid_nesting(a: "Placement", b: "Placement") -> bool:
     """Whether `a` and `b` are exactly the nested-column relationship
     `Item.nesting_height` describes: the same item type, the same footprint, one
@@ -28,6 +51,20 @@ def is_valid_nesting(a: "Placement", b: "Placement") -> bool:
     if low.origin.z == high.origin.z:
         return False
     return low.z2 - high.origin.z == nesting.ticks
+
+
+def nested_overlap(lower: "Placement", upper: "Placement") -> int:
+    """The physical space a valid nesting pair shares.
+
+    The pair sinks by `nesting_height` envelope to envelope, so under a clearance the items
+    themselves overlap by `2 x clearance` less, over their own footprint rather than the
+    envelope's. Counting the envelope's overlap took more than a narrow item's own volume
+    and reported a negative used volume. Equal to `nesting_height x base area` with no
+    clearance. O(1).
+    """
+    a, b = lower.box, upper.box
+    height = min(a.z2, b.z2) - max(a.origin.z, b.origin.z)
+    return a.overlap_area_xy(b) * height if height > 0 else 0
 
 
 def _nesting_overlap_volume(placements: Sequence["Placement"]) -> int:
@@ -54,7 +91,7 @@ def _nesting_overlap_volume(placements: Sequence["Placement"]) -> int:
         ordered = sorted(group, key=lambda p: p.envelope_box.origin.z)
         for lower, upper in zip(ordered, ordered[1:]):
             if is_valid_nesting(lower, upper):
-                overlap += lower.instance.item.nesting_height.ticks * lower.envelope_dimensions.base_area
+                overlap += nested_overlap(lower, upper)
     return overlap
 
 
@@ -127,5 +164,5 @@ def used_volume_delta(placements: Sequence["Placement"], placement: "Placement")
     overlap = 0
     for existing in placements:
         if is_valid_nesting(existing, placement):
-            overlap += nesting.ticks * placement.envelope_dimensions.base_area
+            overlap += nested_overlap(existing, placement)
     return placement.dimensions.volume - overlap

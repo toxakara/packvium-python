@@ -295,10 +295,12 @@ def test_the_container_lower_bound_ignores_payload_when_no_container_accepts_any
 
 def test_a_root_bound_past_its_ceiling_is_left_unset_and_the_pack_still_succeeds():
     # F5's counterpart here: past the declared ceiling the bound is withheld, never raised.
-    heavy = Item.create("heavy", Dimensions.mm(10, 10, 10), weight=10**31)
-    assert bounds.for_request(heavy.instances(), (container("c", 100, 100, 100),),
+    # A weight cannot pass the sum ceiling since admission caps the total at 2^63 - 1 ticks
+    #, so two cubes at the 10^30 cubic-tick volume ceiling pass it instead.
+    vast = item("vast", 625_000, 625_000, 625_000, quantity=2)
+    assert bounds.for_request(vast.instances(), (container("c", 625_000, 625_000, 625_000),),
                               "default") is None
-    result = Packer(counted(solvers=("exact_small",))).pack([heavy], [container("c", 100, 100, 100)])
+    result = Packer(counted(solvers=("exact_small",))).pack([vast], [container("c", 625_000, 625_000, 625_000)])
     assert result.complete
 
 
@@ -312,13 +314,18 @@ def test_the_container_plan_beam_prefers_one_container_that_holds_everything():
     assert_sound(result, items, containers)
 
 
-def test_the_container_plan_beam_stops_expanding_at_its_node_limit():
-    items = [item("a", 100, 100, 100, quantity=3)]
-    containers = [container("x", 100, 100, 100, quantity=3), container("y", 100, 100, 100, quantity=3)]
-    config = counted(solvers=("extreme_points",), container_plan_beam_width=4, container_plan_node_limit=1)
+@pytest.mark.parametrize(("node_limit", "packed_count"), [(1, 4), (4, 4), (5, 5)])
+def test_the_container_plan_beam_stops_expanding_at_its_effective_node_limit(node_limit, packed_count):
+    # One type makes every trial add exactly one container. The beam's four-trial
+    # floor applies to small budgets; a larger declared budget still stops search.
+    items = [item("a", 100, 100, 100, quantity=6)]
+    containers = [container("x", 100, 100, 100, quantity=6)]
+    config = counted(solvers=("extreme_points",), container_plan_beam_width=4,
+                     container_plan_node_limit=node_limit)
     result = Packer(config).pack(items, containers)
-    assert len(result.containers) == 1
-    assert len(result.unpacked) == 2
+    assert len(result.containers) == packed_count
+    assert len(result.unpacked) == 6 - packed_count
+    assert_sound(result, items, containers)
 
 
 def test_the_container_plan_beam_never_opens_more_of_a_type_than_the_request_has():

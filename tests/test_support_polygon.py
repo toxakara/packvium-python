@@ -7,6 +7,8 @@ first, not derived from the code under test.
 
 from __future__ import annotations
 
+import math
+
 from packvium import AxisAlignedBox, Dimensions, Length, Point
 from packvium.support_polygon import (contact_hull_points, convex_hull, doubled_centroid,
                                       eight_times_area, point_in_hull)
@@ -155,3 +157,58 @@ def test_one_centred_strip_is_where_the_two_polygon_rules_part():
     assert point_in_hull(doubled_centroid(candidate), hull)
     assert eight_times_area(hull) == 8 * 100 * 20
     assert eight_times_area(hull) <= 8 * (100 * 100) // 2
+
+
+# ------------------------------------------------------------ rare and absurd supports
+
+def supported(candidate, supporters) -> bool:
+    return point_in_hull(doubled_centroid(candidate), convex_hull(contact_hull_points(candidate, supporters)))
+
+
+def test_a_one_tick_knife_edge_under_the_centroid_carries_the_box():
+    assert supported(box(0, 0, 10, 10), [box(5, 0, 1, 10)])
+    assert not supported(box(0, 0, 10, 10), [box(6, 0, 1, 10)])
+
+
+def test_a_supporter_wider_than_the_footprint_is_clipped_to_it():
+    assert contact_hull_points(box(10, 10, 10, 10), [box(0, 0, 100, 100)]) == [
+        (20, 20), (20, 40), (40, 20), (40, 40),
+    ]
+
+
+def test_a_corner_square_whose_inner_corner_is_the_centroid_carries_it():
+    assert supported(box(0, 0, 40, 40), [box(0, 0, 20, 20)])
+    assert not supported(box(0, 0, 40, 40), [box(0, 0, 20, 19)])
+
+
+def legs_on_a_circle(keep) -> list[AxisAlignedBox]:
+    angles = (math.radians(degree) for degree in range(360))
+    return [
+        box(round(500 + 400 * math.cos(angle)), round(500 + 400 * math.sin(angle)), 1, 1)
+        for angle in angles if keep(angle)
+    ]
+
+
+def test_three_hundred_and_sixty_legs_on_a_circle_carry_the_centroid():
+    assert supported(box(0, 0, 1000, 1000), legs_on_a_circle(lambda _: True))
+
+
+def test_legs_on_half_a_circle_leave_the_centroid_hanging():
+    assert not supported(box(0, 0, 1000, 1000), legs_on_a_circle(lambda angle: math.sin(angle) > 0.1))
+
+
+def test_repeated_and_reordered_supporters_give_the_same_hull():
+    legs = [box(0, 0, 5, 5), box(35, 0, 5, 5), box(0, 35, 5, 5)]
+    candidate = box(0, 0, 40, 40)
+    hulls = {
+        tuple(convex_hull(contact_hull_points(candidate, order)))
+        for order in (legs, legs[::-1], legs + legs)
+    }
+    assert len(hulls) == 1
+    assert supported(candidate, legs)
+
+
+def test_coordinates_beyond_any_fixed_width_integer_stay_exact():
+    far = 2**80
+    assert supported(box(far, far, 101, 10), [box(far, far, 51, 10)])
+    assert not supported(box(far, far, 101, 10), [box(far, far, 50, 10)])

@@ -37,6 +37,8 @@ _UNKNOWN_KEY = "an object has no place for a key its class does not declare"
 _COERCED = "the deserializer coerces it, so the objects it builds are a different, valid request"
 _CONSTRUCTOR_FIRST = ("two faults: a constructor refuses its own value as the object is built, "
                       "before Packer.pack walks the request in the JSON order")
+_CEILING_SECOND = ("a length past the admission ceiling also breaks its constructor's own rule, which "
+                   "refuses it as the object is built, before Packer.pack reaches the ceiling")
 _NEGATIVE_POSITION = ("a Point cannot hold a negative coordinate; the measure it is read with "
                       "refuses it as negative_measure, where the JSON path names the placement")
 
@@ -48,6 +50,15 @@ _UNIT_KEY = ("the deserializer's parse cache is keyed by the unit, which an obje
 
 #: Cases with no object form: the value cannot be held, or the deserializer changes it.
 NOT_OBJECTS: dict[str, str] = {
+    "obstacle-origin-false": "a Point cannot hold a boolean instead of its coordinates",
+    "obstacle-origin-zero": "a Point cannot hold a number instead of its coordinates",
+    "obstacle-origin-nonempty-list": "a Point cannot hold a list instead of its coordinates",
+    "obstacle-origin-empty-string": "a Point cannot hold text instead of its coordinates",
+    "obstacle-additional-origin-false": "a Point cannot hold a boolean instead of its coordinates",
+    "obstacle-additional-origin-zero": "a Point cannot hold a number instead of its coordinates",
+    "obstacle-additional-origin-nonempty-list": "a Point cannot hold a list instead of its coordinates",
+    "obstacle-additional-origin-empty-string": "a Point cannot hold text instead of its coordinates",
+    "obstacle-additional-boxes-not-list": "an Obstacle holds its additional boxes as a tuple",
     "request-not-object": "a request that is not an object has no objects",
     "items-missing": "Packer.pack takes the items as an argument",
     "items-not-list": "Packer.pack takes the items as a sequence of Item",
@@ -111,12 +122,23 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
     "an-item-id-before-its-quantity": _CONSTRUCTOR_FIRST,
     "item-ids-before-containers": _CONSTRUCTOR_FIRST,
     "container-ids-before-fixed-placements": _CONSTRUCTOR_FIRST,
+    **{name: _CEILING_SECOND for name in (
+        "item.nesting_height=2^53 ticks",
+        *(f"container.made_to_measure.minimum.{axis}=2^53 ticks" for axis in ("length", "width", "height")),
+        *(f"container.made_to_measure.increment.{axis}=2^53 ticks" for axis in ("length", "height")),
+        *(f"container.obstacles.origin.{axis}=2^53 ticks" for axis in "xyz"),
+        "container.obstacles.dimensions.length=2^53 ticks",
+    )},
     "configuration-boolean-before-effort-budget": ("two faults: the EffortBudget is built, and refuses "
                                                    "its own value, before the PackingConfig that holds it"),
+    **{f"{name}=2^53 as a number": ("a JSON number past 2^53 - 1 is a rule of the JSON text; an object "
+                                    "holds the exact integer") for name in (
+        "item.weight", "item.max_top_load", "container.tare_weight", "container.max_payload",
+        "container.max_stack_density", "container.made_to_measure.tare_per_square_metre")},
 }
 
 #: Pinned, so the skip set cannot grow without this line changing too.
-SKIPPED = 62
+SKIPPED = 87
 
 
 @dataclass(frozen=True)

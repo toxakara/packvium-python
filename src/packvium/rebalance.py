@@ -199,15 +199,15 @@ def rebalance_weight(
         spread = max(weights) - min(weights)
         if spread <= 0:
             break
-        source_index = max(range(len(working)), key=lambda i: weights[i])
+        source_index = max(range(len(working)), key=lambda i: (weights[i], -i))
         source = working[source_index]
         ranked_items = sorted(
             range(len(source.placements)),
-            key=lambda i: -source.placements[i].instance.weight.ticks,
+            key=lambda i: (-source.placements[i].instance.weight.ticks, i),
         )
         destinations = sorted(
             (i for i in range(len(working)) if i != source_index),
-            key=lambda i: weights[i],
+            key=lambda i: (weights[i], i),
         )
 
         committed = None

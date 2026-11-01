@@ -29,8 +29,8 @@ from .flat_bag import as_dimensions, fits_alone
 from .lattice_summary import LatticeSummary
 from .models import (Container, ItemInstance, PackedContainer, Placement, UnpackedItem,
                      carries_itself, hull_collision_is_exact, is_stack_sensitive)
-from .nesting import (is_valid_nesting, item_occupied_volume, occupied_volume,
-                      used_volume as nesting_used_volume, used_volume_delta)
+from .nesting import (column_layer_z, column_layers, is_valid_nesting, item_occupied_volume,
+                      occupied_volume, used_volume as nesting_used_volume, used_volume_delta)
 from .result import SolverMetrics, StartRecord
 from .spatial_index import SpatialIndex
 from . import trace
@@ -140,12 +140,17 @@ class Deadline:
         return self.limit_ns - (self._clock() - self.started) <= 0
 
     def slice(self, parts: int) -> "Deadline":
+        return self.share(1, parts)
+
+    def share(self, weight: int, total: int) -> "Deadline":
+        """`weight / total` of what is left, never below the minimum slice; all of it when
+        this is the last share."""
         remaining = self.remaining_ns
-        if parts <= 1:
+        if total <= weight:
             return Deadline(0, limit_ns=remaining, clock=self._clock, effort_budget=self._effort_budget, stats=self._stats)
         return Deadline(
             0,
-            limit_ns=max(remaining // parts, min(remaining, MINIMUM_SLICE_NS)),
+            limit_ns=max(remaining * weight // total, min(remaining, MINIMUM_SLICE_NS)),
             clock=self._clock,
             effort_budget=self._effort_budget,
             stats=self._stats,
@@ -1425,8 +1430,7 @@ class GridSolver:
             nx = container.inner_dimensions.length.ticks // envelope.length.ticks
             ny = container.inner_dimensions.width.ticks // envelope.width.ticks
             layer_step = envelope.height.ticks - nesting_ticks
-            inner_height = container.inner_dimensions.height.ticks
-            nz = 0 if inner_height < envelope.height.ticks else (inner_height - envelope.height.ticks) // layer_step + 1
+            nz = column_layers(container.inner_dimensions.height.ticks, envelope.height.ticks, nesting_ticks)
             if single_layer: nz = min(nz, 1)
             if prototype.max_top_load is not None and prototype.weight.ticks > 0:
                 # In a uniform column the bottom item bears every item above it, so
@@ -1485,7 +1489,8 @@ class GridSolver:
             stats.search_nodes_expanded += 1
             stats.candidate_points_considered += 1
             x, y, z = index % nx, (index // nx) % ny, index // (nx * ny)
-            point = Point(x * envelope.length.ticks, y * envelope.width.ticks, z * layer_step)
+            point = Point(x * envelope.length.ticks, y * envelope.width.ticks,
+                          column_layer_z(z, envelope.height.ticks, nesting_ticks))
             position = Point(point.x + clearance, point.y + clearance, point.z + clearance)
             # A mixed-declared-type lattice group is only reached when every
             # item shares the same *achievable footprint set*, not necessarily the same
@@ -1842,15 +1847,6 @@ class HomogeneousBlockSolver:
         )
 
     @staticmethod
-    def _member_support(state: ContainerState, instance: ItemInstance, point: Point,
-                        envelope: Dimensions) -> float:
-        """The share of a member's base that rests on the floor or on a box beneath it."""
-        if point.z == 0:
-            return 1.0
-        support = direct_support_view(state.placements, instance, AxisAlignedBox(point, envelope))
-        return support.supporting_area / envelope.base_area
-
-    @staticmethod
     def _solution_key(solution: SingleContainerSolution, by_volume: bool = False) -> tuple:
         state = solution.state
         signature = tuple(
@@ -2092,21 +2088,58 @@ class HomogeneousBlockSolver:
         del remaining[best.item_id][:members]
         clearance = config.clearance.ticks
         per_layer = best.nx * best.ny
+        dx = best.envelope.length.ticks
+        dy = best.envelope.width.ticks
+        dz = best.envelope.height.ticks
+        base_z = best.space.origin.z
+        base_area = best.envelope.base_area
+        supporters: list[tuple[int, int, int, int]] = []
+        if base_z > 0 and members > 0:
+            bx1 = best.space.origin.x
+            by1 = best.space.origin.y
+            bx2 = bx1 + best.nx * dx
+            by2 = by1 + best.ny * dy
+            for existing in state.placements:
+                e_origin = existing.envelope_origin
+                e_dims = existing.envelope_dimensions
+                if e_origin.z + e_dims.height.ticks != base_z:
+                    continue
+                ox1 = e_origin.x
+                ox2 = ox1 + e_dims.length.ticks
+                if ox2 <= bx1 or ox1 >= bx2:
+                    continue
+                oy1 = e_origin.y
+                oy2 = oy1 + e_dims.width.ticks
+                if oy2 <= by1 or oy1 >= by2:
+                    continue
+                supporters.append((ox1, oy1, ox2, oy2))
         for index in range(members):
             x, y, z = index % best.nx, (index // best.nx) % best.ny, index // per_layer
-            point = Point(
-                best.space.origin.x + x * best.envelope.length.ticks,
-                best.space.origin.y + y * best.envelope.width.ticks,
-                best.space.origin.z + z * best.envelope.height.ticks,
-            )
-            position = Point(point.x + clearance, point.y + clearance, point.z + clearance)
+            px1 = best.space.origin.x + x * dx
+            py1 = best.space.origin.y + y * dy
+            pz1 = base_z + z * dz
+            point = Point(px1, py1, pz1)
+            position = Point(px1 + clearance, py1 + clearance, pz1 + clearance)
+            if z == 0 and base_z > 0:
+                px2 = px1 + dx
+                py2 = py1 + dy
+                area = 0
+                for ox1, oy1, ox2, oy2 in supporters:
+                    ix = (px2 if px2 < ox2 else ox2) - (px1 if px1 > ox1 else ox1)
+                    if ix <= 0:
+                        continue
+                    iy = (py2 if py2 < oy2 else oy2) - (py1 if py1 > oy1 else oy1)
+                    if iy > 0:
+                        area += ix * iy
+                support_ratio = area / base_area
+            else:
+                support_ratio = 1.0
             state.add_direct(
                 Placement(
                     chosen[index], position, best.rotation, best.physical, point, best.envelope,
                     # Above its bottom layer a member rests on an identical footprint; the
                     # bottom layer rests on whatever is there.
-                    self._member_support(state, chosen[index], point, best.envelope)
-                    if z == 0 else 1.0,
+                    support_ratio,
                 )
             )
             stats.candidates_evaluated += 1
@@ -2490,8 +2523,20 @@ def _run_concurrent_start(solver, order, containers, config, container_selector,
     return packed, unpacked, exhaustive, reached, dominant_lattice, stats, budget.effort_stopped
 
 
+def _slice_weights(starts: Sequence[tuple]) -> list[int]:
+    """Each start's weight in the time slicing. The late-type neighbourhoods are greedy re-runs
+    of one order, so together they weigh one start: with T of them, each weighs 1 and every
+    other start T. Without neighbourhoods every start weighs 1, the even share it always had.
+    Otherwise twenty item types would halve every other start's time, the first start's
+    lattice included (1.9.0 release frontier, br7 `quality`)."""
+    neighbourhoods = sum(1 for _, name, _ in starts if name.startswith("neighborhood:"))
+    if neighbourhoods == 0:
+        return [1] * len(starts)
+    return [1 if name.startswith("neighborhood:") else neighbourhoods for _, name, _ in starts]
+
+
 def _start_budget(deadline: Deadline, effort_budget: EffortBudget | None, stats: SearchStats,
-                  starts_left: int) -> Deadline:
+                  starts_left: int, weight: int = 1) -> Deadline:
     """The deadline one start runs under.
 
     Without an effort budget each start gets an even share of what is left, so a slow start
@@ -2501,7 +2546,7 @@ def _start_budget(deadline: Deadline, effort_budget: EffortBudget | None, stats:
     lose quietly, making a budgeted answer depend on the machine's speed.
     """
     if effort_budget is None:
-        return deadline.slice(starts_left)
+        return deadline.share(weight, starts_left)
     return deadline.with_effort(effort_budget, stats)
 
 
@@ -2709,6 +2754,7 @@ class SolverOrchestrator:
 
     def _solve_sequential(self, items, containers, config, deadline, starts, effort_budget, preloaded=()):
         results = []
+        weights = _slice_weights(starts)
         completed_orders: dict[str, tuple] = {}
         records = [
             StartRecord(f"{solver.name}:{order_name}", False, False, False)
@@ -2745,7 +2791,7 @@ class SolverOrchestrator:
                 else:
                     order_name = f"{base_name}:beam"
             stats = SearchStats()
-            budget = _start_budget(deadline, effort_budget, stats, len(starts) - position)
+            budget = _start_budget(deadline, effort_budget, stats, sum(weights[position:]), weights[position])
             start_config = _start_config(order_name, config)
             packed, unpacked, exhaustive, reached, dominant_lattice = self._across_containers(solver, order, containers, start_config, stats, budget, preloaded)
             wall_reached, effort_reached = _limits_reached(reached, budget.effort_stopped, budget.remaining_ns)
@@ -3215,8 +3261,12 @@ class SolverOrchestrator:
         incumbent = initial
         incumbent_score = self._score_plan(incumbent.packed, incumbent.remaining, config)
         plan_nodes = 0
+        # A beam wider than its node budget used to stop after trying the
+        # first container in static order, so the order chose it, not the objective. The
+        # budget is at least one trial per container type for every plan the beam keeps.
+        node_limit = max(config.container_plan_node_limit, config.container_plan_beam_width * len(containers))
 
-        while beam and plan_nodes < config.container_plan_node_limit:
+        while beam and plan_nodes < node_limit:
             expansions: list[_ContainerPlan] = []
             for plan in beam:
                 if not plan.remaining or len(plan.packed) >= maximum:
@@ -3224,7 +3274,7 @@ class SolverOrchestrator:
                     # and the incumbent only ever improves, so it cannot win now.
                     continue
                 for container in ordered:
-                    if plan_nodes >= config.container_plan_node_limit:
+                    if plan_nodes >= node_limit:
                         break
                     if deadline.expired:
                         reached = True

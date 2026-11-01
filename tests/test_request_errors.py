@@ -337,3 +337,72 @@ def test_without_an_output_block_the_result_is_in_the_request_unit_spelt_as_its_
 def test_a_nesting_height_not_below_the_height_is_refused_at_its_pointer(nesting, detail):
     error = refusal(lambda d: d["items"][0].update(nesting_height=nesting))
     assert (error.reason, error.field, error.detail) == ("invalid_value", "/items/0/nesting_height", detail)
+
+
+@pytest.mark.parametrize("origin", [False, 0, [], ""])
+@pytest.mark.parametrize("additional", [False, True], ids=["obstacle", "additional-box"])
+def test_falsy_non_object_obstacle_origins_have_typed_refusals(origin, additional):
+    data = request()
+    box = {"origin": origin, "dimensions": {"length": "1", "width": "1", "height": "1"}}
+    obstacle = {"id": "o", **box}
+    field = "/containers/0/obstacles/0/origin"
+    if additional:
+        obstacle = {"id": "o", "dimensions": box["dimensions"], "additional_boxes": [box]}
+        field = "/containers/0/obstacles/0/additional_boxes/0/origin"
+    data["containers"][0]["obstacles"] = [obstacle]
+    with pytest.raises(InvalidRequestError) as caught:
+        pack_from_dict(data)
+    assert (caught.value.reason, caught.value.field, caught.value.detail) == (
+        "wrong_type", field, "must be an object")
+
+
+@pytest.mark.parametrize("additional", [False, True], ids=["obstacle", "additional-box"])
+def test_null_obstacle_origin_packs_as_the_default_origin(additional):
+    data = request()
+    box = {"origin": None, "dimensions": {"length": "1", "width": "1", "height": "1"}}
+    obstacle = {"id": "o", **box}
+    if additional:
+        obstacle = {"id": "o", "dimensions": box["dimensions"], "additional_boxes": [box]}
+    data["containers"][0]["obstacles"] = [obstacle]
+    defaulted = copy.deepcopy(data)
+    target = defaulted["containers"][0]["obstacles"][0]
+    if additional:
+        target = target["additional_boxes"][0]
+    target["origin"] = {}
+    result = pack_from_dict(data)
+    expected = pack_from_dict(defaulted)
+    result["algorithm"]["duration_ms"] = expected["algorithm"]["duration_ms"]
+    assert result == expected
+
+
+@pytest.mark.parametrize("axis", ["x", "y", "z"])
+@pytest.mark.parametrize("additional", [False, True], ids=["obstacle", "additional-box"])
+def test_null_obstacle_coordinate_packs_as_zero(axis, additional):
+    data = request()
+    box = {"origin": {axis: None}, "dimensions": {"length": "1", "width": "1", "height": "1"}}
+    obstacle = {"id": "o", **box}
+    if additional:
+        obstacle = {"id": "o", "dimensions": box["dimensions"], "additional_boxes": [box]}
+    data["containers"][0]["obstacles"] = [obstacle]
+    defaulted = copy.deepcopy(data)
+    target = defaulted["containers"][0]["obstacles"][0]
+    if additional:
+        target = target["additional_boxes"][0]
+    target["origin"][axis] = 0
+    result = pack_from_dict(data)
+    expected = pack_from_dict(defaulted)
+    result["algorithm"]["duration_ms"] = expected["algorithm"]["duration_ms"]
+    assert result == expected
+
+
+def test_null_obstacle_additional_boxes_packs_as_an_empty_list():
+    data = request()
+    data["containers"][0]["obstacles"] = [{
+        "id": "o", "dimensions": {"length": "1", "width": "1", "height": "1"},
+        "additional_boxes": None}]
+    defaulted = copy.deepcopy(data)
+    defaulted["containers"][0]["obstacles"][0]["additional_boxes"] = []
+    result = pack_from_dict(data)
+    expected = pack_from_dict(defaulted)
+    result["algorithm"]["duration_ms"] = expected["algorithm"]["duration_ms"]
+    assert result == expected
