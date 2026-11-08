@@ -39,6 +39,17 @@ from ._compat import dataclass
 from enum import Enum
 from typing import Any, Mapping, Optional
 
+__all__ = [
+    "ALLOWED_FIELDS",
+    "DuplicateEventMismatchError",
+    "OutcomeError",
+    "OutcomeEvent",
+    "OutcomeEventNotFoundError",
+    "OutcomeEventType",
+    "OutcomeLedger",
+    "UnsupportedOutcomeFieldError",
+]
+
 
 # --------------------------------------------------------------------------------- errors
 

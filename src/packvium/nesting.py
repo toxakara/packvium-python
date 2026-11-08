@@ -134,7 +134,7 @@ def item_occupied_volume(instance: "ItemInstance") -> int:
     """The volume `occupied_volume` counts for this item before it is placed, in any orientation.
 
     A hull occupies its authored solid, and a proper rotation keeps that volume, so one
-    orientation answers for all six through the memoised shape: `O(1)` after the first call.
+    orientation answers for all 24 through the memoised shape: `O(1)` after the first call.
     A compressible item keeps its declared box: collision and support use the uncompressed
     box, so placed boxes never share space and their declared volumes stay additive.
     """

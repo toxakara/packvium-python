@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 
 from .axle_load import axle_reactions
 from .constraints import load_units, reserved_volume
-from .models import PackedContainer, UnpackedItem
+from .models import PackedContainer, UnpackedItem, placement_id
 from .units import Length
 
 
@@ -195,6 +195,9 @@ class PackingResult:
     optimality: ResultFact | None = None
     objective: str = "default"
     catalog_versions_used: tuple[dict, ...] = ()
+    #: The request's ISO 4217 code, echoed only when the request declares one, by the answer
+    #: and by every alternative alike (1.10).
+    currency: str | None = None
 
     def __post_init__(self) -> None:
         derived = derive_result_facts(self.status, not self.unpacked, self.algorithm.time_limit_reached)
@@ -220,8 +223,9 @@ class PackingResult:
     def packed_item_count(self) -> int: return sum(c.placement_count for c in self.containers)
 
     def to_dict(self, length_unit: str = "mm", weight_unit: str = "g", include_alternatives: bool = True) -> dict:
-        def placement_dict(p):
+        def placement_dict(p, container_id):
             return {
+                "placement_id": placement_id(container_id, p.position, p.instance.item.id, p.rotation.value),
                 "item_id": p.instance.id,
                 "item_type": p.instance.item.id,
                 "position": p.position.to_dict(length_unit),
@@ -299,8 +303,8 @@ class PackingResult:
             "score": list(self.score),
             "containers": [{
                 "id": c.id, "container_type": c.container.id,
-                "inner_dimensions": c.container.inner_dimensions.to_dict(length_unit),
-                "outer_dimensions": (c.container.outer_dimensions or c.container.inner_dimensions).to_dict(length_unit),
+                "inner_dimensions": c.container.declared_inner.to_dict(length_unit),
+                "outer_dimensions": (c.container.outer_dimensions or c.container.declared_inner).to_dict(length_unit),
                 **achieved_dict(c),
                 **made_to_measure_dict(c.container),
                 "payload_weight": c.payload_weight.to_dict(weight_unit),
@@ -315,7 +319,7 @@ class PackingResult:
                 # empty and an added `lattice_summary` key carries the same information in
                 # O(1)/O(r) instead of one entry per instance.
                 **lattice_summary_dict(c.lattice_summary),
-                "placements": [placement_dict(p) for p in c.placements],
+                "placements": [placement_dict(p, c.id) for p in c.placements],
             } for c in self.containers],
             "unpacked_items": [{
                 "item_id": u.instance.id,
@@ -325,6 +329,8 @@ class PackingResult:
                 "proof": u.proof.to_dict(),
             } for u in self.unpacked],
             "catalog_versions_used": [dict(reference) for reference in self.catalog_versions_used],
+            # Absent unless the request declared one, so every other request keeps its bytes.
+            **({} if self.currency is None else {"currency": self.currency}),
             "warnings": list(self.warnings),
             "alternatives": [a.to_dict(length_unit, weight_unit, False) for a in self.alternatives] if include_alternatives else [],
         }

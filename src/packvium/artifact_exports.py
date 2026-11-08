@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
+from ._canonical_json import MAX_EXACT_MAGNITUDE
 from .artifacts import FORMAT, OperationalArtifactError, canonical_artifact_json
 
 __all__ = ["CSV_COLUMNS", "export_csv", "export_json", "export_work_order_html"]
@@ -183,6 +184,9 @@ def _text(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
+        # Beyond 2^53 - 1 JavaScript has already rounded the integer, so its decimal would differ.
+        if abs(value) > MAX_EXACT_MAGNITUDE:
+            raise OperationalArtifactError("number_out_of_range", f"{value} is beyond what every engine holds exactly")
         return str(value)
     raise OperationalArtifactError("invalid_value", f"a {type(value).__name__} has no single rendering in a work order")
 
@@ -192,7 +196,7 @@ def _ordinal(index: Any) -> str:
     `0.5 + 1` would print `1.5` in one engine and be refused in another."""
     if isinstance(index, bool) or not isinstance(index, int):
         raise OperationalArtifactError("invalid_value", f"container index {index!r} is not an integer")
-    return str(index + 1)
+    return _text(index + 1)
 
 
 def _escape(value: Any) -> str:

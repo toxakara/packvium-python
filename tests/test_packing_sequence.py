@@ -895,3 +895,53 @@ def test_safe_route_removal_order_deadlock_reports_all_stuck_boxes():
         safe_route_removal_order([b0, b1], stops=[1, 0], container=container, directions=("-x",))
     assert excinfo.value.stop == 0
     assert 1 in excinfo.value.stuck
+
+
+def test_out_of_z_order_floor_box_sliding_under_elevated_box_deactivates_isolated_floor_shortcut():
+    """When an elevated box at z=5mm is already in the loading prefix before a floor box
+    of height 5mm slides underneath it at step 1, `elevated_bases` contains 5mm, so the
+    isolated-floor shortcut must not skip the load/stacking check on the newly formed column."""
+    heavy_upper = Item.create("upper", Dimensions.mm(10, 10, 5), weight="5kg", stacking_group="C")
+    fragile_floor = Item.create("floor-fragile", Dimensions.mm(10, 10, 5), weight="1kg", max_top_load="1kg")
+    non_stack_floor = Item.create("floor-ns", Dimensions.mm(10, 10, 5), stackable=False)
+    group_floor = Item.create("floor-grp", Dimensions.mm(10, 10, 5), accepts_stacking_groups=["A"])
+    container = Container.create("c", Dimensions.mm(10, 10, 20))
+
+    for base_item, expected_reason in (
+        (fragile_floor, "top_load_exceeded: floor-fragile#1"),
+        (non_stack_floor, "non_stackable_item_has_load: floor-ns#1"),
+        (group_floor, "stacking_group_incompatible: floor-grp"),
+    ):
+        placements = [
+            stacked_placement(base_item, 0, 0, 0),
+            stacked_placement(heavy_upper, 0, 0, 5),
+        ]
+        # Order [1, 0] loads the elevated box at z=5mm first, then the floor box at z=0.
+        with pytest.raises(SequenceReplayError) as excinfo:
+            verify_loading_prefix_business_rules(placements, [1, 0], container)
+        assert excinfo.value.index == 0
+        assert excinfo.value.step == 1
+        assert excinfo.value.reason == expected_reason
+
+
+def test_isolated_floor_step_among_many_floor_boxes_catches_exact_density_offender():
+    """Even when 40 boxes rest on the floor with no elevated items, the isolated-floor
+    fast path checks `max_stack_density` on each step and pinpoints the exact offending step."""
+    light = Item.create("light", Dimensions.mm(10, 10, 5), weight="1g", quantity=40)
+    anvil = Item.create("anvil", Dimensions.mm(10, 10, 5), weight="50kg")
+    placements = [
+        Placement(
+            inst, Point(i * 10 * MM, 0, 0), Rotation.LWH, inst.dimensions,
+            Point(i * 10 * MM, 0, 0), inst.dimensions,
+        )
+        for i, inst in enumerate(light.instances())
+    ]
+    placements.insert(27, stacked_placement(anvil, 400, 0, 0))
+    container = Container.create("c", Dimensions.mm(500, 20, 20), max_stack_density="1000kg")
+    order = list(range(len(placements)))
+    with pytest.raises(SequenceReplayError) as excinfo:
+        verify_loading_prefix_business_rules(placements, order, container)
+    assert excinfo.value.index == 27
+    assert excinfo.value.step == 27
+    assert "stack_density_exceeded" in excinfo.value.reason
+

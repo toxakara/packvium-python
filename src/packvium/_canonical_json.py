@@ -44,6 +44,22 @@ def canonical_json(value: Any) -> str:
     return "".join(parts)
 
 
+def canonical_identifier(values: List[Any]) -> str:
+    """`canonical_json` of `values`, except that a lone UTF-16 surrogate in a string is written
+    as its lowercase `\\udxxx` escape, as ECMAScript's `JSON.stringify` writes it, instead of
+    refused. For an identifier built from caller-chosen ids (`placement_id`, 1.10): a request
+    may name a container that way, and an answer must still name its placements. Every string
+    PHP and Rust can hold has no lone surrogate, so for those this is `canonical_json` exactly."""
+    return "[" + ",".join(_identifier_part(value) for value in values) + "]"
+
+
+def _identifier_part(value: Any) -> str:
+    if not isinstance(value, str):
+        return canonical_json(value)
+    return '"' + "".join(f"\\u{ord(c):04x}" if 0xD800 <= ord(c) <= 0xDFFF else _string(c)[1:-1]
+                         for c in value) + '"'
+
+
 def json_integer(value: Any) -> Optional[int]:
     """The integer a JSON value is, judged by value as every engine can judge it.
 

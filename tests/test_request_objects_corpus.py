@@ -69,6 +69,9 @@ NOT_OBJECTS: dict[str, str] = {
     "container-made-to-measure-not-object": "a machine that is not an object is not a MadeToMeasure",
     "container-deformable-boundary-not-object": "the object holds the bag's kind, not a block",
     "container-deformable-boundary-kind-missing": "the object holds the bag's kind, not a block",
+    "container-pallet-overhang-limit-not-object": "a limit that is not an object is not an OverhangLimit",
+    "container-pallet-overhang-limit-length-missing": "OverhangLimit requires both axes",
+    "container-pallet-overhang-limit-width-missing": "OverhangLimit requires both axes",
     "item-id-missing": "Item requires an id",
     "item-dimensions-missing": "Item requires dimensions",
     "item-side-missing": "Dimensions requires all three sides",
@@ -83,6 +86,9 @@ NOT_OBJECTS: dict[str, str] = {
     "configuration-keys-unknown-first-in-code-point-order": _UNKNOWN_KEY,
     "effort-key-unknown": _UNKNOWN_KEY,
     "container-deformable-boundary-key-unknown": _UNKNOWN_KEY,
+    "container-gusseted-bag-key-unknown": _UNKNOWN_KEY,
+    "an-unknown-boundary-key-before-a-missing-gusset": _UNKNOWN_KEY,
+    "container-pallet-overhang-limit-key-unknown": _UNKNOWN_KEY,
     "container-made-to-measure-key-unknown": _UNKNOWN_KEY,
     "unknown-configuration-key-before-its-values": _UNKNOWN_KEY,
     "unsupported-before-units": "an unsupported field has no object form",
@@ -100,15 +106,25 @@ NOT_OBJECTS: dict[str, str] = {
     "item-allowed-rotation-unknown": "Rotation has no such member",
     "item-allowed-rotation-lowercase": "Rotation has no such member",
     "item-shape-type-unknown": "ShapeType has no such member",
+    "item-allowed-rotation-reflection-on-a-hull": "Rotation has no such member",
+    "item-allowed-rotation-legacy-spelled-signed-on-a-hull": "Rotation has no such member",
+    "item-allowed-rotation-signed-beside-an-unknown-shape": "ShapeType has no such member",
+    "fixed-orientation-reflection-on-a-hull": "Rotation has no such member",
     "fixed-orientation-unknown": "Rotation has no such member",
     "configuration-solvers-not-list": _AS_LETTERS,
     "output-not-object": _OUTPUT,
     "output-length-unit-unknown": _OUTPUT,
     "output-weight-unit-unknown": _OUTPUT,
     "output-before-configuration": _OUTPUT,
+    "output-before-currency": _OUTPUT,
     # The request's length unit is an argument of each measure, not an object of its own.
     "units-not-object": _UNITS,
     "units-list": _UNITS,
+    "units-weight": _UNITS,
+    "units-unknown-key": _UNITS,
+    "units-unknown-keys-first-in-code-point-order": _UNITS,
+    "units-unknown-key-null": _UNITS,
+    "unknown-units-key-before-its-length": _UNITS,
     "units-length-object": _UNIT_KEY,
     "units-length-list": _UNIT_KEY,
 }
@@ -122,12 +138,14 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
     "an-item-id-before-its-quantity": _CONSTRUCTOR_FIRST,
     "item-ids-before-containers": _CONSTRUCTOR_FIRST,
     "container-ids-before-fixed-placements": _CONSTRUCTOR_FIRST,
+    "currency-before-configuration": _CONSTRUCTOR_FIRST,
     **{name: _CEILING_SECOND for name in (
         "item.nesting_height=2^53 ticks",
         *(f"container.made_to_measure.minimum.{axis}=2^53 ticks" for axis in ("length", "width", "height")),
         *(f"container.made_to_measure.increment.{axis}=2^53 ticks" for axis in ("length", "height")),
         *(f"container.obstacles.origin.{axis}=2^53 ticks" for axis in "xyz"),
         "container.obstacles.dimensions.length=2^53 ticks",
+        "container-gusseted-bag-side-gusset-depth-past-the-ceiling",
     )},
     "configuration-boolean-before-effort-budget": ("two faults: the EffortBudget is built, and refuses "
                                                    "its own value, before the PackingConfig that holds it"),
@@ -138,7 +156,7 @@ DIFFERENT_ON_PURPOSE: dict[str, str] = {
 }
 
 #: Pinned, so the skip set cannot grow without this line changing too.
-SKIPPED = 87
+SKIPPED = 105
 
 
 @dataclass(frozen=True)
@@ -172,7 +190,8 @@ def fixed_placement(raw: dict[str, Any], unit: str) -> FixedPlacement:
     return FixedPlacement(item_id=raw["item_type"], container_id=raw["container_type"],
                           position=Point(*_point_ticks(raw.get("position", {}), unit)),
                           rotation=Rotation(raw["orientation"]),
-                          container_instance=raw.get("container_instance", 1))
+                          container_instance=raw.get("container_instance", 1),
+                          placement_id=raw.get("placement_id"))
 
 
 def object_refusal(request: Any) -> Refusal:
@@ -186,7 +205,7 @@ def object_refusal(request: Any) -> Refusal:
     except Exception as error:  # what the objects could not be built from is the finding
         return Refusal(error, "constructor")
     try:
-        Packer(config).pack(items, containers, fixed)
+        Packer(config).pack(items, containers, fixed, data.get("currency"))
     except Exception as error:
         return Refusal(error, "pack")
     return Refusal(None, "pack")

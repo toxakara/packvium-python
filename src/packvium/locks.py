@@ -79,23 +79,30 @@ not refused, because the constraint has no way to size a box it is not currently
 
 ## The one thing a constraint cannot see
 
-A lock names a container index; a constraint runs inside a search that has no index yet --
-`container_index` is a position in the *result's* sorted container order, which does not
-exist until the solve finishes. The constraint therefore applies the outstanding rule in
-every container the locked box could physically occupy, and `resolve_with_locks` verifies
-preservation at the exact index afterwards. Over-applying can only *forbid*, never place,
-so the failure mode is a reported `missing` lock and never a placement the engine would have
-refused.
+A lock names a container; a constraint runs inside a search that has not numbered its
+containers yet. The constraint therefore applies the outstanding rule in every container the
+locked box could physically occupy, and `resolve_with_locks` verifies preservation afterwards.
+Over-applying can only *forbid*, never place, so the failure mode is a reported `missing`
+lock and never a placement the engine would have refused.
+
+Since 1.10 a lock read from a plan carries the placement's `placement_id`, the canonical JSON
+of `[container id, x, y, z, item type, orientation]`, and preservation is checked by it. Before, it was checked at
+the plan's `container_index`: the position in the *emitted* container list, which the
+contract does not fix, so a re-solve that opened the same containers in another order
+reported a held lock as `missing`. A lock built without an id keeps the index rule.
 """
 
 from __future__ import annotations
 
+import json
 from ._compat import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
+from ._canonical_json import canonical_identifier
 from .constraints import ConstraintContext, ConstraintResult
 from .extensions import ExtensionRegistry
 from .geometry import AxisAlignedBox, Point, Rotation
+from .orientations import CODES
 
 __all__ = [
     "LOCK_VIOLATED",
@@ -145,13 +152,16 @@ class PlacementLock:
     item_type: str
     orientation: str
     position_ticks: tuple[int, int, int]
+    #: The plan reference's `placement_id` (1.10). When set, preservation is checked by it
+    #: rather than by `container_index`; its last five entries must be this lock's own.
+    placement_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.container_index < 0:
             raise ValueError("a lock must name a container index")
         if not self.item_type:
             raise ValueError("a lock must name an item type")
-        if self.orientation not in Rotation.__members__:
+        if self.orientation not in CODES:
             raise ValueError(f"{self.orientation!r} is not an orientation this engine emits")
         if len(self.position_ticks) != 3:
             raise ValueError("a lock's position must have three axes")
@@ -159,6 +169,19 @@ class PlacementLock:
             raise ValueError("a lock's position must be exact integer ticks")
         if any(t < 0 for t in self.position_ticks):
             raise ValueError("a lock's position cannot be negative")
+        if self.placement_id is not None and not self._names_this_placement(self.placement_id):
+            raise ValueError(f"{self.placement_id!r} is not the placement id of this lock")
+
+    def _names_this_placement(self, identifier: str) -> bool:
+        """The id is `[container id, x, y, z, item type, orientation]` in canonical JSON and its
+        last five entries are this lock's own (1.10)."""
+        try:
+            parts = json.loads(str(identifier))
+        except ValueError:
+            return False
+        return (isinstance(parts, list) and len(parts) == 6 and isinstance(parts[0], str)
+                and bool(parts[0]) and parts[1:] == [*self.position_ticks, self.item_type, self.orientation]
+                and canonical_identifier(parts) == identifier)
 
     @property
     def slot(self) -> _Slot:
@@ -188,6 +211,7 @@ def locks_from_plan(plan: Mapping[str, Any], *, container_index: int,
                 item_type=str(reference["item_type"]),
                 orientation=str(reference["orientation"]),
                 position_ticks=(int(ticks["x"]), int(ticks["y"]), int(ticks["z"])),
+                placement_id=reference.get("placement_id"),
             ))
     return tuple(locks)
 
@@ -228,7 +252,7 @@ class _LockConstraint:
         it exists to drop locks that plainly cannot apply here, and a lock this admits is
         still judged by the ordinary geometry rules.
         """
-        box = context.item.dimensions.rotated(Rotation[lock.orientation])
+        box = context.item.dimensions.rotated(Rotation(lock.orientation))
         inner = context.container.inner_dimensions
         x, y, z = lock.position_ticks
         return (x + box.length.ticks <= inner.length.ticks
@@ -243,7 +267,7 @@ class _LockConstraint:
         ordinary clearance rule already enforces around whatever ends up here, and reserving
         it twice would refuse neighbours the engine is willing to place.
         """
-        dimensions = context.item.dimensions.rotated(Rotation[lock.orientation])
+        dimensions = context.item.dimensions.rotated(Rotation(lock.orientation))
         return AxisAlignedBox(Point(*lock.position_ticks), dimensions)
 
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
@@ -319,13 +343,15 @@ class LockedResolve:
             raise ValueError("an unpreserved resolve must name the locks it could not honour")
 
 
-def _placed(result: Mapping[str, Any]) -> set[tuple[int, str, str, tuple[int, int, int]]]:
-    """Every placement in the result, keyed the way a lock addresses one.
+def _placed(result: Mapping[str, Any]) -> set[tuple[Any, ...]]:
+    """Every placement in the result, keyed both ways a lock addresses one (`_lock_key`).
 
-    `container_index` is the container's position in the emitted list, which is the same
-    order `packvium.execution` indexes and the order the plan's references carry.
+    `container_index` is the container's position in the emitted list, the order
+    `packvium.execution` indexes. `placement_id` names the container by id instead, and is
+    unique in a valid result, so it finds the placement whatever order the re-solve emitted
+    its containers in. O(P).
     """
-    placed = set()
+    placed: set[tuple[Any, ...]] = set()
     for index, container in enumerate(result.get("containers") or ()):
         for placement in container.get("placements") or ():
             position = placement.get("position") or {}
@@ -333,9 +359,16 @@ def _placed(result: Mapping[str, Any]) -> set[tuple[int, str, str, tuple[int, in
                 ticks = tuple(int(position[axis]["ticks"]) for axis in ("x", "y", "z"))
             except (KeyError, TypeError):
                 continue
-            placed.add((index, str(placement.get("item_type")),
-                        str(placement.get("orientation")), ticks))
+            placed.add((index, str(placement.get("item_type")), str(placement.get("orientation")), ticks))
+            if isinstance(placement.get("placement_id"), str):
+                placed.add((placement["placement_id"],))
     return placed
+
+
+def _lock_key(lock: PlacementLock) -> tuple[Any, ...]:
+    if lock.placement_id is not None:
+        return (lock.placement_id,)
+    return (lock.container_index, lock.item_type, lock.orientation, tuple(lock.position_ticks))
 
 
 def _refuse_a_contradictory_set(locks: Sequence[PlacementLock],
@@ -351,7 +384,7 @@ def _refuse_a_contradictory_set(locks: Sequence[PlacementLock],
         item = items.get(lock.item_type)
         if item is None:
             raise LockSetError(f"the request has no item type {lock.item_type!r} to lock")
-        dimensions = item.dimensions.rotated(Rotation[lock.orientation])
+        dimensions = item.dimensions.rotated(Rotation(lock.orientation))
         boxes.append((lock, AxisAlignedBox(Point(*lock.position_ticks), dimensions)))
 
     for index, (lock, box) in enumerate(boxes):
@@ -386,9 +419,5 @@ def resolve_with_locks(request: Mapping[str, Any], locks: Sequence[PlacementLock
     })
     result = pack_from_dict(dict(request), extensions=lock_registry(locks, base))
     placed = _placed(result)
-    missing = tuple(
-        lock for lock in locks
-        if (lock.container_index, lock.item_type, lock.orientation,
-            tuple(lock.position_ticks)) not in placed
-    )
+    missing = tuple(lock for lock in locks if _lock_key(lock) not in placed)
     return LockedResolve(locks=locks, result=result, preserved=not missing, missing=missing)

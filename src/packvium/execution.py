@@ -81,6 +81,19 @@ def placement_reference(container_index: int, placement: Mapping[str, Any]) -> d
         ) from error
 
 
+def _step_reference(container_index: int, placement: Mapping[str, Any]) -> dict[str, Any]:
+    """`placement_reference` plus the result placement's `placement_id` (1.10), copied rather
+    than derived, when the result carries one. A canonical projection (a golden) has no ids,
+    so its plan keeps the bytes it always had. `locks_from_plan` reads the id from here."""
+    reference = placement_reference(container_index, placement)
+    if "placement_id" not in placement:
+        return reference
+    identifier = placement["placement_id"]
+    if not isinstance(identifier, str) or not identifier:
+        raise ExecutionPlanError(f"placement_id {identifier!r} is not a non-empty string")
+    return {**reference, "placement_id": identifier}
+
+
 def _steps(container_index: int, container: Mapping[str, Any],
            loading_order: Optional[Sequence[int]]) -> dict[str, Any]:
     """The operator sequence for one container, or an honest absence of one.
@@ -96,7 +109,7 @@ def _steps(container_index: int, container: Mapping[str, Any],
         return {
             "order": "unavailable",
             "steps": [
-                {"placement": placement_reference(container_index, placement)}
+                {"placement": _step_reference(container_index, placement)}
                 for placement in placements
             ],
         }
@@ -108,7 +121,7 @@ def _steps(container_index: int, container: Mapping[str, Any],
     return {
         "order": "loading",
         "steps": [
-            {"sequence": step, "placement": placement_reference(container_index, placements[index])}
+            {"sequence": step, "placement": _step_reference(container_index, placements[index])}
             for step, index in enumerate(loading_order, start=1)
         ],
     }

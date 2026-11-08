@@ -77,7 +77,10 @@ events = [
     {"sequence": 1, "type": "placement_locked", "placement": {
         "item_type": "cube", "container_type": "tote", "container_instance": 1,
         "position": {axis: loaded["position"][axis]["value"] for axis in ("x", "y", "z")},
-        "orientation": loaded["orientation"]}},
+        "orientation": loaded["orientation"],
+        # Optional: the result's own id for this box. Quoting it ties the lock to exactly
+        # the placement the dock saw; an id that disagrees with the fields is refused.
+        "placement_id": loaded["placement_id"]}},
     {"sequence": 2, "type": "item_missing", "item_type": "slab", "quantity": 1},
 ]
 revision = derive_revision(root, approved, events)
@@ -123,3 +126,54 @@ print("""
   An edited request no longer equals what its parent's request and its own events
   produce, and any later revision would stop naming it as a parent. An event that
   contradicts the request is refused by name rather than applied as a best guess.""")
+
+# --------------------------------------------------------------------------------------
+section("5. A box cut to measure is already cut: the replan stocks it")
+
+MACHINE = {
+    "id": "machine", "quantity": 3, "cost_minor": 40, "tare_weight": "50",
+    "inner_dimensions": {"length": "610", "width": "610", "height": "610"},
+    "made_to_measure": {"minimum": {"length": "60", "width": "60", "height": "60"},
+                        "increment": {"length": "25", "width": "25", "height": "25"},
+                        "cost_per_square_metre_minor": 1000, "tare_per_square_metre": "500",
+                        "outer_allowance": {"length": "3", "width": "3", "height": "3"}},
+    # A quarter of the box that ships is left for void fill. Cut tight to the two cubes the
+    # box would be nearly full, so the machine cuts a larger one instead.
+    "void_fill_reserve_ratio": 0.25,
+}
+CUT = {**REQUEST, "items": [{**REQUEST["items"][0], "quantity": 2}], "containers": [MACHINE]}
+
+
+def cut_size(plan: dict) -> str:
+    sides = plan["containers"][0]["inner_dimensions"]
+    return " x ".join(sides[axis]["value"] for axis in ("length", "width", "height")) + " mm"
+
+
+tight = {**CUT, "containers": [{key: value for key, value in MACHINE.items() if key != "void_fill_reserve_ratio"}]}
+print(f"  cut with no reserve:    {cut_size(pack_from_dict(copy.deepcopy(tight)))}")
+
+cut_root = root_revision(CUT)
+cut_plan = pack_from_dict(copy.deepcopy(CUT))
+cut_artifact = build_operational_artifact(CUT, cut_plan)
+box = cut_plan["containers"][0]
+print(f"  cut with a 25% reserve: {cut_size(cut_plan)}, {box['made_to_measure']['cost_minor']} minor units")
+
+cube = box["placements"][0]
+lock = {"sequence": 1, "type": "placement_locked", "placement": {
+    "item_type": "cube", "container_type": "machine", "container_instance": 1,
+    "position": {axis: cube["position"][axis]["value"] for axis in ("x", "y", "z")},
+    "orientation": cube["orientation"]}}
+stocked = derive_revision(cut_root, cut_artifact, [lock])
+for container in stocked["request"]["containers"]:
+    print(f"  container {container['id']}: quantity {container['quantity']},"
+          f" {'cut to measure' if 'made_to_measure' in container else 'stock, cost ' + str(container['cost_minor'])}")
+print(f"  the cube is locked in:       {stocked['request']['fixed_placements'][0]['container_type']}")
+print(f"  audit without the artifact:  {codes(verify_revision_chain([cut_root, stocked]))}")
+print(f"  audit with it:               {codes(verify_revision_chain([cut_root, stocked], [None, cut_artifact]))}")
+print("""
+  A cube locked in a box the machine already cut cannot ask for a new cut: the box
+  exists. The derived request turns it into a stock container named
+  `<type>@<revision>#<instance>`, at the size, price and tare the approved artifact
+  records, takes it from the machine's quantity, and fixes the cube inside it. New
+  boxes are still cut to measure. The size comes from the artifact, so the chain can
+  only be checked with it; without it the audit says `artifact_required`.""")

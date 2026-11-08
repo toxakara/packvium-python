@@ -54,14 +54,40 @@ WEIGHT_TICKS = {
     "tick": 1, "ticks": 1,
 }
 
-#: Axis permutation each orientation code applies to (length, width, height).
-ROTATIONS = {
-    "LWH": (0, 1, 2), "LHW": (0, 2, 1), "WLH": (1, 0, 2),
-    "WHL": (1, 2, 0), "HLW": (2, 0, 1), "HWL": (2, 1, 0),
-}
+#: The six legacy orientation codes: every box a cuboid can make, and an item's default list.
+BOX_ROTATIONS = ("LWH", "LHW", "WLH", "WHL", "HLW", "HWL")
 
-#: Orientations that keep the item's own height vertical.
-UPRIGHT_ROTATIONS = ("LWH", "WLH")
+#: Each of the 24 proper rotations, in canonical table order (1.10): the declared side each
+#: container axis takes its extent from, and the sign it carries. Written out rather than
+#: derived, so this table is a second statement of the contract and not a copy of an engine's.
+#: The legacy codes negate x exactly when their permutation is odd.
+ROTATION_TABLE = (
+    ("LWH", (0, 1, 2), (1, 1, 1)), ("LHW", (0, 2, 1), (-1, 1, 1)),
+    ("WLH", (1, 0, 2), (-1, 1, 1)), ("WHL", (1, 2, 0), (1, 1, 1)),
+    ("HLW", (2, 0, 1), (1, 1, 1)), ("HWL", (2, 1, 0), (-1, 1, 1)),
+    ("+L-W-H", (0, 1, 2), (1, -1, -1)), ("-L+W-H", (0, 1, 2), (-1, 1, -1)),
+    ("-L-W+H", (0, 1, 2), (-1, -1, 1)),
+    ("+L-H+W", (0, 2, 1), (1, -1, 1)), ("+L+H-W", (0, 2, 1), (1, 1, -1)),
+    ("-L-H-W", (0, 2, 1), (-1, -1, -1)),
+    ("+W-L+H", (1, 0, 2), (1, -1, 1)), ("+W+L-H", (1, 0, 2), (1, 1, -1)),
+    ("-W-L-H", (1, 0, 2), (-1, -1, -1)),
+    ("+W-H-L", (1, 2, 0), (1, -1, -1)), ("-W+H-L", (1, 2, 0), (-1, 1, -1)),
+    ("-W-H+L", (1, 2, 0), (-1, -1, 1)),
+    ("+H-L-W", (2, 0, 1), (1, -1, -1)), ("-H+L-W", (2, 0, 1), (-1, 1, -1)),
+    ("-H-L+W", (2, 0, 1), (-1, -1, 1)),
+    ("+H-W+L", (2, 1, 0), (1, -1, 1)), ("+H+W-L", (2, 1, 0), (1, 1, -1)),
+    ("-H-W-L", (2, 1, 0), (-1, -1, -1)),
+)
+
+#: Axis permutation each orientation code applies to (length, width, height).
+ROTATIONS = {code: axes for code, axes, _ in ROTATION_TABLE}
+
+#: The sign each container axis carries under each code; a box ignores it, a hull does not.
+ROTATION_SIGNS = {code: signs for code, _, signs in ROTATION_TABLE}
+
+#: Orientations that keep the item's own height vertical and pointing up: z takes `+H`.
+UPRIGHT_ROTATIONS = tuple(code for code, axes, signs in ROTATION_TABLE
+                          if axes[2] == 2 and signs[2] == 1)
 
 #: One square metre in length ticks squared -- the reference area a
 #: `Container.max_stack_density` limit is expressed per.
@@ -246,11 +272,17 @@ class ContainerSpec:
     #: A flat bag, admitted only when a + c <= L and b + c <= W over the largest
     #: envelope x2, y2 and z2 of its placements.
     flat_bag: bool = False
+    #: 1.10: a gusseted bag's side gusset depth G in ticks, which widens the width girth to
+    #: b + c <= W + G; 0 for a flat bag and every rigid container.
+    side_gusset: int = 0
     #: Whether a packed instance must report `achieved_dimensions`: a flat bag or a
     #: made-to-measure box. Either way it is the tight extent of the placements.
     reports_achieved_extent: bool = False
     #: The on-demand box machine this container is cut by, or None for stock.
     made_to_measure: "MachineSpec | None" = None
+    #: The weight-bearing deck `(x, y, length, width)` inside a pallet's solving
+    #: frame, which `inner` then is; None for every other container.
+    deck: tuple[int, int, int, int] | None = None
 
 
 def _flag(raw: dict, key: str, default: bool, where: str) -> bool:
@@ -266,13 +298,17 @@ def _flag(raw: dict, key: str, default: bool, where: str) -> bool:
 
 def _length_unit(request: dict) -> str:
     """`units.length` as every engine reads it: `units` or `units.length` absent or
-    null is millimetres; `units` that is not an object, or a length unit the engines do not
-    know, is refused naming the field rather than failing inside the arithmetic."""
+    null is millimetres; `units` that is not an object, a key other than `length` (,
+    the first in code-point order), or a length unit the engines do not know, is refused
+    naming the field rather than failing inside the arithmetic."""
     units = request.get("units")
     if units is None:
         return "mm"
     if not isinstance(units, dict):
         raise MalformedResult("units must be an object")
+    unknown = sorted(set(units) - {"length"})
+    if unknown:
+        raise MalformedResult(f"units.{unknown[0]} is not a known field")
     length = units.get("length")
     if length is None:
         return "mm"
@@ -282,6 +318,19 @@ def _length_unit(request: dict) -> str:
     return REQUEST_LENGTH_UNITS[key.lower()]
 
 
+def _allowed_rotations(raw: dict, keep_upright: bool) -> tuple[str, ...]:
+    """The codes an item may be placed in: its list, or the six legacy codes, narrowed to the
+    upright ones under `keep_upright`. A signed code counts only on a hull -- the engines refuse
+    it anywhere else -- so a box placed in one reads as a forbidden rotation (1.10)."""
+    listed = raw.get("allowed_rotations")
+    rotations = BOX_ROTATIONS if listed is None else tuple(listed)
+    if raw.get("shape_type") != "convex_hull":
+        rotations = tuple(code for code in rotations if code in BOX_ROTATIONS)
+    if keep_upright:
+        rotations = tuple(code for code in rotations if code in UPRIGHT_ROTATIONS)
+    return rotations
+
+
 def _parse_items(request: dict, unit: str) -> dict[str, ItemSpec]:
     items = {}
     for index, raw in enumerate(request["items"]):
@@ -289,15 +338,15 @@ def _parse_items(request: dict, unit: str) -> dict[str, ItemSpec]:
         keep_upright = _flag(raw, "keep_upright", False, where)
         stackable = _flag(raw, "stackable", True, where)
         must_be_on_floor = _flag(raw, "must_be_on_floor", False, where)
-        rotations = raw.get("allowed_rotations")
-        if rotations is None:
-            rotations = UPRIGHT_ROTATIONS if keep_upright else tuple(ROTATIONS)
+        rotations = _allowed_rotations(raw, keep_upright)
+        if not rotations:
+            raise MalformedResult(f"{where}.allowed_rotations must allow at least one rotation after keep_upright")
         items[raw["id"]] = ItemSpec(
             id=raw["id"],
             dimensions=dimensions_to_ticks(raw["dimensions"], unit),
             weight=to_ticks(raw.get("weight", 0), "g", WEIGHT_TICKS),
             quantity=raw.get("quantity", 1),
-            allowed_rotations=tuple(rotations),
+            allowed_rotations=rotations,
             stackable=stackable,
             must_be_on_floor=must_be_on_floor,
             max_top_load=(
@@ -360,9 +409,11 @@ def _parse_containers(request: dict, unit: str) -> dict[str, ContainerSpec]:
             )
             for axle in raw_axles
         )
+        inner, deck = _frame_and_deck(dimensions_to_ticks(raw["inner_dimensions"], unit),
+                                      raw.get("pallet_overhang_limit"), unit)
         containers[raw["id"]] = ContainerSpec(
             id=raw["id"],
-            inner=dimensions_to_ticks(raw["inner_dimensions"], unit),
+            inner=inner,
             access_directions=tuple(
                 direction for direction in _EXIT_DIRECTIONS
                 if direction in set(raw.get("access_directions", ()))
@@ -390,11 +441,56 @@ def _parse_containers(request: dict, unit: str) -> dict[str, ContainerSpec]:
             ),
             rate_table=raw.get("rate_table"),
             flat_bag=raw.get("deformable_boundary") is not None,
+            side_gusset=_side_gusset(raw.get("deformable_boundary"), unit),
             reports_achieved_extent=(raw.get("deformable_boundary") is not None
-                                     or raw.get("made_to_measure") is not None),
+                                     or raw.get("made_to_measure") is not None
+                                     or deck is not None),
             made_to_measure=_parse_machine(raw.get("made_to_measure"), unit),
+            deck=deck,
         )
     return containers
+
+
+def _side_gusset(boundary: dict | None, unit: str) -> int:
+    """A gusseted bag's side gusset depth in ticks, else 0."""
+    if boundary is None or boundary.get("side_gusset_depth") is None:
+        return 0
+    return to_ticks(boundary["side_gusset_depth"], unit, LENGTH_TICKS)
+
+
+def _frame_and_deck(declared: tuple[int, int, int], limit: dict | None,
+                    unit: str) -> tuple[tuple[int, int, int], tuple[int, int, int, int] | None]:
+    """A pallet's solving frame and the deck inside it, else the declared size."""
+    if limit is None:
+        return declared, None
+    overhang_x = to_ticks(limit["length"], unit, LENGTH_TICKS)
+    overhang_y = to_ticks(limit["width"], unit, LENGTH_TICKS)
+    frame = (declared[0] + 2 * overhang_x, declared[1] + 2 * overhang_y, declared[2])
+    return frame, (overhang_x, overhang_y, declared[0], declared[1])
+
+
+def _pallet_footprint(packed: dict, deck: tuple[int, int, int, int],
+                      clearance: int) -> tuple[int, int]:
+    """The deck grown by the overhang the placements use past each of its edges."""
+    x, y, length, width = deck
+    envelopes = [_envelope(placement, clearance) for placement in packed["placements"]]
+    low_x = min([x, *(box.x for box in envelopes)])
+    low_y = min([y, *(box.y for box in envelopes)])
+    high_x = max([x + length, *(box.x2 for box in envelopes)])
+    high_y = max([y + width, *(box.y2 for box in envelopes)])
+    return high_x - low_x, high_y - low_y
+
+
+def _billed_size(packed: dict, spec: ContainerSpec, clearance: int) -> tuple[int, int, int]:
+    """What a carrier measures: a bag's package; a pallet's declared footprint or
+    its grown deck, the larger per axis; else the declared outer, else inner size."""
+    if spec.flat_bag:
+        return _achieved_extent(packed, clearance)
+    if spec.deck is None:
+        return spec.outer if spec.outer is not None else spec.inner
+    length, width = _pallet_footprint(packed, spec.deck, clearance)
+    base = spec.outer if spec.outer is not None else (spec.deck[2], spec.deck[3], spec.inner[2])
+    return max(base[0], length), max(base[1], width), base[2]
 
 
 def _parse_machine(raw: dict | None, unit: str) -> MachineSpec | None:
@@ -599,6 +695,16 @@ def _check_structure(result: dict, issues: list[Issue]) -> None:
                             f"complete={result['complete']} with {unpacked} unpacked"))
 
 
+def _check_currency(request: dict, result: dict, issues: list[Issue]) -> None:
+    """The result echoes the request's currency, and states none the request did not declare.
+
+    A null is the field left out, on either side. O(1)."""
+    requested = request.get("currency")
+    reported = result.get("currency")
+    if reported != requested:
+        issues.append(Issue("currency_mismatch", f"reported {reported!r}, requested {requested!r}"))
+
+
 def _resolve_container_tag_rules(request: dict) -> tuple[dict, ...]:
     """Participating `require_container_tag` rules, resolved from the request alone.
 
@@ -693,7 +799,7 @@ def _fits_empty(container: ContainerSpec, size: tuple[int, int, int]) -> bool:
     if any(size[index] > container.inner[index] for index in range(3)):
         return False
     return not container.flat_bag or (size[0] + size[2] <= container.inner[0]
-                                      and size[1] + size[2] <= container.inner[1])
+                                      and size[1] + size[2] <= container.inner[1] + container.side_gusset)
 
 
 def _achieved_extent(packed: dict, clearance: int) -> tuple[int, int, int]:
@@ -715,15 +821,18 @@ def _check_achieved_extent(packed: dict, spec: ContainerSpec, clearance: int,
                                 f"{packed['id']}: reported for a container of fixed size"))
         return
     a, b, c = _achieved_extent(packed, clearance)
+    if spec.deck is not None:
+        a, b = _pallet_footprint(packed, spec.deck, clearance)
     stated = None if not isinstance(reported, dict) else tuple(
         reported.get(side, {}).get("ticks") for side in ("length", "width", "height"))
     if stated != (a, b, c):
         issues.append(Issue("achieved_dimensions_mismatch",
                             f"{packed['id']}: reported {stated}, computed {(a, b, c)}"))
-    if spec.flat_bag and (a + c > spec.inner[0] or b + c > spec.inner[1]):
+    if spec.flat_bag and (a + c > spec.inner[0] or b + c > spec.inner[1] + spec.side_gusset):
         issues.append(Issue("bag_girth_exceeded",
                             f"{packed['id']}: a + c = {a + c}, b + c = {b + c}, "
-                            f"flat size {spec.inner[0]} x {spec.inner[1]}"))
+                            f"flat size {spec.inner[0]} x {spec.inner[1]}"
+                            + (f", side gusset {spec.side_gusset}" if spec.side_gusset else "")))
 
 
 def _fabricated_side(achieved: int, minimum: int, increment: int) -> int:
@@ -743,6 +852,30 @@ def _reported_ticks(value: Any, keys: tuple[str, ...]) -> tuple[int, ...] | None
     if not isinstance(value, dict):
         return None
     return tuple((value.get(key) or {}).get("ticks") for key in keys)
+
+
+def _reserve_cut(packed: dict, spec: ContainerSpec, machine: MachineSpec,
+                 tight: tuple[int, int, int], reported: tuple | None) -> bool:
+    """Whether a reported box larger than the tight cut is a reserve cut: the tight
+    box breaks the void-fill reserve, and the reported one is on the machine grid between the
+    tight box and the maximum. That it keeps the reserve is the ordinary reserve check's.
+    Reads the reported used volume, which `used_volume_mismatch` holds to the placements."""
+    if spec.void_fill_reserve_ratio == 0 or reported is None:
+        return False
+    if not all(isinstance(side, int) and not isinstance(side, bool) for side in reported):
+        return False
+    on_grid = all(
+        tight[axis] <= reported[axis] <= spec.inner[axis]
+        and (reported[axis] - machine.minimum[axis]) % machine.increment[axis] == 0
+        for axis in range(3)
+    )
+    used = packed.get("used_volume_ticks3")
+    if not on_grid or not isinstance(used, str) or not used.isdigit():
+        return False
+    volume = tight[0] * tight[1] * tight[2]
+    scaled = _ratio_ppm(spec.void_fill_reserve_ratio)
+    reserved = (volume // SCORE_SCALE) * scaled + ((volume % SCORE_SCALE) * scaled) // SCORE_SCALE
+    return int(used) > volume - reserved
 
 
 def _check_made_to_measure(packed: dict, compact: bool, spec: ContainerSpec,
@@ -775,6 +908,8 @@ def _check_made_to_measure(packed: dict, compact: bool, spec: ContainerSpec,
         issues.append(Issue("fabricated_dimensions_exceed_machine",
                             f"{container_id}: {fabricated} beyond {spec.inner}"))
     reported_inner = _reported_ticks(packed.get("inner_dimensions"), sides)
+    if reported_inner != fabricated and _reserve_cut(packed, spec, machine, fabricated, reported_inner):
+        fabricated = reported_inner
     if reported_inner != fabricated:
         issues.append(Issue("fabricated_dimensions_mismatch",
                             f"{container_id}: reported {reported_inner}, computed {fabricated}"))
@@ -863,7 +998,7 @@ def _check_reason_proof(
             _fits_empty(container, tuple(spec.dimensions[axis] + 2 * clearance
                                          for axis in ROTATIONS[rotation]))
             for container in containers.values()
-            for rotation in ROTATIONS
+            for rotation in BOX_ROTATIONS
         )
         if fits_any_rotation:
             issues.append(Issue(
@@ -887,7 +1022,7 @@ def _check_reason_proof(
             _fits_empty(container, tuple(spec.dimensions[axis] + 2 * clearance
                                          for axis in ROTATIONS[rotation]))
             for container in containers.values()
-            for rotation in ROTATIONS
+            for rotation in BOX_ROTATIONS
         )
         if not fits_any_rotation:
             issues.append(Issue(
@@ -968,21 +1103,17 @@ def _check_reason_proof(
 def _rotate_hull(
     vertices: tuple[tuple[int, int, int], ...], orientation: str
 ) -> tuple[tuple[int, int, int], ...]:
-    """Reorient a hull the way `ROTATIONS` reorients its box, without ever mirroring it.
+    """Reorient a hull by one of the 24 proper rotations, without ever mirroring it.
 
-    Three of the six orientations are odd permutations of the coordinate axes. A bare
-    permutation would hand back the item's mirror image -- invisible on a cuboid, wrong on a
-    hull -- so the sign of one axis flips when the permutation is odd and every orientation
-    stays a proper rotation. The result is translated so the rotated hull's bounding box
+    `v'[i] = s[i] * v[src[i]]` from `ROTATION_TABLE`, where every code has determinant +1:
+    a bare permutation would hand back the item's mirror image for an odd one -- invisible on
+    a cuboid, wrong on a hull. The result is translated so the rotated hull's bounding box
     starts at the origin, which is the frame a placement position is expressed in.
     """
     axes = ROTATIONS[orientation]
-    inversions = sum(
-        1 for first in range(3) for second in range(first + 1, 3) if axes[first] > axes[second]
-    )
-    sign = -1 if inversions % 2 else 1
+    signs = ROTATION_SIGNS[orientation]
     turned = [
-        (sign * vertex[axes[0]], vertex[axes[1]], vertex[axes[2]]) for vertex in vertices
+        tuple(signs[axis] * vertex[axes[axis]] for axis in range(3)) for vertex in vertices
     ]
     low = tuple(min(vertex[axis] for vertex in turned) for axis in range(3))
     return tuple(
@@ -1008,7 +1139,7 @@ def _placed_hull(
     reported placement rather than trusted from the engine.
     """
     if (spec is None or spec.shape_type != "convex_hull" or spec.hull_vertices is None
-            or spec.stop_index is not None
+            or spec.stop_index is not None or placement["orientation"] not in ROTATIONS
             or (envelope.length, envelope.width, envelope.height)
             != tuple(spec.dimensions[axis] for axis in ROTATIONS[placement["orientation"]])):
         return _box_vertices(envelope)
@@ -1089,8 +1220,9 @@ def _occupied_volume(
         return length * width * _compressed_height(height, length * width, spec, load)
     if spec is not None and spec.shape_type == "convex_hull" and spec.hull_vertices is not None:
         # Collision intentionally uses the box for routes and clearance. Volume is a property
-        # of the physical hull and must not inherit that conservative collision fallback.
-        return _hull_volume(_rotate_hull(spec.hull_vertices, placement["orientation"]))
+        # of the physical hull and must not inherit that conservative collision fallback. A
+        # proper rotation keeps it, so the authored vertices answer for every orientation.
+        return _hull_volume(spec.hull_vertices)
     solid = _placed_hull(envelope, placement, spec)
     if len(solid) == 8 and solid == _box_vertices(envelope):
         return (placement["dimensions"]["length"]["ticks"]
@@ -1283,6 +1415,8 @@ def _check_container(
     _check_support_and_load(
         packed, envelopes, supporters, direct_above, global_support, issues
     )
+    if spec.deck is not None:
+        _check_deck_support(envelopes, spec.deck, global_support, issues)
     loads = _propagate_load(envelopes, supporters)
     _check_stack_top_load(envelopes, loads, issues)
     _check_stack_density(packed, envelopes, loads, spec.max_stack_density, issues)
@@ -1557,6 +1691,34 @@ def _centroid_supported(envelope: Box, surfaces: Sequence[Box]) -> bool:
         _hull_cross(hull[index], hull[(index + 1) % len(hull)], centroid) >= 0
         for index in range(len(hull))
     )
+
+
+def _check_deck_support(
+    envelopes: dict[str, tuple[Box, dict, ItemSpec | None]],
+    deck: tuple[int, int, int, int],
+    global_support: Fraction,
+    issues: list[Issue],
+) -> None:
+    """A floor placement on a pallet rests on its overlap with the deck alone,
+    judged by the ratio and centre-of-gravity rule a supporting item would be."""
+    x, y, length, width = deck
+    surface = Box(x, y, -1, length, width, 1)
+    for item_id, (envelope, _, spec) in envelopes.items():
+        if spec is None or envelope.z != 0:
+            continue
+        required = max(global_support, spec.minimum_support_ratio)
+        if required <= 0:
+            continue
+        dx = min(envelope.x2, x + length) - max(envelope.x, x)
+        dy = min(envelope.y2, y + width) - max(envelope.y, y)
+        area = dx * dy if dx > 0 and dy > 0 else 0
+        if area < _required_support_area(envelope.base_area, _ratio_ppm(required)):
+            ratio = Fraction(area, envelope.base_area)
+            issues.append(Issue("insufficient_support",
+                                f"{item_id}: {float(ratio):.6f} < {float(required):.6f} on the deck"))
+        elif area * 2 <= envelope.base_area and not _centroid_supported(envelope, [surface]):
+            issues.append(Issue("centre_of_gravity_unsupported",
+                                f"{item_id}: centroid outside the deck"))
 
 
 def _check_support_and_load(
@@ -1913,6 +2075,7 @@ def validate(request: dict, result: dict) -> list[Issue]:
         coordinates_required, result, items, containers, clearance, issues
     )
     _check_structure(validated_result, issues)
+    _check_currency(request, validated_result, issues)
     _check_algorithm_metrics(validated_result, issues)
     _check_effort_budget(request, validated_result, issues)
     _check_result_facts(validated_result, issues)
@@ -1959,6 +2122,7 @@ def validate(request: dict, result: dict) -> list[Issue]:
                             f"{opened} containers opened, limit {max_containers}"))
 
     _check_fixed_placements(request, validated_result, unit, issues)
+    _check_placement_ids(result, issues)
     _check_groups(request, validated_result, issues)
     _check_solver_selection(request, validated_result, issues)
     score = _check_objective(request, validated_result, containers, items, clearance, issues,
@@ -2009,6 +2173,52 @@ def _check_fixed_placements(request: dict, result: dict, unit: str, issues: list
             issues.append(Issue("fixed_placement_moved", f"{key[1]} fixed in {container_id} at {key[2:5]} {key[5]}"))
     for key in sorted(reported - requested):
         issues.append(Issue("unexpected_fixed_placement", f"{key[1]} in {key[0]} at {key[2:5]} {key[5]}"))
+
+
+#: How a placement id spells a string's characters: RFC 8785's escapes, and a lone UTF-16
+#: surrogate as its lowercase escape, as ECMAScript's `JSON.stringify` writes it.
+_ID_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def _id_string(text: str) -> str:
+    return '"' + "".join(
+        _ID_ESCAPES.get(character)
+        or (f"\\u{ord(character):04x}" if ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF
+            else character)
+        for character in text
+    ) + '"'
+
+
+def _expected_placement_id(container_id: Any, placement: dict) -> str:
+    """The canonical JSON text of `[container id, x, y, z, item type, orientation]` (1.10),
+    written here rather than imported so the validator shares no code with the engine."""
+    position = placement["position"]
+    ticks = [str(position[axis]["ticks"]) for axis in "xyz"]
+    names = [_id_string(str(value)) for value in (container_id, placement["item_type"], placement["orientation"])]
+    return "[" + ",".join([names[0], *ticks, names[1], names[2]]) + "]"
+
+
+def _check_placement_ids(result: dict, issues: list[Issue]) -> None:
+    """Every reported placement carries its `placement_id`, the canonical JSON of
+    `[container id, x, y, z, item type, orientation]` with the position in ticks (1.10), and no
+    two carry the same one. Read from the result as reported: a lattice summary has no
+    placement objects, so it has no ids to check. O(placements).
+    """
+    seen: set[str] = set()
+    for container in result["containers"]:
+        container_id = container.get("id", "")
+        for placement in container["placements"]:
+            expected = _expected_placement_id(container_id, placement)
+            reported = placement.get("placement_id")
+            where = f"{placement['item_id']} in {container_id}"
+            if not isinstance(reported, str):
+                issues.append(Issue("placement_id_mismatch", f"{where}: no placement_id, expected {expected}"))
+                continue
+            if reported != expected:
+                issues.append(Issue("placement_id_mismatch", f"{where}: reported {reported}, expected {expected}"))
+            if reported in seen:
+                issues.append(Issue("duplicate_placement_id", reported))
+            seen.add(reported)
 
 
 def _check_algorithm_metrics(result: dict, issues: list[Issue]) -> None:
@@ -2337,8 +2547,7 @@ def objective(
         if name in ("shipping_cost", "lowest_landed_cost") and dimensional_weight_divisor is not None:
             gross = int(packed.get("gross_weight", {}).get("ticks", 0))
             # A flat bag is billed on the package it conformed to.
-            billed_size = (_achieved_extent(packed, clearance) if spec.flat_bag
-                           else spec.outer if spec.outer is not None else spec.inner)
+            billed_size = _billed_size(packed, spec, clearance)
             dimensional = _dimensional_weight_ticks(
                 billed_size, dimensional_weight_divisor,
                 dimensional_weight_length_unit, dimensional_weight_weight_unit,
@@ -2493,10 +2702,14 @@ def _check_groups(request: dict, result: dict, issues: list[Issue]) -> None:
 # ------------------------------------------------------------- optimality bound
 
 #: Where each covered objective reads `(L0, L1, L2, L3, L4)` in its own score order
-#: (docs/OPTIMALITY-CERTIFICATES.md, "Per-objective vectors"). Any other objective has no bound.
-BOUND_ORDERS: dict[str, tuple[int, ...]] = {
+#: (docs/OPTIMALITY-CERTIFICATES.md, "Per-objective vectors"), a name standing for the one key
+#: only that objective ranks by. Any other objective has no bound.
+BOUND_ORDERS: dict[str, tuple[int | str, ...]] = {
     "default": (0, 1, 2, 3, 4),
     "lowest_cost": (0, 2, 1, 3, 4),
+    "maximum_value": (0, "value_forgone", 1, 2, 3),
+    "open_dimension_height": (0, "achieved_height", 1, 2, 3),
+    "maximum_volume": ("unpacked_volume_ppm", 0, 1, 2, 3),
 }
 
 #: The one refusal predicate's two ceilings.
@@ -2725,10 +2938,38 @@ def _stated_bound(request: dict, status: Any, items: dict[str, ItemSpec],
         return None, "status is 'infeasible'"
     if status == "invalid_result":
         return None, "status is 'invalid_result'"
-    bound = lower_bound(*_bound_inputs(items, containers))
+    volumes, weights, shrinks, bound_containers = _bound_inputs(items, containers)
+    bound = lower_bound(volumes, weights, shrinks, bound_containers)
     if bound is None:
         return None, "the request is past a declared ceiling"
-    return tuple(bound[position] for position in order), ""
+    stated = tuple(bound[position] if isinstance(position, int)
+                   else _objective_term(position, items, volumes, shrinks, bound_containers, bound[0])
+                   for position in order)
+    if any(value > MAX_BOUND_VALUE for value in stated):
+        return None, f"the {objective_name} key is past the portable ceiling"
+    return stated, ""
+
+
+def _objective_term(name: str, items: dict[str, ItemSpec], volumes: Runs, shrinks: bool,
+                    containers: Sequence[BoundContainer], unpacked: int) -> int:
+    """The key only one objective ranks by, each conditional on `L0` like the five:
+    the least value forgone and the least summed top of a packing leaving `unpacked` behind,
+    and the least unpacked share of requested volume any packing scores. O(t + c)."""
+    if name == "value_forgone":
+        return _smallest(_runs([(spec.value or 0, spec.quantity) for spec in items.values()]),
+                         unpacked)
+    if shrinks:
+        return 0
+    if name == "achieved_height":
+        placed = _run_count(volumes) - unpacked
+        floors = [container.base_area for container in containers if container.base_area > 0]
+        return _ceil_div(_smallest(volumes, placed), max(floors)) if placed > 0 and floors else 0
+    requested = sum(value * count for value, count in volumes)
+    capacity = _capacity_total([container.usable for container in containers],
+                               [container.quantity for container in containers])
+    if requested == 0 or capacity is None:
+        return 0
+    return _ceil_div(max(0, requested - capacity) * SCORE_SCALE, requested)
 
 
 def _departure(score: Sequence[int], bound: Sequence[int]) -> tuple[int, int] | None:

@@ -135,12 +135,14 @@ except ValueError as refusal:
 
 # And a field the schema reserves but this engine has not implemented yet is refused
 # by name, so a request written for a newer engine fails loudly instead of being
-# half-honoured. The list is the engine's own constant.
+# half-honoured. The list is the engine's own constant, empty while it is caught up; a
+# combination of implemented fields that has no defined meaning is refused the same way.
 print("fields this engine refuses by name:",
       {scope: fields for scope, fields in UNSUPPORTED_FIELDS.items() if fields} or "none")
 
 ahead = json.loads(json.dumps(request))
 ahead["containers"][0]["pallet_overhang_limit"] = {"length": "50", "width": "50"}
+ahead["containers"][0]["axles"] = [{"position": "0"}, {"position": "100"}]
 try:
     pack_from_dict(ahead)
 except UnsupportedFeatureError as refusal:

@@ -17,15 +17,16 @@ import pytest
 
 from packvium import (AxisAlignedBox, Container, Dimensions, EffortBudget, ExtensionRegistry, FixedPlacement,
                       Item, Length, Packer, PackingConfig, PackingStatus, Placement, Point, Rotation,
-                      use_trace)
+                      pack_from_dict, use_trace, validate)
 from packvium.geometry import ShapeType
 from packvium.solvers import (ContainerState, Deadline, DefaultContainerSelector, DeterministicRandom,
                               ExtremePointSolver, GridSolver, HomogeneousBlockSolver, LayerSolver,
                               PortfolioRun, RawSolution, SearchStats, SingleContainerSolution,
                               SolverOrchestrator, Space, TimeLimitReached, _ContainerPlan,
-                              _nesting_points, _run_concurrent_start, _subtract, beam_pack,
-                              default_constraints, find_candidates)
+                              _nesting_points, _run_concurrent_start, beam_pack,
+                              default_constraints, find_candidates, subtract_all)
 from packvium import bounds
+from packvium.units import Weight
 from support import assert_sound, container, item
 
 GENEROUS_MS = 60_000
@@ -509,7 +510,7 @@ def test_the_candidate_beam_skips_the_volume_bound_while_nesting_items_are_still
 def test_carving_a_box_that_misses_the_space_leaves_the_space_whole():
     space = Space(Point(0, 0, 0), Dimensions.mm(10, 10, 10))
     far = AxisAlignedBox(Point(Length.mm(20).ticks, 0, 0), Dimensions.mm(10, 10, 10))
-    assert _subtract(space, far) == [space]
+    assert subtract_all([space], [far]) == [space]
 
 
 def test_a_draw_in_the_biased_tail_is_redrawn_rather_than_folded():
@@ -563,3 +564,91 @@ def test_the_block_solver_leaves_a_request_that_asks_for_support_to_the_per_item
                       minimum_support_ratio=1.0)
     assert solution.state.placements
     assert {_resting_share(solution.state.placements, p) for p in solution.state.placements} == {1.0}
+
+
+# ------------------------------------------------- rarely-walked solver branches
+
+
+def _cushion(id: str) -> Item:
+    """A 50 mm compressible cube, of the same lattice profile as `item(id, 50, 50, 50)`."""
+    return Item.create(id, Dimensions.mm(50, 50, 50), "1kg", shape_type=ShapeType.COMPRESSIBLE,
+                       compression_ratio_ppm=500_000, max_compression_pressure_kpa=100)
+
+
+def test_a_compressible_type_never_joins_a_rigid_lattice():
+    """Same size and weight once made one lattice profile, so a cushion joined a brick's
+    lattice and was stacked with no crush check: the packer returned an `invalid_result`
+    where a valid plan existed. The shape is part of the profile now."""
+    brick, cushion = item("brick", 50, 50, 50, weight="1kg"), _cushion("cushion")
+
+    assert not GridSolver().supports(items_of((brick, cushion)))
+    assert GridSolver().supports(items_of((brick, item("alias", 50, 50, 50, weight="1kg"))))
+
+
+def test_a_cushion_that_would_be_crushed_is_left_out_rather_than_stacked():
+    request = {
+        "units": {"length": "mm"},
+        "items": [
+            {"id": "rigid", "dimensions": {"length": "50", "width": "50", "height": "50"},
+             "weight": {"value": "1", "unit": "kg"}},
+            {"id": "soft", "quantity": 2, "dimensions": {"length": "50", "width": "50", "height": "50"},
+             "weight": {"value": "1", "unit": "kg"}, "shape_type": "compressible",
+             "compression_ratio": 0.5, "max_compression_pressure_kpa": 1},
+        ],
+        "containers": [{"id": "c", "inner_dimensions": {"length": "50", "width": "50", "height": "150"}}],
+        "configuration": {"max_containers": 1, "time_limit_ms": 60000, "effort_budget": {
+            "max_candidates_evaluated": 1000000, "max_placement_attempts": 1000000,
+            "max_search_nodes": 1000000}},
+    }
+
+    result = pack_from_dict(request)
+
+    assert result["status"] == "best_found"
+    assert [u["item_type"] for u in result["unpacked_items"]] == ["soft"]
+    assert validate(request, result) == []
+
+
+def test_a_wider_candidate_list_on_a_one_plan_beam_ranks_its_children():
+    """`max_candidates_per_item` keeps several children of the single plan a width-one beam
+    holds, ordered by the node key, and that is what recovers the third item here: the
+    greedy first corner for the first item leaves no room for the last one."""
+    instances = items_of([item("i0", 6, 3, 5), item("i1", 4, 6, 4), item("i2", 5, 4, 5)])
+    box = container("c", 8, 9, 6)
+
+    def solve(candidates: int) -> SingleContainerSolution:
+        config = PackingConfig.balanced(max_candidates_per_item=candidates)
+        assert config.container_plan_beam_width == 1
+        return ExtremePointSolver().pack_one(box, 1, instances, config, SearchStats(), generous())
+
+    assert [one.id for one in solve(1).unpacked] == ["i2#1"]
+    wide = solve(3)
+    assert wide.unpacked == ()
+    layout = [(p.instance.id, p.position) for p in wide.state.placements]
+    assert layout == [(p.instance.id, p.position) for p in solve(3).state.placements]
+
+
+def test_an_item_no_single_container_admits_on_every_count_keeps_no_feasible_placement():
+    """One container is big enough but too weak, the other strong enough but too small. Each
+    structural count passes somewhere, so no proof applies, and no container limit explains
+    it either: the reason stays `no_feasible_placement` instead of blaming the inventory."""
+    heavy = item("heavy", 50, 50, 50, weight="5kg")
+    weak = container("weak", 100, 100, 100, max_payload=Weight.parse("1kg"))
+    tiny = container("tiny", 40, 40, 40)
+    result = Packer(counted()).pack([heavy], [weak, tiny])
+    assert [(u.instance.id, u.reason) for u in result.unpacked] == [("heavy#1", "no_feasible_placement")]
+
+
+def test_a_plan_beam_out_of_nodes_mid_round_keeps_its_best_complete_plan():
+    """Two plans of width two over two container types use the four-node floor after the
+    first plan's trials, so the second plan stops before its first trial. The incumbent
+    already holds every item, and a node limit is not reported as a time limit."""
+    instances = items_of([item("a", 50, 50, 50, quantity=3)])
+    containers = (container("small", 50, 50, 50, cost_minor=1),
+                  container("tall", 50, 50, 100, cost_minor=3))
+    config = PackingConfig.quality(time_limit_ms=GENEROUS_MS, container_plan_beam_width=2,
+                                   container_plan_node_limit=3)
+    packed, unpacked, proven, reached, _ = SolverOrchestrator()._across_containers(
+        ExtremePointSolver(), instances, containers, config, SearchStats(), generous())
+    assert sorted((one.container.id, len(one.placements)) for one in packed) == [("small", 1), ("tall", 2)]
+    assert unpacked == ()
+    assert (proven, reached) == (False, False)

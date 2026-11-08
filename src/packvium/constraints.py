@@ -8,6 +8,7 @@ from .contact import ContactEdge, ContactGraph
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
                        Point, Rotation, sweep_intersects, swept_volume)
 from .models import Container, Item, ItemInstance, Placement
+from .pallet_overhang import deck_contact_area
 from .support_polygon import contact_hull_points, convex_hull, doubled_centroid, point_in_hull
 from .compression import applied_pressure
 from .units import Length, Weight
@@ -749,7 +750,9 @@ class SupportConstraint:
         return rule not in (None, "free") or required > 0
 
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
-        if context.point.z == 0 or not self.applies_to(context.item):
+        if context.point.z == 0:
+            return self._on_floor(context)
+        if not self.applies_to(context.item):
             return ConstraintResult.allow()
         candidate = context.envelope_box
         support = direct_support_view(context.placements, context.item, candidate)
@@ -762,10 +765,24 @@ class SupportConstraint:
                 return ConstraintResult.reject("ground_contact_violation", f"single: rests on {len(supporters)} item(s)")
             if rule == "multiple" and len(supporters) < 2:
                 return ConstraintResult.reject("ground_contact_violation", f"multiple: rests on {len(supporters)} item(s)")
+        return self._ratio_and_centroid(context, candidate, supporters, support.supporting_area)
+
+    def _on_floor(self, context: ConstraintContext) -> ConstraintResult:
+        """A floor is whole support unless it is a pallet deck: then the deck is
+        the one supporter, judged by the same ratio and centre-of-gravity rule. The ground
+        contact rules name supporting items, and the floor is none, so they do not apply."""
+        deck = context.container.deck
+        if deck is None:
+            return ConstraintResult.allow()
+        candidate = context.envelope_box
+        return self._ratio_and_centroid(context, candidate, [deck.as_box()],
+                                        deck_contact_area(deck, candidate))
+
+    def _ratio_and_centroid(self, context: ConstraintContext, candidate: AxisAlignedBox,
+                            supporters: list[AxisAlignedBox], supporting_area: int) -> ConstraintResult:
         required = max(self.global_minimum, context.item.item.minimum_support_ratio)
         if required <= 0:
             return ConstraintResult.allow()
-        supporting_area = support.supporting_area
         base_area = context.envelope_dimensions.base_area
         if supporting_area < required_area(base_area, scaled_ratio(required)):
             return ConstraintResult.reject("insufficient_support", f"{supporting_area}/{base_area} < {required:.6f}")
@@ -804,13 +821,42 @@ class PlacedSupportBase:
     refers to it.
     """
 
-    __slots__ = ("_placements", "_base", "_base_units", "_hint")
+    __slots__ = (
+        "_placements",
+        "_base",
+        "_base_units",
+        "_hint",
+        "_base_loads",
+        "_base_stacked_counts",
+        "_base_has_max_top",
+        "_base_has_crush",
+        "_base_has_max_stacked",
+        "_base_bearing_holds",
+        "_base_density_checked",
+        "_base_density_holds",
+        "_base_stops",
+        "_base_routed",
+        "_base_max_stop_above",
+        "_base_route_holds",
+    )
 
     def __init__(self) -> None:
         self._placements: tuple[Placement, ...] | None = None
         self._base: LoadSupportGraph | None = None
         self._base_units: tuple[LoadUnit, ...] = ()
         self._hint = 1
+        self._base_loads: list[int] | None = None
+        self._base_stacked_counts: list[int] | None = None
+        self._base_has_max_top = False
+        self._base_has_crush = False
+        self._base_has_max_stacked = False
+        self._base_bearing_holds: bool | None = None
+        self._base_density_checked: int | None = None
+        self._base_density_holds: bool | None = None
+        self._base_stops: list[float] | None = None
+        self._base_routed = False
+        self._base_max_stop_above: list[float] | None = None
+        self._base_route_holds: bool | None = None
 
     def _base_for(self, placements: tuple[Placement, ...], footprint: int):
         """The support graph over `placements` alone, rebuilt only when it cannot serve.
@@ -823,23 +869,354 @@ class PlacedSupportBase:
         coarse, and a cell far larger than the boxes collapses the spatial hash back into
         the all-pairs scan it exists to avoid.
         """
-        if self._placements is placements and footprint <= self._hint:
+        same = type(placements) is tuple and self._placements is placements
+        if same and footprint <= self._hint:
             return self._base, self._base_units
-        hint = max(self._hint if self._placements is placements else 1, footprint)
-        units = load_units(placements)
+        hint = max(self._hint if same else 1, footprint)
+        units = self._base_units if same else load_units(placements)
         self._placements = placements
         self._hint = hint
         self._base_units = units
         self._base = LoadSupportGraph(units, cell_hint=hint)
+        if not same:
+            self._base_loads = None
+            self._base_stacked_counts = None
+            self._base_bearing_holds = None
+            self._base_density_checked = None
+            self._base_density_holds = None
+            self._base_stops = None
+            self._base_routed = False
+            self._base_max_stop_above = None
+            self._base_route_holds = None
         return self._base, units
 
-    def with_candidate(self, placements: tuple[Placement, ...],
-                       unit: LoadUnit) -> tuple[tuple[LoadUnit, ...], LoadSupportGraph]:
-        """`placements`' units and graph with `unit` appended at the last index."""
-        box = unit.box
+    def _settle_bearing(self, density_limit: int | None) -> bool:
+        """Settle base loads, stacked counts and base validity once per placement state."""
+        assert self._base is not None
+        base_units = self._base_units
+        if self._base_bearing_holds is None:
+            self._base_has_max_top = any(u.max_top_load_ticks is not None for u in base_units)
+            self._base_has_crush = any(u.max_compression_pressure_kpa is not None for u in base_units)
+            self._base_has_max_stacked = any(u.max_stacked_items is not None for u in base_units)
+            loads = top_loads(base_units, self._base)
+            self._base_loads = loads
+            holds = True
+            if self._base_has_max_top:
+                for u, load in zip(base_units, loads):
+                    if u.max_top_load_ticks is not None and load > u.max_top_load_ticks:
+                        holds = False
+                        break
+            if holds and self._base_has_crush:
+                for u, load in zip(base_units, loads):
+                    limit = u.max_compression_pressure_kpa
+                    if limit is None:
+                        continue
+                    fp = u.footprint_ticks2 if u.footprint_ticks2 is not None else (u.box.x2 - u.box.origin.x) * (u.box.y2 - u.box.origin.y)
+                    if applied_pressure(Weight(load), fp).exceeds_kpa(limit):
+                        holds = False
+                        break
+            if self._base_has_max_stacked:
+                counts = stacked_counts(base_units, self._base)
+                self._base_stacked_counts = counts
+                if holds:
+                    for u, count in zip(base_units, counts):
+                        if u.max_stacked_items is not None and count > u.max_stacked_items:
+                            holds = False
+                            break
+            self._base_bearing_holds = holds
+        if not self._base_bearing_holds:
+            return False
+        if density_limit is None:
+            return True
+        if self._base_density_checked != density_limit or self._base_density_holds is None:
+            assert self._base_loads is not None
+            self._base_density_checked = density_limit
+            self._base_density_holds = all(
+                (u.weight_ticks + load) * SQUARE_METRE_TICKS <= density_limit * u.box.dimensions.base_area
+                for u, load in zip(base_units, self._base_loads)
+            )
+        return self._base_density_holds
+
+    def evaluate_top_load(self, context: ConstraintContext) -> ConstraintResult:
+        """Evaluate bearing and stacking limits against the settled base without cloning the graph."""
+        candidate = context.envelope_box
+        item = context.item.item
+        footprint = max(candidate.x2 - candidate.origin.x, candidate.y2 - candidate.origin.y)
+        base, base_units = self._base_for(context.placements, footprint)
+        density_limit = None if context.container.max_stack_density is None else context.container.max_stack_density.ticks
+        if not base._nested and item.nesting_height is None and self._settle_bearing(density_limit):
+            below = base._face.contacts_below(candidate)
+            above = base._face.contacts_above(candidate)
+            upper_group = item.stacking_group
+            placements = context.placements
+            for edge in below:
+                lower = placements[edge.index].instance.item
+                code = stacking_refusal(lower, upper_group)
+                if code is not None:
+                    return ConstraintResult.reject(code, lower.id)
+            if not item.stackable or item.accepts_stacking_groups:
+                for edge in above:
+                    code = stacking_refusal(item, placements[edge.index].instance.item.stacking_group)
+                    if code is not None:
+                        return ConstraintResult.reject(code, item.id)
+            has_max_top = self._base_has_max_top or item.max_top_load is not None
+            has_crush = self._base_has_crush or item.max_compression_pressure_kpa is not None
+            has_max_stacked = self._base_has_max_stacked or item.max_stacked_items is not None
+            if not (has_max_top or has_crush or has_max_stacked or density_limit is not None):
+                return ConstraintResult.allow()
+            if not below and not above:
+                if density_limit is not None and context.item.weight.ticks * SQUARE_METRE_TICKS > density_limit * candidate.dimensions.base_area:
+                    return ConstraintResult.reject("stack_density_exceeded", context.item.id)
+                return ConstraintResult.allow()
+            if not above:
+                base_supporters = base._face._supporters
+                base_loads = self._base_loads
+                assert base_loads is not None
+                # Fast path when every direct supporter rests on the floor (no further
+                # downward edges): `below` is already in ascending index order, so load
+                # shares and stacked counts can be checked in a single pass with zero
+                # set/dict/sort allocations.
+                if all(not base_supporters[edge.index] for edge in below):
+                    downward = context.item.weight.ticks
+                    total_area = sum(edge.area for edge in below)
+                    assigned = 0
+                    last_pos = len(below) - 1
+                    shares: list[int] = []
+                    for pos, edge in enumerate(below):
+                        if total_area > 0 and downward > 0:
+                            share = downward - assigned if pos == last_pos else downward * edge.area // total_area
+                            assigned += share
+                        else:
+                            share = 0
+                        shares.append(share)
+                    if self._base_has_max_top:
+                        for pos, edge in enumerate(below):
+                            u = edge.index
+                            limit_ticks = base_units[u].max_top_load_ticks
+                            if limit_ticks is not None and base_loads[u] + shares[pos] > limit_ticks:
+                                return ConstraintResult.reject("top_load_exceeded", base_units[u].label)
+                    if self._base_has_crush:
+                        for pos, edge in enumerate(below):
+                            unit_u = base_units[edge.index]
+                            limit_kpa = unit_u.max_compression_pressure_kpa
+                            if limit_kpa is None:
+                                continue
+                            fp = unit_u.footprint_ticks2 if unit_u.footprint_ticks2 is not None else (unit_u.box.x2 - unit_u.box.origin.x) * (unit_u.box.y2 - unit_u.box.origin.y)
+                            if applied_pressure(Weight(base_loads[edge.index] + shares[pos]), fp).exceeds_kpa(limit_kpa):
+                                return ConstraintResult.reject("crush_violation", unit_u.label)
+                    if self._base_has_max_stacked:
+                        assert self._base_stacked_counts is not None
+                        for edge in below:
+                            u = edge.index
+                            max_stacked = base_units[u].max_stacked_items
+                            if max_stacked is not None and self._base_stacked_counts[u] + 1 > max_stacked:
+                                return ConstraintResult.reject("stacked_item_limit_exceeded", base_units[u].label)
+                    if density_limit is not None:
+                        for pos, edge in enumerate(below):
+                            u = edge.index
+                            unit_u = base_units[u]
+                            if (unit_u.weight_ticks + base_loads[u] + shares[pos]) * SQUARE_METRE_TICKS > density_limit * unit_u.box.dimensions.base_area:
+                                return ConstraintResult.reject("stack_density_exceeded", unit_u.label)
+                        if downward * SQUARE_METRE_TICKS > density_limit * candidate.dimensions.base_area:
+                            return ConstraintResult.reject("stack_density_exceeded", context.item.id)
+                    return ConstraintResult.allow()
+
+                pending = [edge.index for edge in below]
+                seen_affected: set[int] = set(pending)
+                idx = 0
+                while idx < len(pending):
+                    u = pending[idx]
+                    idx += 1
+                    for edge in base_supporters[u]:
+                        if edge.index not in seen_affected:
+                            seen_affected.add(edge.index)
+                            pending.append(edge.index)
+                delta_loads: dict[int, int] = {}
+                if has_max_top or has_crush or density_limit is not None:
+                    downward = context.item.weight.ticks
+                    total_area = sum(edge.area for edge in below)
+                    if total_area > 0 and downward > 0:
+                        assigned = 0
+                        last_pos = len(below) - 1
+                        for pos, edge in enumerate(below):
+                            share = downward - assigned if pos == last_pos else downward * edge.area // total_area
+                            assigned += share
+                            delta_loads[edge.index] = delta_loads.get(edge.index, 0) + share
+                    order = sorted(
+                        seen_affected,
+                        key=lambda u: (-base_units[u].box.z2, -base_units[u].box.origin.z, u),
+                    )
+                    for u in order:
+                        d_load = delta_loads.get(u, 0)
+                        if d_load == 0:
+                            continue
+                        supports = base_supporters[u]
+                        if not supports:
+                            continue
+                        total_area = sum(edge.area for edge in supports)
+                        old_downward = base_units[u].weight_ticks + base_loads[u]
+                        new_downward = old_downward + d_load
+                        old_assigned = 0
+                        new_assigned = 0
+                        last_pos = len(supports) - 1
+                        for pos, edge in enumerate(supports):
+                            if pos == last_pos:
+                                old_share = old_downward - old_assigned
+                                new_share = new_downward - new_assigned
+                            else:
+                                old_share = old_downward * edge.area // total_area
+                                new_share = new_downward * edge.area // total_area
+                                old_assigned += old_share
+                                new_assigned += new_share
+                            diff = new_share - old_share
+                            if diff != 0:
+                                delta_loads[edge.index] = delta_loads.get(edge.index, 0) + diff
+                ascending = sorted(seen_affected)
+                if self._base_has_max_top:
+                    for u in ascending:
+                        limit_ticks = base_units[u].max_top_load_ticks
+                        if limit_ticks is not None and base_loads[u] + delta_loads.get(u, 0) > limit_ticks:
+                            return ConstraintResult.reject("top_load_exceeded", base_units[u].label)
+                if self._base_has_crush:
+                    for u in ascending:
+                        unit_u = base_units[u]
+                        limit_kpa = unit_u.max_compression_pressure_kpa
+                        if limit_kpa is None:
+                            continue
+                        fp = unit_u.footprint_ticks2 if unit_u.footprint_ticks2 is not None else (unit_u.box.x2 - unit_u.box.origin.x) * (unit_u.box.y2 - unit_u.box.origin.y)
+                        if applied_pressure(Weight(base_loads[u] + delta_loads.get(u, 0)), fp).exceeds_kpa(limit_kpa):
+                            return ConstraintResult.reject("crush_violation", unit_u.label)
+                if self._base_has_max_stacked:
+                    assert self._base_stacked_counts is not None
+                    for u in ascending:
+                        max_stacked = base_units[u].max_stacked_items
+                        if max_stacked is not None and self._base_stacked_counts[u] + 1 > max_stacked:
+                            return ConstraintResult.reject("stacked_item_limit_exceeded", base_units[u].label)
+                if density_limit is not None:
+                    for u in ascending:
+                        unit_u = base_units[u]
+                        if (unit_u.weight_ticks + base_loads[u] + delta_loads.get(u, 0)) * SQUARE_METRE_TICKS > density_limit * unit_u.box.dimensions.base_area:
+                            return ConstraintResult.reject("stack_density_exceeded", unit_u.label)
+                    if context.item.weight.ticks * SQUARE_METRE_TICKS > density_limit * candidate.dimensions.base_area:
+                        return ConstraintResult.reject("stack_density_exceeded", context.item.id)
+                return ConstraintResult.allow()
+
+        unit = LoadUnit(candidate, context.item.weight.ticks,
+                        None if item.max_top_load is None else item.max_top_load.ticks,
+                        item.max_stacked_items, context.item.id,
+                        None if item.nesting_height is None else item.id,
+                        None if item.nesting_height is None else item.nesting_height.ticks,
+                        item.compression_ratio_ppm, item.max_compression_pressure_kpa,
+                        context.dimensions.length.ticks * context.dimensions.width.ticks)
+        units, graph = base_units + (unit,), base.with_unit(unit, cell_hint=self._hint)
+        failure = non_stackable_failure(
+            context.placements, context.item, graph, len(units) - 1
+        )
+        if failure is not None:
+            return failure
+        failure = (
+            overloaded(units, graph)
+            or crushed(units, graph)
+            or stack_limit_exceeded(units, graph)
+            or stack_density_exceeded(units, density_limit, graph)
+        )
+        if failure is not None:
+            return ConstraintResult.reject(*failure)
+        return ConstraintResult.allow()
+
+    def _settle_route(self, placements: tuple[Placement, ...]) -> None:
+        assert self._base is not None
+        if self._base_stops is not None:
+            return
+        stops = [
+            RIDES_THE_WHOLE_ROUTE if p.instance.item.stop_index is None else float(p.instance.item.stop_index)
+            for p in placements
+        ]
+        self._base_stops = stops
+        self._base_routed = any(stop != RIDES_THE_WHOLE_ROUTE for stop in stops)
+        max_stop_above = [_NO_STOP_ABOVE] * len(stops)
+        if self._base_routed:
+            for index in self._base._descending_indices():
+                best = _NO_STOP_ABOVE
+                for child in self._base.children(index):
+                    child_stop = stops[child]
+                    if child_stop > best:
+                        best = child_stop
+                    child_above = max_stop_above[child]
+                    if child_above > best:
+                        best = child_above
+                max_stop_above[index] = best
+            self._base_route_holds = all(max_stop_above[i] <= stops[i] for i in range(len(stops)))
+        else:
+            self._base_route_holds = True
+        self._base_max_stop_above = max_stop_above
+
+    def evaluate_route_order(self, context: ConstraintContext) -> ConstraintResult:
+        """Evaluate route unloading order against the settled base without cloning the graph."""
+        box = context.envelope_box
         footprint = max(box.x2 - box.origin.x, box.y2 - box.origin.y)
-        base, base_units = self._base_for(placements, footprint)
-        return base_units + (unit,), base.with_unit(unit, cell_hint=self._hint)
+        base, base_units = self._base_for(context.placements, footprint)
+        self._settle_route(context.placements)
+        assert self._base_stops is not None and self._base_max_stop_above is not None
+        item_stop = context.item.item.stop_index
+        candidate_stop = RIDES_THE_WHOLE_ROUTE if item_stop is None else float(item_stop)
+        if not self._base_routed and candidate_stop == RIDES_THE_WHOLE_ROUTE:
+            return ConstraintResult.allow()
+        if not base._nested and context.item.item.nesting_height is None and self._base_route_holds:
+            below = base._face.contacts_below(box)
+            above = base._face.contacts_above(box)
+            if not below and not above:
+                return ConstraintResult.allow()
+            base_stops = self._base_stops
+            base_max_above = self._base_max_stop_above
+            violated = False
+            for edge in below:
+                if candidate_stop > base_stops[edge.index]:
+                    violated = True
+                    break
+            if not violated:
+                for edge in above:
+                    c = edge.index
+                    if base_stops[c] > candidate_stop or base_max_above[c] > candidate_stop:
+                        violated = True
+                        break
+            if not violated:
+                return ConstraintResult.allow()
+            if not above:
+                # Candidate has no children, so it is the sole new node above its
+                # supporter closure, and `base_route_holds` guarantees no existing
+                # node above any supporter violated that supporter's stop.
+                base_supporters = base._face._supporters
+                pending = [edge.index for edge in below]
+                seen: set[int] = set(pending)
+                idx = 0
+                offender: int | None = None
+                while idx < len(pending):
+                    u = pending[idx]
+                    idx += 1
+                    if base_stops[u] < candidate_stop and (offender is None or u < offender):
+                        offender = u
+                    for edge in base_supporters[u]:
+                        if edge.index not in seen:
+                            seen.add(edge.index)
+                            pending.append(edge.index)
+                assert offender is not None
+                return ConstraintResult.reject(
+                    "unloading_order_violation",
+                    f"{base_units[offender].label} blocked by {context.item.id}",
+                )
+
+        candidate = LoadUnit(
+            box, context.item.weight.ticks, None, None, context.item.id,
+            None if context.item.item.nesting_height is None else context.item.item.id,
+            None if context.item.item.nesting_height is None else context.item.item.nesting_height.ticks,
+        )
+        stops = [*self._base_stops, candidate_stop]
+        units, graph = base_units + (candidate,), base.with_unit(candidate, cell_hint=self._hint)
+        failure = route_order_violated(units, stops, graph)
+        if failure is not None:
+            return ConstraintResult.reject(*failure)
+        return ConstraintResult.allow()
 
 
 class TopLoadConstraint:
@@ -857,31 +1234,7 @@ class TopLoadConstraint:
 
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if not context.stack_sensitive: return ConstraintResult.allow()
-        candidate = context.envelope_box
-        item = context.item.item
-        unit = LoadUnit(candidate, context.item.weight.ticks,
-                        None if item.max_top_load is None else item.max_top_load.ticks,
-                        item.max_stacked_items, context.item.id,
-                        None if item.nesting_height is None else item.id,
-                        None if item.nesting_height is None else item.nesting_height.ticks,
-                        item.compression_ratio_ppm, item.max_compression_pressure_kpa,
-                        context.dimensions.length.ticks * context.dimensions.width.ticks)
-        units, graph = self._support.with_candidate(context.placements, unit)
-        failure = non_stackable_failure(
-            context.placements, context.item, graph, len(units) - 1
-        )
-        if failure is not None:
-            return failure
-        density_limit = None if context.container.max_stack_density is None else context.container.max_stack_density.ticks
-        failure = (
-            overloaded(units, graph)
-            or crushed(units, graph)
-            or stack_limit_exceeded(units, graph)
-            or stack_density_exceeded(units, density_limit, graph)
-        )
-        if failure is not None:
-            return ConstraintResult.reject(*failure)
-        return ConstraintResult.allow()
+        return self._support.evaluate_top_load(context)
 
 
 class RouteOrderConstraint:
@@ -901,22 +1254,7 @@ class RouteOrderConstraint:
 
     def evaluate(self, context: ConstraintContext) -> ConstraintResult:
         if not context.route_sensitive: return ConstraintResult.allow()
-        candidate = LoadUnit(
-            context.envelope_box, context.item.weight.ticks, None, None, context.item.id,
-            None if context.item.item.nesting_height is None else context.item.item.id,
-            None if context.item.item.nesting_height is None else context.item.item.nesting_height.ticks,
-        )
-        stops = [
-            RIDES_THE_WHOLE_ROUTE if p.instance.item.stop_index is None else float(p.instance.item.stop_index)
-            for p in context.placements
-        ]
-        item_stop = context.item.item.stop_index
-        stops.append(RIDES_THE_WHOLE_ROUTE if item_stop is None else float(item_stop))
-        units, graph = self._support.with_candidate(context.placements, candidate)
-        failure = route_order_violated(units, stops, graph)
-        if failure is not None:
-            return ConstraintResult.reject(*failure)
-        return ConstraintResult.allow()
+        return self._support.evaluate_route_order(context)
 
 
 def _stop_of(placement: Placement) -> int | float:

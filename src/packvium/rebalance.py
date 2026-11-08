@@ -12,6 +12,7 @@ from .models import (ItemInstance, PackedContainer, PackingRequest, Placement, U
                      UnratedWeightError)
 from .solvers import (ContainerState, Deadline, SearchStats, TimeLimitReached, default_constraints,
                       find_candidates)
+from .pallet_overhang import Deck, floor_support_ratio
 from .units import Weight
 from .validation import IndependentSolutionValidator
 
@@ -47,7 +48,7 @@ def _refresh_top_loads(placements: tuple[Placement, ...]) -> tuple[Placement, ..
 
 def _support_ratio(
     existing: tuple[Placement, ...], instance: ItemInstance, origin: Point,
-    envelope_dimensions: Dimensions,
+    envelope_dimensions: Dimensions, deck: Deck | None,
 ) -> float:
     """Fraction of the base resting on something already in the container.
 
@@ -56,9 +57,9 @@ def _support_ratio(
     depending on `solvers.py`'s private placement-time bookkeeping, only on the
     same public contact-area rule it uses.
     """
-    if origin.z == 0:
-        return 1.0
     box = AxisAlignedBox(origin, envelope_dimensions)
+    if origin.z == 0:
+        return floor_support_ratio(deck, box)
     return direct_support_view(existing, instance, box).supporting_area / envelope_dimensions.base_area
 
 
@@ -105,7 +106,8 @@ def _attempt_move(
     new_dest_placement = Placement(
         moving.instance, candidate.position, candidate.rotation, candidate.dimensions,
         candidate.point, candidate.envelope_dimensions,
-        _support_ratio(dest.placements, moving.instance, candidate.point, candidate.envelope_dimensions),
+        _support_ratio(dest.placements, moving.instance, candidate.point, candidate.envelope_dimensions,
+                       dest.container.deck),
     )
     new_source_placements = source.placements[:placement_index] + source.placements[placement_index + 1:]
     new_dest_placements = (*dest.placements, new_dest_placement)

@@ -33,7 +33,7 @@ FORMAT = "packvium-operational-artifact/v1"
 #: The suite version of this builder, the same string in all four engines of one release.
 #: The engine's own name is deliberately not recorded: four correct builders naming themselves
 #: would emit four different documents. `make version-set` rewrites this line.
-SUITE_VERSION = "1.9.0"
+SUITE_VERSION = "1.10.0"
 
 #: The deterministic part of `result.algorithm`. `duration_ms` is wall-clock time and never
 #: enters an artifact.
@@ -72,7 +72,7 @@ def build_operational_artifact(
         raise OperationalArtifactError("invalid_result", "a result is a JSON object")
     _require_objects(result)
     try:
-        plan = build_execution_plan(request, result, loading_orders=loading_orders)
+        plan = build_execution_plan(request, _without_placement_ids(result), loading_orders=loading_orders)
     except ExecutionPlanError as error:
         raise OperationalArtifactError("invalid_plan_input", str(error)) from error
 
@@ -165,6 +165,25 @@ def _replay(solver: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     if solver["time_limit_reached"]:
         return {"level": "not_guaranteed", "because": "provenance.solver.time_limit_reached"}
     return {"level": "exact", "because": None}
+
+
+def _without_placement_ids(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The result as the v1 artifact reads it: every placement without its 1.10 `placement_id`.
+
+    v1 is closed, and its embedded plan and placement references predate the id, so a plan
+    built from a 1.10 result would otherwise gain a field inside a closed document. The id is
+    recoverable from what v1 does carry: the canonical JSON of the result's
+    `containers[container_index].id` and the reference's `position_ticks`, `item_type` and
+    `orientation` (docs/OPERATIONAL-ARTIFACTS.md). Read after `_require_objects`, so
+    every entry is an object; copies only what it changes, O(P)."""
+    containers = _list(result.get("containers"), "result.containers")
+    return {**result, "containers": [
+        {**container, "placements": [
+            {key: value for key, value in placement.items() if key != "placement_id"}
+            for placement in _placements(index, container)
+        ]}
+        for index, container in enumerate(containers)
+    ]}
 
 
 # -------------------------------------------------------------------------------- geometry

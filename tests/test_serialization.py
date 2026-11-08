@@ -148,8 +148,10 @@ def test_a_normal_pack_reports_verifiable_per_start_termination():
 def test_a_placement_reports_everything_a_caller_needs_to_reproduce_it():
     result = pack_from_dict(request([cube("a", 50)], [box("c")]))
     placement, = result["containers"][0]["placements"]
-    assert set(placement) == {"item_id", "item_type", "position", "dimensions", "orientation",
-                              "support_ratio", "top_load"}
+    assert set(placement) == {"placement_id", "item_id", "item_type", "position", "dimensions",
+                              "orientation", "support_ratio", "top_load"}
+    assert json.loads(placement["placement_id"]) == [
+        "c#1", *(placement["position"][axis]["ticks"] for axis in "xyz"), "a", placement["orientation"]]
     assert placement["item_id"] == "a#1"
     assert placement["item_type"] == "a"
     assert placement["orientation"] in {"LWH", "LHW", "WLH", "WHL", "HLW", "HWL"}
