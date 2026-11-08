@@ -12,8 +12,8 @@ error is an `InvalidRequestError` with:
 - `detail`: the fixed text for the reason, so the message is identical in every engine.
 
 `check_request` walks the schema's rules over the raw JSON before any model is built, and the
-first violation wins, in a fixed order every engine follows: units, output, configuration,
-items, containers. The floors are the ones the request schema declares, and a cross-engine suite
+first violation wins, in a fixed order every engine follows: units, output, currency,
+configuration, items, containers. The floors are the ones the request schema declares, and a cross-engine suite
 holds all four engines to the same reason, field and message.
 """
 
@@ -23,9 +23,10 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Set, Tu
 
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
 from ._request_error import InvalidRequestError
-from .flat_bag import DEFORMABLE_BOUNDARY_KINDS
+from .flat_bag import DEFORMABLE_BOUNDARY_KINDS, GUSSETED_BAG
 from .units import LENGTH_UNIT_CODES, WEIGHT_UNIT_CODES, Length, ParsedMeasures, Weight
 from .made_to_measure import box_cost_minor_for
+from .orientations import CODES, UPRIGHT_CODES, SIGNED_CODE_NEEDS_A_HULL, refusal_reason, vocabulary
 from .bounds import MAX_BOUND_SUM
 
 REASONS = ("missing_field", "wrong_type", "below_minimum", "above_maximum", "negative_measure",
@@ -37,7 +38,8 @@ OBJECTIVES = ("default", "lowest_cost", "shipping_cost", "lowest_landed_cost", "
 ACCESS_DIRECTIONS = ("+x", "-x", "+y", "-y", "+z", "-z")
 #: The schema's closed vocabularies, each refused as `not_allowed` like the two above.
 SOLVERS = ("grid", "extreme_points", "homogeneous_blocks", "layer", "maximal_spaces", "exact_small")
-ROTATIONS = ("LWH", "LHW", "WLH", "WHL", "HLW", "HWL")
+#: All 24 proper rotations in table order (1.10); the 18 signed ones need a `convex_hull`.
+ROTATIONS = CODES
 LENGTH_UNITS = LENGTH_UNIT_CODES
 WEIGHT_UNITS = WEIGHT_UNIT_CODES
 GROUND_CONTACT_RULES = ("free", "covered", "single", "multiple")
@@ -195,6 +197,8 @@ def check_request(data: Any) -> ParsedMeasures:
     request = _object(data, "")
     unit = _check_units(request.get("units"))
     _check_output(request.get("output"))
+    currency = request.get("currency")
+    _optional(request, "currency", "", currency_code)
     _check_configuration(request.get("configuration"), unit, measures)
     items = _required_list(request, "items", "")
     for index, raw in enumerate(items):
@@ -202,7 +206,7 @@ def check_request(data: Any) -> ParsedMeasures:
     _require_unique_ids(items, "items")
     containers = _required_list(request, "containers", "")
     for index, raw in enumerate(containers):
-        _check_container(raw, pointer("containers", index), unit, measures)
+        _check_container(raw, pointer("containers", index), unit, measures, currency)
     _require_unique_ids(containers, "containers")
     _total_weight(items, containers, measures)
     return measures
@@ -212,6 +216,8 @@ def _check_units(raw: Any) -> str:
     if raw is None:
         return "mm"
     units = _object(raw, "/units")
+    # `{"length": "cm", "weight": "kg"}` used to read every bare weight as grams.
+    _known_fields(units, "/units", ("length",))
     length = units.get("length")
     if length is None:
         return "mm"
@@ -273,11 +279,38 @@ def _check_item(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> No
     _optional(item, "compression_ratio", where, lambda v, f: _ratio(v, f, None))
     _optional(item, "stacking_group", where, _stacking_group_name)
     _optional(item, "accepts_stacking_groups", where, _stacking_group_names)
-    _optional(item, "allowed_rotations", where, lambda v, f: _each_one_of(v, f, ROTATIONS))
+    _optional(item, "allowed_rotations", where, lambda v, f: _allowed_rotations(v, f, item))
     _optional(item, "ground_contact_rule", where, lambda v, f: _one_of(v, f, GROUND_CONTACT_RULES))
     _optional(item, "shape_type", where, lambda v, f: _one_of(v, f, SHAPE_TYPES))
     for name in ITEM_BOOLEANS:
         _optional(item, name, where, _boolean)
+    listed = item.get("allowed_rotations")
+    if listed is not None and not any(not item.get("keep_upright") or code in UPRIGHT_CODES for code in listed):
+        raise InvalidRequestError("invalid_value", pointer_join(where, "allowed_rotations"),
+                                  "must allow at least one rotation after keep_upright")
+
+
+def _allowed_rotations(raw: Any, where: str, item: Mapping[str, Any]) -> None:
+    """Each code from the item's vocabulary (1.10): all 24 for a hull, the six legacy codes
+    for anything else, where a signed code is a rule broken rather than an unknown word. The
+    shape is read as written, so a shape no engine knows is not a hull. O(len(raw))."""
+    hull = item.get("shape_type") == "convex_hull"
+    for index, value in enumerate(_list(raw, where)):
+        refuse_orientation(value, hull, pointer_join(where, index), InvalidRequestError)
+
+
+def refuse_orientation(value: Any, hull: bool, field: str,
+                       error: Callable[[str, str, str], Exception], where: str = "") -> None:
+    """Raise `error(reason, field, detail)` when `value` cannot orient an item of this shape
+    (`orientations.refusal_reason`). `where` names the value inside the detail, the way a fixed
+    placement or a revision event words its own refusals. Shared by every field that names a
+    requested item's orientation. O(1)."""
+    reason = refusal_reason(value, hull)
+    if reason == "invalid_value":
+        raise error(reason, field, f"{where}: {SIGNED_CODE_NEEDS_A_HULL}" if where else SIGNED_CODE_NEEDS_A_HULL)
+    if reason is not None:
+        rule = f"must be one of {json_spelling(list(vocabulary(hull)))}"
+        raise error(reason, field, f"{where} {rule}" if where else rule)
 
 
 def _nesting_below_height(value: Any, field: str, item: Mapping[str, Any], unit: str,
@@ -289,7 +322,8 @@ def _nesting_below_height(value: Any, field: str, item: Mapping[str, Any], unit:
         raise InvalidRequestError("invalid_value", field, "must be less than the item's height")
 
 
-def _check_container(raw: Any, where: str, unit: str, measures: ParsedMeasures) -> None:
+def _check_container(raw: Any, where: str, unit: str, measures: ParsedMeasures,
+                     currency: Optional[str]) -> None:
     container = _object(raw, where)
     _required_string(container, "id", where)
     _optional(container, "quantity", where, lambda v, f: _integer(v, f, 1))
@@ -302,28 +336,73 @@ def _check_container(raw: Any, where: str, unit: str, measures: ParsedMeasures) 
     _optional(container, "void_fill_reserve_ratio", where, _ratio)
     _optional(container, "access_directions", where, _access_directions)
     _optional(container, "tag_limits", where, _tag_limits)
-    _optional(container, "rate_table", where, _rate_table)
+    _optional(container, "rate_table", where, lambda v, f: _rate_table(v, f, currency))
     _optional(container, "obstacles", where, lambda v, f: _obstacles(
         v, f, unit, measures, _ticks(container["inner_dimensions"], unit, measures)))
     _optional(container, "deformable_boundary", where,
-              lambda v, f: _deformable_boundary(container, v, f, where))
+              lambda v, f: _deformable_boundary(container, v, f, where, unit, measures))
     _optional(container, "made_to_measure", where,
               lambda v, f: _made_to_measure(container, v, f, where, unit, measures))
+    _optional(container, "pallet_overhang_limit", where,
+              lambda v, f: _pallet_overhang_limit(container, v, f, unit, measures))
+
+
+def _pallet_overhang_limit(container: Mapping[str, Any], raw: Any, field: str, unit: str,
+                           measures: ParsedMeasures) -> None:
+    """Both axes, each a non-negative length, and a solving frame inside the admission
+    ceiling. O(1)."""
+    limit = _object(raw, field)
+    _known_fields(limit, field, PALLET_OVERHANG_FIELDS)
+    for axis in PALLET_OVERHANG_FIELDS:
+        _measure(_required(limit, axis, field), pointer_join(field, axis), Length, unit, measures)
+    inner = _ticks(container["inner_dimensions"], unit, measures)
+    pallet_frame(inner, measures.read(Length, limit["length"], unit).ticks,
+                 measures.read(Length, limit["width"], unit).ticks, field)
+
+
+#: The two axes `pallet_overhang_limit` requires, in the order it is checked.
+PALLET_OVERHANG_FIELDS = ("length", "width")
+
+
+def pallet_frame(inner: Tuple[int, int, int], overhang_x: int, overhang_y: int, field: str) -> None:
+    """The widened frame a pallet is packed in, held to the same ceiling as any box.
+    Shared with `request_objects`."""
+    box_ticks((inner[0] + 2 * overhang_x, inner[1] + 2 * overhang_y, inner[2]), field)
 
 
 #: Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md).
 BAG_EXCLUSIONS = ("obstacles", "axles", "access_directions", "max_stack_density",
-                  "outer_dimensions", "void_fill_reserve_ratio", "made_to_measure")
+                  "outer_dimensions", "void_fill_reserve_ratio", "made_to_measure",
+                  "pallet_overhang_limit")
 
 
-def _deformable_boundary(container: Mapping[str, Any], raw: Any, field: str, where: str) -> None:
+def _deformable_boundary(container: Mapping[str, Any], raw: Any, field: str, where: str,
+                         unit: str, measures: ParsedMeasures) -> None:
+    """The boundary object top to bottom -- kind, unknown keys, the gusset -- then the
+    container fields a bag refuses. O(1)."""
     boundary = _object(raw, field)
-    _one_of(_required(boundary, "kind", field), pointer_join(field, "kind"), DEFORMABLE_BOUNDARY_KINDS)
-    _known_fields(boundary, field, ("kind",))
+    kind = _required(boundary, "kind", field)
+    _one_of(kind, pointer_join(field, "kind"), DEFORMABLE_BOUNDARY_KINDS)
+    gusseted = kind == GUSSETED_BAG
+    _known_fields(boundary, field, ("kind", "side_gusset_depth") if gusseted else ("kind",))
+    if gusseted:
+        _side_gusset_depth(container, _required(boundary, "side_gusset_depth", field),
+                           pointer_join(field, "side_gusset_depth"), unit, measures)
     for name in BAG_EXCLUSIONS:
         if _set_beside_a_bag(name, container.get(name)):
             raise InvalidRequestError("not_allowed", pointer_join(where, name),
                                       "cannot be combined with deformable_boundary")
+
+
+def _side_gusset_depth(container: Mapping[str, Any], value: Any, field: str, unit: str,
+                       measures: ParsedMeasures) -> None:
+    """A length, positive once read in ticks, and no deeper than the bag's inner width."""
+    _measure(value, field, Length, unit, measures)
+    depth = measures.read(Length, value, unit).ticks
+    if depth == 0:
+        raise InvalidRequestError("invalid_value", field, "must be positive")
+    if depth > _ticks(container["inner_dimensions"], unit, measures)[1]:
+        raise InvalidRequestError("invalid_value", field, "exceeds inner_dimensions width")
 
 
 #: Every key the request schema's `made_to_measure` declares; it sets `additionalProperties: false`.
@@ -468,7 +547,7 @@ def _tag_limits(raw: Any, where: str) -> None:
         _integer(limits[tag], pointer_join(where, tag), 1)
 
 
-def _rate_table(raw: Any, where: str) -> None:
+def _rate_table(raw: Any, where: str, currency: Optional[str]) -> None:
     table = _object(raw, where)
     for name, minimum in (("weight_brackets_g", 1), ("prices_minor", 0)):
         values = table.get(name)
@@ -477,6 +556,30 @@ def _rate_table(raw: Any, where: str) -> None:
                 _integer(value, pointer_join(where, name, index), minimum)
     _optional(table, "minimum_charge_minor", where, lambda v, f: _integer(v, f, 0))
     _optional(table, "fuel_surcharge_permille", where, lambda v, f: _integer(v, f, 0))
+    _optional(table, "currency", where, lambda v, f: rate_table_currency(v, f, currency))
+
+
+def currency_code(value: Any, field: str) -> None:
+    """An ISO 4217 shape, `^[A-Z]{3}$`, with no code list: the engines never convert, so a
+    code they do not know is still one they can echo (docs/SERIALIZATION.md). ASCII letters
+    only, and no trailing newline, which a `$` would let through in some regex dialects. O(1)."""
+    if not isinstance(value, str):
+        raise InvalidRequestError("wrong_type", field, "must be a string")
+    if len(value) != 3 or any(not "A" <= letter <= "Z" for letter in value):
+        raise InvalidRequestError("invalid_value", field, "must be three capital letters (ISO 4217)")
+
+
+def rate_table_currency(value: Any, field: str, currency: Optional[str]) -> None:
+    """A rate table prices in the request's currency or says nothing: a table in another one
+    would be ranked as though its minor units were the request's. Shared with
+    `request_objects`. O(1)."""
+    currency_code(value, field)
+    if currency is None:
+        raise InvalidRequestError("missing_field", "/currency",
+                                  "is required when a rate_table declares a currency")
+    if value != currency:
+        raise InvalidRequestError("not_allowed", field,
+                                  f"must equal the request currency {json_spelling(currency)}")
 
 
 def _obstacles(raw: Any, where: str, unit: str, measures: ParsedMeasures,

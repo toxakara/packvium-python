@@ -6,34 +6,76 @@ from functools import lru_cache
 from itertools import product
 from typing import Iterable
 
+from .orientations import LEGACY_CODES, SOURCE_AXES, UPRIGHT_CODES
 from .units import Length, Rounding, Weight
 from ._request_error import refused
 
 
 class Rotation(str, Enum):
+    """The 24 proper rotations in canonical table order (`orientations`, 1.10).
+
+    The six legacy codes come first and are the whole vocabulary of a box; the 18 signed codes
+    after them are reachable only by a `convex_hull`. Member order is the tie-break order.
+    """
+
     LWH = "LWH"
     LHW = "LHW"
     WLH = "WLH"
     WHL = "WHL"
     HLW = "HLW"
     HWL = "HWL"
+    PL_NW_NH = "+L-W-H"
+    NL_PW_NH = "-L+W-H"
+    NL_NW_PH = "-L-W+H"
+    PL_NH_PW = "+L-H+W"
+    PL_PH_NW = "+L+H-W"
+    NL_NH_NW = "-L-H-W"
+    PW_NL_PH = "+W-L+H"
+    PW_PL_NH = "+W+L-H"
+    NW_NL_NH = "-W-L-H"
+    PW_NH_NL = "+W-H-L"
+    NW_PH_NL = "-W+H-L"
+    NW_NH_PL = "-W-H+L"
+    PH_NL_NW = "+H-L-W"
+    NH_PL_NW = "-H+L-W"
+    NH_NL_PW = "-H-L+W"
+    PH_NW_PL = "+H-W+L"
+    PH_PW_NL = "+H+W-L"
+    NH_NW_NL = "-H-W-L"
 
     @classmethod
     def all(cls) -> tuple["Rotation", ...]:
-        return tuple(cls)
+        """The six legacy codes: an item's default list, and every box a cuboid can make."""
+        return _LEGACY
 
     @classmethod
     def upright(cls) -> tuple["Rotation", ...]:
-        return (cls.LWH, cls.WLH)
+        """The legacy codes `keep_upright` leaves of the default list."""
+        return _LEGACY_UPRIGHT
 
+    @classmethod
+    def every(cls) -> tuple["Rotation", ...]:
+        """All 24 proper rotations, in table order; the 18 past `all()` need a hull."""
+        return tuple(cls)
+
+    @property
+    def is_signed(self) -> bool:
+        return self.value not in LEGACY_CODES
+
+    @property
+    def is_upright(self) -> bool:
+        """Whether the item's own height stays vertical and pointing up (z takes `+H`)."""
+        return self.value in UPRIGHT_CODES
+
+
+_LEGACY: tuple[Rotation, ...] = tuple(Rotation(code) for code in LEGACY_CODES)
+_LEGACY_UPRIGHT: tuple[Rotation, ...] = (Rotation.LWH, Rotation.WLH)
 
 # Which declared side lands on each axis under a rotation. A module-level table rather
 # than a dict literal inside `rotated`: that method runs once per rotation per candidate
-# search, and rebuilding six tuples there was measurable.
+# search, and rebuilding the tuples there was measurable. A box ignores the signs.
 _ROTATION_AXES: dict[Rotation, tuple[int, int, int]] = {
-    Rotation.LWH: (0, 1, 2), Rotation.LHW: (0, 2, 1),
-    Rotation.WLH: (1, 0, 2), Rotation.WHL: (1, 2, 0),
-    Rotation.HLW: (2, 0, 1), Rotation.HWL: (2, 1, 0),
+    rotation: SOURCE_AXES[rotation.value] for rotation in Rotation
 }
 
 

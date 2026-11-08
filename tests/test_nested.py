@@ -6,6 +6,8 @@ outer dimensions, gross weight, upright orientation — is what these tests pin 
 
 from __future__ import annotations
 
+import pytest
+
 from packvium import (Dimensions, NestedPacker, PackingConfig, PackingLevel, Weight)
 from support import container, item
 
@@ -88,3 +90,51 @@ def test_a_single_level_behaves_like_an_ordinary_pack():
 
     assert len(result.levels) == 1
     assert result.levels[0].complete
+
+
+def test_a_level_beam_width_of_one_is_the_greedy_chain():
+    cartons = [container("long", 200, 100, 100), container("single", 100, 100, 100)]
+    pallets = [container("tower", 100, 100, 200)]
+    items = [item("cube", 100, 100, 100, quantity=2)]
+    levels = [PackingLevel("carton", cartons), PackingLevel("pallet", pallets)]
+
+    def shape(result):
+        return [(level.complete, [c.id for c in level.containers], level.score) for level in result.levels]
+
+    assert shape(NestedPacker(1).pack(items, levels)) == shape(NestedPacker().pack(items, levels))
+
+
+def test_a_wider_beam_finds_the_carton_set_that_fits_the_pallet():
+    """The single long carton is the better carton level and cannot stand on the tower."""
+    cartons = [container("long", 200, 100, 100), container("single", 100, 100, 100)]
+    pallets = [container("tower", 100, 100, 200)]
+    levels = [PackingLevel("carton", cartons), PackingLevel("pallet", pallets)]
+    items = [item("cube", 100, 100, 100, quantity=2)]
+
+    greedy = NestedPacker(1).pack(items, levels)
+    beam = NestedPacker(2).pack(items, levels)
+
+    assert [level.complete for level in greedy.levels] == [True, False]
+    assert [level.complete for level in beam.levels] == [True, True]
+    assert [c.container.id for c in beam.levels[0].containers] == ["single", "single"]
+
+
+def test_handoffs_that_are_the_same_items_occupy_one_beam_slot():
+    """Packing against every carton and against `long` alone both hand up one `long#1`;
+    counting that twice would fill a width of two and drop the chain that fits."""
+    cartons = [container("long", 200, 100, 100), container("single", 100, 100, 100)]
+    pallets = [container("tower", 100, 100, 200)]
+    result = NestedPacker(2).pack([item("cube", 100, 100, 100, quantity=2)],
+                                  [PackingLevel("carton", cartons), PackingLevel("pallet", pallets)])
+
+    assert all(level.complete for level in result.levels)
+
+
+def test_no_levels_is_an_empty_answer_at_any_width():
+    assert NestedPacker(3).pack([item("cube", 100, 100, 100)], []).levels == ()
+
+
+@pytest.mark.parametrize("width", [0, -1, True, 1.0, "2"])
+def test_the_level_beam_width_is_a_positive_integer(width):
+    with pytest.raises(ValueError, match="level_beam_width must be a positive integer"):
+        NestedPacker(width)

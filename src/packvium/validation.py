@@ -6,11 +6,11 @@ from .axle_load import axle_load_exceeded
 from .constraints import (CompatibilityConstraint, ConstraintContext, LoadSupportGraph,
                           SupportConstraint, TagCountConstraint, load_units,
                           crushed, non_stackable_failure, overloaded, stack_density_exceeded,
-                          stack_limit_exceeded)
+                          stack_limit_exceeded, usable_volume)
 from .flat_bag import extent_of, girth_admits
 from .geometry import AxisAlignedBox, Point
 from . import made_to_measure
-from .models import (PackedContainer, PackingRequest, UnpackedItem, is_stack_sensitive,
+from .models import (Container, PackedContainer, PackingRequest, UnpackedItem, is_stack_sensitive,
                      placement_hits_box, placements_collide)
 from .nesting import is_valid_nesting as _is_valid_nesting
 from .packing_sequence import RouteSequenceError, safe_route_removal_order
@@ -27,6 +27,21 @@ class ValidationIssue:
 class ValidationReport:
     valid: bool
     issues: tuple[ValidationIssue, ...]
+
+
+def _reserve_cut(packed: PackedContainer, tight: Container, maximum: tuple[int, int, int]) -> bool:
+    """A box larger than the tight cut is admitted when the tight box breaks the void-fill
+    reserve and the larger one is on the machine grid within the maximum; whether
+    it keeps the reserve is checked with every other container's reserve."""
+    spec = tight.made_to_measure
+    if tight.void_fill_reserve_ratio == 0 or spec is None:
+        return False
+    cut = made_to_measure.as_triple(packed.container.inner_dimensions)
+    low = made_to_measure.as_triple(tight.inner_dimensions)
+    if not all(low[axis] <= cut[axis] <= maximum[axis]
+               and (cut[axis] - spec.minimum[axis]) % spec.increment[axis] == 0 for axis in range(3)):
+        return False
+    return packed.used_volume > usable_volume(tight)
 
 
 class IndependentSolutionValidator:
@@ -58,6 +73,8 @@ class IndependentSolutionValidator:
             stack_sensitive = any(is_stack_sensitive(p.instance.item) for p in placements)
             units = load_units(placements)
             stack_graph = LoadSupportGraph(units) if stack_sensitive else None
+            compatibility_constraints = (CompatibilityConstraint(), TagCountConstraint()) if compatibility_sensitive else ()
+            support_constraint = SupportConstraint(minimum_support_ratio) if support_sensitive else None
             for left, right in self._collision_pairs(placements):
                 issues.append(ValidationIssue(
                     "collision",
@@ -78,20 +95,25 @@ class IndependentSolutionValidator:
                 if eligible_tags and not (eligible_tags & packed.container.tags):
                     issues.append(ValidationIssue("container_ineligible", item_id))
                 # The common lattice case has no pair-dependent rules. Avoid building
-                # an O(n) "all other placements" tuple for every item in that case.
-                if compatibility_sensitive or support_sensitive:
-                    others = placements[:index] + placements[index + 1:]
-                    context = ConstraintContext(packed.container, others, placement.instance, placement.envelope_origin,
-                                                placement.rotation, placement.dimensions, placement.envelope_dimensions)
-                else:
-                    context = None
-                constraints = ()
+                # an O(n) "all other placements" tuple unless tag rules need it;
+                # support queries only inspect z2 == origin.z or origin.z < box.origin.z,
+                # which a positive-height box never satisfies against itself, so passing
+                # `placements` reuses `_TOP_PLANE_CACHE` across the container in O(n).
                 if compatibility_sensitive:
-                    constraints += (CompatibilityConstraint(), TagCountConstraint())
-                if support_sensitive:
-                    constraints += (SupportConstraint(minimum_support_ratio),)
-                for constraint in constraints:
-                    result = constraint.evaluate(context)
+                    others = placements[:index] + placements[index + 1:]
+                    compat_context = ConstraintContext(
+                        packed.container, others, placement.instance, placement.envelope_origin,
+                        placement.rotation, placement.dimensions, placement.envelope_dimensions,
+                    )
+                    for constraint in compatibility_constraints:
+                        result = constraint.evaluate(compat_context)
+                        if not result.allowed: issues.append(ValidationIssue(result.code, f"{item_id}: {result.detail}"))
+                if support_constraint is not None:
+                    support_context = ConstraintContext(
+                        packed.container, placements, placement.instance, placement.envelope_origin,
+                        placement.rotation, placement.dimensions, placement.envelope_dimensions,
+                    )
+                    result = support_constraint.evaluate(support_context)
                     if not result.allowed: issues.append(ValidationIssue(result.code, f"{item_id}: {result.detail}"))
                 if stack_sensitive:
                     assert stack_graph is not None
@@ -160,6 +182,9 @@ class IndependentSolutionValidator:
             if machine is None or machine.made_to_measure is None or achieved is None:
                 continue
             expected = made_to_measure.fabricate(machine, made_to_measure.as_triple(achieved))
+            if packed.container.inner_dimensions != expected.inner_dimensions and _reserve_cut(
+                    packed, expected, made_to_measure.as_triple(machine.inner_dimensions)):
+                expected = made_to_measure.fabricate(machine, made_to_measure.as_triple(packed.container.inner_dimensions))
             for code, field in (("fabricated_dimensions_mismatch", "inner_dimensions"),
                                 ("outer_dimensions_mismatch", "outer_dimensions"),
                                 ("made_to_measure_cost_mismatch", "cost_minor"),
@@ -231,9 +256,10 @@ class IndependentSolutionValidator:
 
     @staticmethod
     def _bag_admits(packed: PackedContainer) -> bool:
-        """The girth rule over the envelopes alone; the frame is checked above."""
+        """The girth rule over the envelopes alone, widened by a side gusset (1.10);
+        the frame is checked above."""
         a, b, c = extent_of((box.x2, box.y2, box.z2) for box in (p.envelope_box for p in packed.placements))
-        return girth_admits(packed.container.inner_dimensions, a, b, c)
+        return girth_admits(packed.container.inner_dimensions, a, b, c, packed.container.side_gusset_ticks)
 
     @staticmethod
     def _unloading_order_violation(packed: PackedContainer) -> "ValidationIssue | None":

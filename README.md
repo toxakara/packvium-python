@@ -10,7 +10,7 @@ coordinates and rotations for each item, with a reason for anything that did not
 Full documentation, the constraint reference and benchmarks live at
 [packvium.com](https://packvium.com).
 
-> **Version 1.9.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.10.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/toxakara/packvium-python/blob/main/docs/GUARANTEES.md) before relying on a result.
@@ -72,7 +72,7 @@ Item.create("mug", Dimensions.mm("100", "100", "120"), "12 oz")
 
 A JSON request refuses a float measure rather than rounding it: send `"160.5"`, not
 `160.5`. Its `units` sets only the length unit; a weight takes its unit from the measure or is
-grams, and `units.weight` is ignored today. See
+grams; any other `units` key, `weight` included, is refused. See
 [docs/UNITS-AND-NUMERICS.md](https://github.com/toxakara/packvium-python/blob/main/docs/UNITS-AND-NUMERICS.md).
 
 ## Getting the same answer every time
@@ -210,22 +210,22 @@ in `constraints.py` and `limits.py` have failed you.
 | File | What it shows |
 | --- | --- |
 | [`basic.py`](https://github.com/toxakara/packvium-python/blob/main/examples/basic.py) | The smallest useful call: items in, placements out — and the three details in it that are easy to miss. |
-| [`objectives.py`](https://github.com/toxakara/packvium-python/blob/main/examples/objectives.py) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree, including the rate card that makes the heavier shipment the cheaper one. |
-| [`constraints.py`](https://github.com/toxakara/packvium-python/blob/main/examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused. |
+| [`objectives.py`](https://github.com/toxakara/packvium-python/blob/main/examples/objectives.py) | Six of the seven objectives (all but `maximum_volume`) on scenes where they genuinely disagree, including the rate card that makes the heavier shipment the cheaper one, a rate card's `currency`, and the lower bound that proves the value left behind is the least possible. |
+| [`constraints.py`](https://github.com/toxakara/packvium-python/blob/main/examples/constraints.py) | Upright-only, floor-only, non-stackable, top-load limits, and tags that keep two items out of the same box — plus how to read the reason an item was refused, and a crate allowed past the pallet deck by `pallet_overhang_limit`. |
 | [`limits.py`](https://github.com/toxakara/packvium-python/blob/main/examples/limits.py) | A courier fleet: a van with a fridge unit and wheel arches as obstacles, an item cap per bike, one dangerous-goods item per van, frozen goods only in a refrigerated vehicle, and a cap on vehicles. |
 | [`units.py`](https://github.com/toxakara/packvium-python/blob/main/examples/units.py) | Why there are no floats anywhere: fractional inches, exact ticks, and the one-tick difference between a fit and a refusal. |
 | [`serialization.py`](https://github.com/toxakara/packvium-python/blob/main/examples/serialization.py) | The same request as JSON, the result in full, and exactly which mistakes are refused and which are silently ignored. |
 | [`errors.py`](https://github.com/toxakara/packvium-python/blob/main/examples/errors.py) | A web handler: refused requests turned into a 422 with a pointer and a message a person can act on, fixed placements that cannot hold, and a partial fit that is not an error. |
 | [`reproducibility.py`](https://github.com/toxakara/packvium-python/blob/main/examples/reproducibility.py) | Why a clock-limited search answers differently on a busy machine, how an effort budget fixes it, and how to read `termination`. |
 | [`trucking.py`](https://github.com/toxakara/packvium-python/blob/main/examples/trucking.py) | A three-stop delivery van within its axle ratings: loading and unloading order, what the driver can reach at each stop, and the same goods packed without a route. |
-| [`fixed_placements.py`](https://github.com/toxakara/packvium-python/blob/main/examples/fixed_placements.py) | A trailer that arrives partly loaded: new pallets packed around the ones already on board, and a record of what is on board that cannot be true. |
+| [`fixed_placements.py`](https://github.com/toxakara/packvium-python/blob/main/examples/fixed_placements.py) | A trailer that arrives partly loaded: new pallets packed around the ones already on board, a record of what is on board that cannot be true, and a loaded pallet fixed by quoting its `placement_id`. |
 | [`rebalancing.py`](https://github.com/toxakara/packvium-python/blob/main/examples/rebalancing.py) | Two pallets of very different weight evened out after packing, one validated move at a time. |
-| [`shapes.py`](https://github.com/toxakara/packvium-python/blob/main/examples/shapes.py) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, and a cushion that compresses under load until the crush limit refuses it. |
-| [`nested.py`](https://github.com/toxakara/packvium-python/blob/main/examples/nested.py) | Units into cartons, cartons onto a pallet, in one call. |
+| [`shapes.py`](https://github.com/toxakara/packvium-python/blob/main/examples/shapes.py) | Items that are not their box: complementary wedges sharing one crate as `convex_hull`, two copies of one wedge that need a signed rotation such as `-L-W+H`, a cushion that compresses under load until the crush limit refuses it, and a gusseted bag that holds a layer more than a flat one. |
+| [`nested.py`](https://github.com/toxakara/packvium-python/blob/main/examples/nested.py) | Units into cartons, cartons onto a pallet, in one call, and `level_beam_width` letting the pallet pick a dearer carton set that packs better. |
 | [`commerce.py`](https://github.com/toxakara/packvium-python/blob/main/examples/commerce.py) | Rate a shipment, apply an eligibility rule, and pin a catalog version. |
 | [`execution.py`](https://github.com/toxakara/packvium-python/blob/main/examples/execution.py) | Turn a result into dock instructions: solver facts kept apart from screen text, a step order that is injected or honestly absent, and an operator lock that yields a second plan rather than editing the approved one. |
 | [`artifacts.py`](https://github.com/toxakara/packvium-python/blob/main/examples/artifacts.py) | Hand a result to a system with no engine: one document with the plan, geometry and the request that produced it, exported as CSV and a printable work order, with an honest replay level. |
-| [`revisions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/revisions.py) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, and a hash-chained record that notices an edit. |
+| [`revisions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/revisions.py) | Replan a half-loaded job: a missing item and a locked placement recorded against the approved plan, a replan that keeps the locked item in place, a hash-chained record that notices an edit, and a box already cut to measure (with a void-fill reserve) stocked for the replan. |
 | [`intelligence.py`](https://github.com/toxakara/packvium-python/blob/main/examples/intelligence.py) | Prove a carton change is worth publishing: two scenarios compared order by order, a proposal that refuses to exist on thin evidence, and a replay against held-out history where a cheaper packing your validator rejects still counts as a regression. |
 | [`extensions.py`](https://github.com/toxakara/packvium-python/blob/main/examples/extensions.py) | A rule the schema has no field for — and an honest account of what you give up by writing one. |
 
@@ -245,20 +245,24 @@ instead: `PYTHONPATH=src python3 examples/trucking.py`.
 - **Real constraints.** Weight and payload limits, permitted rotations, keep-upright,
   floor-only, non-stackable, top-load limits, minimum support ratio, tag incompatibility,
   eligible container tags, per-container item and tag limits, clearance, obstacles, two-axle
-  load limits and multi-stop route order.
+  load limits, multi-stop route order, pallet overhang past the deck, and flat or gusseted
+  bags.
 - **A solver portfolio, not one algorithm.** Regular-grid, layer, extreme-point,
   maximal-space and bounded exact search, selected by problem shape and profile.
 - **Answers you can check.** Every solution is re-validated by logic independent of the
-  search. Unplaced items come back with a reason code, not silently missing.
-- **A proof, or the distance to one.** Under the `default` and `lowest_cost` objectives every
-  result states `optimality.lower_bound`. A complete result that attains it reports `optimal`,
+  search. Unplaced items come back with a reason code, not silently missing. Every placement
+  carries a `placement_id` that a fixed placement, a revision or a lock can quote.
+- **A proof, or the distance to one.** Under the `default`, `lowest_cost`, `maximum_value`,
+  `open_dimension_height` and `maximum_volume` objectives every result states
+  `optimality.lower_bound`. A complete result that attains it reports `optimal`,
   which proves no packing obeying the request's rules scores better; any other carries the gap
   to the bound (`gap_key`, `absolute_gap`, `relative_gap`).
 - **Deterministic when you ask for it.** The same request with an `effort_budget` gives the
   same result on every run and machine. A search stopped by `time_limit_ms` keeps what it
   reached, which can differ between runs; `termination` says which happened.
 - **Multi-container and nested.** Split across containers, or pack containers into
-  containers. `rebalance_weight` evens out the payload across containers afterwards.
+  containers; `NestedPacker(level_beam_width=K)` carries the K best carton sets up a level,
+  so the pallet decides between them. `rebalance_weight` evens out the payload across containers afterwards.
 - **Extensible.** Register your own constraints, item orderings, candidate scorers,
   container selectors or complete solvers.
 - **Work orders, not just coordinates.** `packvium.execution` turns a validated result
@@ -279,7 +283,7 @@ instead: `PYTHONPATH=src python3 examples/trucking.py`.
 - **Decide before you publish.** `packvium.simulation` and `packvium.recommendations`
   compare two catalog scenarios order by order and propose a change only when the paired
   cohort supports it; `packvium.holdout` replays that proposal against history it has not
-  seen. Python-only, and supported but not yet signature-frozen — see
+  seen. Python-only, and signature-frozen since 1.10.0 like the packing surface — see
   [PUBLIC-API.md](https://github.com/toxakara/packvium-python/blob/main/docs/PUBLIC-API.md).
 
 ## Documentation
@@ -310,7 +314,7 @@ Documentation, the constraint reference and the benchmarks are at
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/toxakara/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/toxakara/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.9"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.10"` | [packvium-rust](https://github.com/toxakara/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/toxakara/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/toxakara/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/toxakara/packvium-php-bridge) |
@@ -332,7 +336,7 @@ CodeMeta form.
 @software{packvium_python,
   author  = {{Packvium contributors}},
   title   = {Packvium for Python},
-  version = {1.9.0},
+  version = {1.10.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

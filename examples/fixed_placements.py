@@ -114,3 +114,33 @@ print("""
   Nothing is solved when the starting point is impossible: a plan built on a
   collision or an overweight trailer would be wrong before the first pallet moved.
   `cannot_hold` names the fixed set as a whole; the detail says what is wrong.""")
+
+# --------------------------------------------------------------------------------------
+section("4. A store pallet is loaded, and the next plan quotes it by its id")
+
+first_plan = solve()
+loaded = next(p for p in first_plan["containers"][0]["placements"] if not p.get("fixed"))
+print(f"  placement_id: {loaded['placement_id']}")
+
+
+def quote_loaded(placement_id: str) -> dict:
+    """The loaded pallet as a fixed placement: the result's own fields, and its id."""
+    return {"item_type": loaded["item_type"], "container_type": "trailer",
+            "position": {axis: loaded["position"][axis]["value"] for axis in ("x", "y", "z")},
+            "orientation": loaded["orientation"], "placement_id": placement_id}
+
+
+replanned = solve(lambda r: r["fixed_placements"].append(quote_loaded(loaded["placement_id"])))
+kept = [p["placement_id"] for p in replanned["containers"][0]["placements"] if p.get("fixed")]
+print(f"  the replan keeps it: {loaded['placement_id'] in kept}")
+try:
+    solve(lambda r: r["fixed_placements"].append(
+        quote_loaded(loaded["placement_id"].replace(loaded["orientation"], "LWH"))))
+except FixedPlacementError as refusal:
+    print(f"  an id that names another orientation: {refusal.reason}, {refusal.field}")
+print("""
+  Every placement carries `placement_id`, the canonical JSON of its container id,
+  position in ticks, item type and orientation, so it is unique within a result and
+  any engine computes the same one. A fixed placement may quote it; it must then
+  name exactly the box the other fields describe, so a copy-paste slip is refused
+  rather than packed around.""")

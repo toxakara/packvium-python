@@ -43,9 +43,10 @@ mathematics and belong to the design task, not to this implementation of it -- r
 Objective key order. `compute` returns the bounds in the *default* objective's order,
 `(unpacked_count, container_count, total_cost_minor, unused_volume_ppm, stack_height_ppm)`.
 `for_request` returns them in the order of the objective a result is scored with:
-`lowest_cost` reads `(L0, L2, L1, L3, L4)`, which the document shows is still a bound, and
-every other objective gets none, because a vector compared against a score that ranks other
-quantities means nothing.
+`lowest_cost` reads `(L0, L2, L1, L3, L4)`, which the document shows is still a bound;
+`maximum_value`, `open_dimension_height` and `maximum_volume` each add one term for the key
+only they rank by; `shipping_cost` and `lowest_landed_cost` get none, because a
+vector compared against a score that ranks other quantities means nothing.
 
 Which instances. The bound is a property of the request, so it is taken over every instance
 the request declares, fixed placements included. A bound over the free instances
@@ -59,6 +60,7 @@ pack, before any solver runs.
 
 from __future__ import annotations
 
+import heapq
 from typing import Dict, Iterable, Sequence, Tuple
 
 from ._compat import dataclass
@@ -89,11 +91,15 @@ MAX_BOUND_SUM = 10 ** 30
 MAX_BOUND_VALUE = 2 ** 53 - 1
 
 
-#: The objectives a bound is stated for, and where each reads the five bounds: the position
-#: in `compute`'s default-order vector of each of the objective's own score keys.
-OBJECTIVE_ORDERS = {
+#: The objectives a bound is stated for, and where each reads its bounds: the position in
+#: `compute`'s default-order vector of each of the objective's own score keys, or the name of
+#: the one key only that objective ranks by (docs/OPTIMALITY-GAP.md § 1.4).
+OBJECTIVE_ORDERS: Dict[str, Tuple["int | str", ...]] = {
     "default": (0, 1, 2, 3, 4),
     "lowest_cost": (0, 2, 1, 3, 4),
+    "maximum_value": (0, "value_forgone", 1, 2, 3),
+    "open_dimension_height": (0, "achieved_height", 1, 2, 3),
+    "maximum_volume": ("unpacked_volume_ppm", 0, 1, 2, 3),
 }
 
 
@@ -269,16 +275,89 @@ def for_request(instances: Sequence[ItemInstance], containers: Sequence[Containe
     A function of the request alone, computed independently of the solver and deadline.
     Emitting its prefix also checks the result's score and the portable gap ceiling.
     """
-    order = OBJECTIVE_ORDERS.get(objective)
-    if order is None:
+    if objective not in OBJECTIVE_ORDERS:
         return None
     if any(container.made_to_measure is not None for container in containers):
         return None
     try:
-        vector = compute(instances, containers).as_tuple()
+        return objective_vector(instances, containers, objective)
     except BoundOverflowError:
         return None
-    return tuple(vector[position] for position in order)
+
+
+def objective_vector(instances: Sequence[ItemInstance], containers: Sequence[Container],
+                     objective: str) -> Tuple[int, ...]:
+    """The bound in a covered `objective`'s score order, raising `BoundOverflowError` where a
+    ceiling withholds it -- the predicate's or the objective's own term's."""
+    vector = compute(instances, containers).as_tuple()
+    return tuple(vector[position] if isinstance(position, int)
+                 else _objective_term(position, instances, containers, vector[0])
+                 for position in OBJECTIVE_ORDERS[objective])
+
+
+def _objective_term(name: str, instances: Sequence[ItemInstance], containers: Sequence[Container],
+                    unpacked: int) -> int:
+    """The bound on the one key an objective ranks by and the default does not.
+
+    Each is conditional on the keys before it, as `compute`'s are: the value and height terms
+    hold for every packing that leaves exactly `unpacked` instances behind, and the volume term
+    leads its objective and holds for every packing.
+
+    No term sorts: `compute` already paid for the only sorts (finding F6 doubled that cost
+    once), and each term needs at most the `unpacked` extreme values, which a heap selects in
+    `O(n log L0)`. With `O(c)` over the container types, the request bound stays
+    `O(n log n + c log c)`.
+    """
+    if name == "value_forgone":
+        return _value_forgone_bound(instances, unpacked)
+    volumes = [instance.item.dimensions.volume for instance in instances]
+    nests = any(_occupies_less_than_its_box(instance.item) for instance in instances)
+    if name == "achieved_height":
+        areas = [container.inner_dimensions.base_area for container in containers]
+        return _achieved_height_bound(volumes, nests, unpacked, areas)
+    usable = [usable_volume(container) for container in containers]
+    return _unpacked_volume_bound(volumes, nests, usable, [c.quantity for c in containers])
+
+
+def _value_forgone_bound(instances: Sequence[ItemInstance], unpacked: int) -> int:
+    """`maximum_value`'s second key: whichever `unpacked` instances are left behind, their
+    value is at least that of the `unpacked` least valuable. Values are non-negative, so the
+    running sum only grows, and it is refused as soon as it passes the portable ceiling."""
+    total = 0
+    for value in heapq.nsmallest(unpacked, (instance.item.value or 0 for instance in instances)):
+        total = _guard_output(total + value, "value forgone")
+    return total
+
+
+def _achieved_height_bound(volumes, nests, unpacked, areas) -> int:
+    """`open_dimension_height`'s second key, the summed tops in ticks.
+
+    A container holding volume `v` on floor `A` stands at least `v / A` tall, because its
+    placements are disjoint boxes inside `A × top`. Summed over the opened containers that is
+    at least the placed volume over the widest floor, and the score is an integer. The placed
+    volume is at least everything but the `unpacked` largest. An instance that occupies less
+    than its box breaks the disjoint-boxes step, so the term is dropped.
+    """
+    floors = [area for area in areas if area > 0]
+    if nests or unpacked >= len(volumes) or not floors:
+        return 0
+    placed = sum(volumes) - sum(heapq.nlargest(unpacked, volumes))
+    return _guard_output(_ceil_div(placed, max(floors)), "achieved height")
+
+
+def _unpacked_volume_bound(volumes, nests, usable, quantities) -> int:
+    """`maximum_volume`'s first key: the volume no inventory can hold, as the score's own
+    rounded-up share of the requested volume.
+
+    The packed volume is at most the summed usable capacity, so at least the rest is left
+    behind whatever the geometry does. Unlimited inventory holds everything, and an instance
+    that occupies less than its box stops nominal volumes summing, so both give 0.
+    """
+    requested = sum(volumes)
+    capacity = _capacity_total(usable, quantities, unbounded_when_value_infinite=False)
+    if nests or requested == 0 or capacity is None:
+        return 0
+    return _ceil_div(max(0, requested - capacity) * PPM, requested)
 
 
 def compute(instances: Sequence[ItemInstance], containers: Sequence[Container]) -> Bounds:

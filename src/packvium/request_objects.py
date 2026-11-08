@@ -2,8 +2,8 @@
 
 `check_request` walks a JSON request; `Packer.pack` takes objects, whose own constructors already
 refuse most of the same values but cannot know where in a request they will sit. This walks the
-objects in the JSON rules' order -- configuration, items, item ids, containers, container ids,
-fixed placements -- with the same primitives, so a value the JSON path refuses is refused here with the same reason
+objects in the JSON rules' order -- currency, configuration, items, item ids, containers,
+container ids, fixed placements -- with the same primitives, so a value the JSON path refuses is refused here with the same reason
 and the same RFC 6901 field. Only rules `check_request` also applies are checked, so on the JSON
 path, which runs `check_request` first, this never refuses anything.
 
@@ -18,14 +18,15 @@ from typing import Any, Iterable, Optional, Sequence
 
 from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
 from .config import PackingConfig
-from .fixed_placements import FixedPlacementError, orientation_rule
+from .fixed_placements import FixedPlacementError, orientation_rule, require_orientation, require_placement_id
 from .flat_bag import DEFORMABLE_BOUNDARY_KINDS
-from .geometry import Point, Rotation
+from .geometry import Point, Rotation, ShapeType
 from .made_to_measure import MadeToMeasure, as_triple, box_cost_minor_for
 from .models import Container, FixedPlacement, Item, RateTable
 from .request_errors import (BAG_EXCLUSIONS, InvalidRequestError, _integer, _one_of,
                              _ratio, _set_beside_a_bag, _stacking_group_name, box_ticks,
-                             length_ticks, pointer, pointer_join, total_weight_ticks, weight_ticks)
+                             currency_code, length_ticks, pallet_frame, pointer, pointer_join,
+                             rate_table_currency, total_weight_ticks, weight_ticks)
 
 #: (JSON name, PackingConfig attribute, floor), in `check_request`'s order.
 _CONFIGURATION_INTEGERS = (("time_limit_ms", "time_limit_ms", 1), ("alternatives", "top_k", 1),
@@ -42,19 +43,35 @@ _EFFORT_LIMITS = ("max_candidates_evaluated", "max_placement_attempts", "max_sea
 
 
 def check_objects(items: Sequence[Item], containers: Sequence[Container], config: PackingConfig,
-                  fixed_placements: Sequence[FixedPlacement] = ()) -> None:
+                  fixed_placements: Sequence[FixedPlacement] = (), currency: Optional[str] = None) -> None:
     """Refuse the request with its first violation, or return."""
+    if currency is not None:
+        currency_code(currency, "/currency")
     _check_configuration(config)
     for index, item in enumerate(items):
         _check_item(item, pointer("items", index))
     _require_unique_ids(items, "items")
     for index, container in enumerate(containers):
-        _check_container(container, pointer("containers", index))
+        _check_container(container, pointer("containers", index), currency)
     _require_unique_ids(containers, "containers")
+    _check_routes_beside_pallets(items, containers)
     total_weight_ticks(((item.weight.ticks, item.quantity) for item in items),
                        (container.tare_weight.ticks for container in containers))
+    hull_types = frozenset(item.id for item in items if item.shape_type is ShapeType.CONVEX_HULL)
     for index, placement in enumerate(fixed_placements):
-        _check_fixed_placement(placement, f"fixed_placements[{index}]", pointer("fixed_placements", index))
+        _check_fixed_placement(placement, f"fixed_placements[{index}]", pointer("fixed_placements", index),
+                               hull_types)
+
+
+def _check_routes_beside_pallets(items: Sequence[Item], containers: Sequence[Container]) -> None:
+    """A routed item beside a pallet that allows overhang: the JSON path refuses it
+    as `container.pallet_overhang_limit+item.stop_index`, this one at the first routed item."""
+    if not any(container.pallet_overhang_limit is not None for container in containers):
+        return
+    for index, item in enumerate(items):
+        if item.stop_index is not None:
+            raise InvalidRequestError("not_allowed", pointer_join(pointer("items", index), "stop_index"),
+                                      "cannot be combined with pallet_overhang_limit")
 
 
 def _check_configuration(config: PackingConfig) -> None:
@@ -90,7 +107,7 @@ def _check_item(item: Item, where: str) -> None:
         _stacking_group_name(name, pointer_join(accepted, index))
 
 
-def _check_container(container: Container, where: str) -> None:
+def _check_container(container: Container, where: str, currency: Optional[str]) -> None:
     _string_id(container.id, where)
     _optional(container.quantity, pointer_join(where, "quantity"), 1)
     box_ticks(as_triple(container.inner_dimensions), pointer_join(where, "inner_dimensions"))
@@ -104,11 +121,17 @@ def _check_container(container: Container, where: str) -> None:
     for tag in _code_point_order(container.tag_limits):
         _integer(container.tag_limits[tag], pointer_join(limits, tag), 1)
     if container.rate_table is not None:
-        _check_rate_table(container.rate_table, pointer_join(where, "rate_table"))
+        _check_rate_table(container.rate_table, pointer_join(where, "rate_table"), currency)
     if container.deformable_boundary is not None:
         _check_flat_bag(container, where)
     if container.made_to_measure is not None:
         _check_made_to_measure(container, container.made_to_measure, where)
+    if container.pallet_overhang_limit is not None:
+        limit = container.pallet_overhang_limit
+        field = pointer_join(where, "pallet_overhang_limit")
+        for axis in ("length", "width"):
+            length_ticks(getattr(limit, axis).ticks, pointer_join(field, axis))
+        pallet_frame(as_triple(container.inner_dimensions), limit.length.ticks, limit.width.ticks, field)
 
 
 def _weights(holder: object, where: str, names: Sequence[str]) -> None:
@@ -118,12 +141,14 @@ def _weights(holder: object, where: str, names: Sequence[str]) -> None:
             weight_ticks(weight.ticks, pointer_join(where, name))
 
 
-def _check_rate_table(table: RateTable, where: str) -> None:
+def _check_rate_table(table: RateTable, where: str, currency: Optional[str]) -> None:
     for name, minimum in (("weight_brackets_g", 1), ("prices_minor", 0)):
         for index, value in enumerate(getattr(table, name)):
             _integer(value, pointer_join(where, name, index), minimum)
     _integer(table.minimum_charge_minor, pointer_join(where, "minimum_charge_minor"), 0)
     _integer(table.fuel_surcharge_permille, pointer_join(where, "fuel_surcharge_permille"), 0)
+    if table.currency is not None:
+        rate_table_currency(table.currency, pointer_join(where, "currency"), currency)
 
 
 def _check_flat_bag(container: Container, where: str) -> None:
@@ -151,7 +176,8 @@ def _check_made_to_measure(container: Container, machine: MadeToMeasure, where: 
         raise InvalidRequestError("invalid_value", price, f"prices the largest box above {MAX_EXACT_MAGNITUDE}")
 
 
-def _check_fixed_placement(placement: FixedPlacement, where: str, field: str) -> None:
+def _check_fixed_placement(placement: FixedPlacement, where: str, field: str,
+                           hull_types: frozenset[str]) -> None:
     """`fixed_placements.require_fixed_placement_shapes`' rules that an object can break, in its
     order and with its refusal; whether the set can hold is `admit_fixed_placements`' to say."""
     for name, value in (("item_type", placement.item_id), ("container_type", placement.container_id)):
@@ -159,6 +185,8 @@ def _check_fixed_placement(placement: FixedPlacement, where: str, field: str) ->
             raise _malformed_placement(f"{where}.{name} is a non-empty string", pointer_join(field, name))
     if not isinstance(placement.rotation, Rotation):
         raise _malformed_placement(f"{where}.orientation {orientation_rule()}", pointer_join(field, "orientation"))
+    require_orientation(placement.rotation.value, placement.item_id in hull_types, where,
+                        pointer_join(field, "orientation"))
     instance = json_integer(placement.container_instance)
     if instance is None or instance < 1:
         raise _malformed_placement(f"{where}.container_instance counts from 1",
@@ -172,6 +200,8 @@ def _check_fixed_placement(placement: FixedPlacement, where: str, field: str) ->
         value = getattr(placement.position, axis)
         if isinstance(value, bool) or not isinstance(value, int):
             raise _malformed_placement(f"{where}.position.{axis} is a measure", pointer_join(position, axis))
+    require_placement_id(placement.placement_id, f"{placement.container_id}#{instance}", placement.position,
+                         placement.item_id, placement.rotation.value, where, field)
 
 
 def _malformed_placement(detail: str, field: str) -> FixedPlacementError:

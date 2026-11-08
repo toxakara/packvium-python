@@ -39,6 +39,12 @@ def refusal(edit) -> InvalidRequestError:
     (lambda d: d["items"][0].update(quantity=-2**60), "below_minimum", "/items/0/quantity", "must be at least 1"),
     (lambda d: d["items"][0]["dimensions"].update(width="-1"), "negative_measure",
      "/items/0/dimensions/width", "cannot be negative"),
+    # Past 2^53 - 1 a weight must be a string, but a negative one is still refused as
+    # negative first, whether its parser stored the JSON number as an integer or a float.
+    (lambda d: d["items"][0].update(weight=-2**53), "negative_measure", "/items/0/weight",
+     "cannot be negative"),
+    (lambda d: d["items"][0].update(weight=-1e16), "negative_measure", "/items/0/weight",
+     "cannot be negative"),
     (lambda d: d["items"][0]["dimensions"].update(width={"value": "1", "unit": "furlong"}), "invalid_unit",
      "/items/0/dimensions/width", 'has an unknown unit "furlong"'),
     (lambda d: d["items"][0]["dimensions"].update(width={"unit": "mm"}), "wrong_type",
@@ -116,11 +122,11 @@ def test_a_request_that_is_not_an_object_is_refused_as_a_whole():
     assert (caught.value.field, str(caught.value)) == ("", "invalid_request: must be an object")
 
 
-def test_what_the_rules_do_not_name_still_arrives_as_a_request_error():
-    # A model rule the schema does not state: an item needs at least one rotation. (An unknown
-    # shape type was this case until made it a `not_allowed` rule.)
+def test_an_empty_rotation_list_names_the_request_rule_it_breaks():
     error = refusal(lambda d: d["items"][0].update(allowed_rotations=[]))
-    assert (error.code, error.reason, error.field) == ("invalid_request", "invalid_value", "")
+    assert (error.code, error.reason, error.field, error.detail) == (
+        "invalid_request", "invalid_value", "/items/0/allowed_rotations",
+        "must allow at least one rotation after keep_upright")
 
 
 def test_a_fixed_placement_refusal_is_a_request_error_with_its_own_code():

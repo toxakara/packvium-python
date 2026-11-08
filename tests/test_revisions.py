@@ -494,3 +494,176 @@ def test_a_value_with_no_json_spelling_is_named_by_what_it_is():
     with pytest.raises(PlanRevisionError) as caught:
         apply_events(cube_request(), [event])
     assert str(caught.value) == "the request has no item an unspellable value"
+
+
+# ------------------------------------------------------------------ made-to-measure boxes
+
+
+def machine_request(quantity: int | None = 3) -> dict:
+    machine = {"id": "machine", "cost_minor": 40, "tare_weight": "50",
+               "inner_dimensions": {"length": "310", "width": "310", "height": "610"},
+               "made_to_measure": {"minimum": {"length": "60", "width": "60", "height": "60"},
+                                   "increment": {"length": "25", "width": "25", "height": "25"},
+                                   "cost_per_square_metre_minor": 1000, "tare_per_square_metre": "500",
+                                   "outer_allowance": {"length": "3", "width": "3", "height": "3"}}}
+    if quantity is not None:
+        machine["quantity"] = quantity
+    return {"units": {"length": "mm"}, "configuration": {"time_limit_ms": 60000},
+            "items": [{"id": "cube", "quantity": 3, "weight": "100",
+                       "dimensions": {"length": "300", "width": "300", "height": "300"}}],
+            "containers": [machine]}
+
+
+def lock_in(result: dict, container_type: str, instance: int, sequence: int) -> dict:
+    packed = [c for c in result["containers"] if c["container_type"] == container_type][instance - 1]
+    placement = packed["placements"][0]
+    return {"sequence": sequence, "type": "placement_locked", "placement": {
+        "item_type": placement["item_type"], "container_type": container_type, "container_instance": instance,
+        "position": {axis: {"value": str(placement["position"][axis]["ticks"]), "unit": "ticks"} for axis in "xyz"},
+        "orientation": placement["orientation"]}}
+
+
+def test_a_box_cut_for_the_approved_plan_becomes_a_stock_container():
+    request = machine_request()
+    result = pack_from_dict(request)
+    artifact = build_operational_artifact(request, result)
+    cut = result["containers"][0]
+    revision = derive_revision(root_revision(request), artifact, [lock_in(result, "machine", 1, 1)])
+    derived = revision["request"]
+    machine, stock = derived["containers"]
+    assert machine["id"] == "machine" and machine["quantity"] == 2
+    assert stock["id"] == "machine@1#1" and stock["quantity"] == 1 and "made_to_measure" not in stock
+    assert {axis: int(side["value"]) for axis, side in stock["inner_dimensions"].items()} == {
+        axis: side["ticks"] for axis, side in cut["inner_dimensions"].items()}
+    assert {axis: int(side["value"]) for axis, side in stock["outer_dimensions"].items()} == {
+        axis: side["ticks"] for axis, side in cut["outer_dimensions"].items()}
+    assert stock["cost_minor"] == cut["made_to_measure"]["cost_minor"]
+    assert int(stock["tare_weight"]["value"]) == cut["made_to_measure"]["tare_weight"]["ticks"]
+    assert derived["fixed_placements"][0]["container_type"] == "machine@1#1"
+    assert derived["fixed_placements"][0]["container_instance"] == 1
+    assert pack_from_dict(derived)["status"] == "feasible"
+
+
+def test_a_lock_quoting_its_placement_id_in_a_cut_box_drops_the_id_once_stocked():
+    request = machine_request()
+    result = pack_from_dict(request)
+    event = lock_in(result, "machine", 1, 1)
+    event["placement"]["placement_id"] = result["containers"][0]["placements"][0]["placement_id"]
+    revision = derive_revision(root_revision(request), build_operational_artifact(request, result), [event])
+    fixed = revision["request"]["fixed_placements"][0]
+    assert fixed["container_type"] == "machine@1#1" and "placement_id" not in fixed
+    assert pack_from_dict(revision["request"])["status"] == "feasible"
+
+
+def test_a_chain_of_cut_boxes_stays_derivable_and_needs_its_artifacts_to_verify():
+    request = machine_request()
+    root = root_revision(request)
+    first = pack_from_dict(request)
+    first_artifact = build_operational_artifact(request, first)
+    one = derive_revision(root, first_artifact, [lock_in(first, "machine", 1, 1)])
+    second = pack_from_dict(one["request"])
+    second_artifact = build_operational_artifact(one["request"], second)
+    two = derive_revision(one, second_artifact, [lock_in(second, "machine", 1, 2)])
+    assert [c["id"] for c in two["request"]["containers"]] == ["machine", "machine@2#1", "machine@1#1"]
+    assert verify_revision_chain([root, one, two], [None, first_artifact, second_artifact]) == []
+    assert [issue.code for issue in verify_revision_chain([root, one, two])] == [
+        "artifact_required", "artifact_required"]
+
+
+def test_the_last_box_of_a_limited_machine_drops_the_machine():
+    request = machine_request(quantity=1)
+    request["items"][0]["quantity"] = 1
+    result = pack_from_dict(request)
+    revision = derive_revision(root_revision(request), build_operational_artifact(request, result),
+                               [lock_in(result, "machine", 1, 1)])
+    assert [c["id"] for c in revision["request"]["containers"]] == ["machine@1#1"]
+
+
+def test_an_unlimited_machine_keeps_no_quantity():
+    request = machine_request(quantity=None)
+    result = pack_from_dict(request)
+    revision = derive_revision(root_revision(request), build_operational_artifact(request, result),
+                               [lock_in(result, "machine", 1, 1)])
+    assert "quantity" not in revision["request"]["containers"][0]
+
+
+def test_a_placement_in_a_box_the_plan_never_cut_is_refused():
+    request = machine_request()
+    result = pack_from_dict(request)
+    event = lock_in(result, "machine", 1, 1)
+    event["placement"]["container_instance"] = 9
+    with pytest.raises(PlanRevisionError) as refusal:
+        derive_revision(root_revision(request), build_operational_artifact(request, result), [event])
+    assert refusal.value.code == "invalid_artifact"
+
+
+def test_a_stock_name_already_taken_is_a_conflict():
+    request = machine_request()
+    request["containers"].append({"id": "machine@1#1", "inner_dimensions": {"length": "10", "width": "10", "height": "10"}})
+    result = pack_from_dict(request)
+    with pytest.raises(PlanRevisionError) as refusal:
+        derive_revision(root_revision(request), build_operational_artifact(request, result),
+                        [lock_in(result, "machine", 1, 1)])
+    assert refusal.value.code == "event_conflict"
+
+
+def test_a_request_without_lists_is_stocked_unchanged():
+    from packvium.revisions import _holds_cut_boxes, stock_cut_boxes
+    assert stock_cut_boxes({"containers": []}, {}, 1) == {"containers": []}
+    assert not _holds_cut_boxes({"containers": {}, "fixed_placements": []})
+
+
+def test_two_placements_in_one_cut_box_share_one_stock_container():
+    request = machine_request()
+    result = pack_from_dict(request)
+    packed = result["containers"][0]
+    events = []
+    for sequence, placement in enumerate(packed["placements"][:2], start=1):
+        events.append({"sequence": sequence, "type": "placement_locked", "placement": {
+            "item_type": placement["item_type"], "container_type": "machine", "container_instance": 1,
+            "position": {axis: {"value": str(placement["position"][axis]["ticks"]), "unit": "ticks"} for axis in "xyz"},
+            "orientation": placement["orientation"]}})
+    revision = derive_revision(root_revision(request), build_operational_artifact(request, result), events)
+    assert [c["id"] for c in revision["request"]["containers"]] == ["machine", "machine@1#1"]
+    assert {entry["container_type"] for entry in revision["request"]["fixed_placements"]} == {"machine@1#1"}
+
+
+@pytest.mark.parametrize("damage, message", [
+    (lambda a: a.update(work_order={}), "holds no machine instance 1"),
+    (lambda a: a["geometry"]["containers"][0]["inner_dimensions"].update(length="12a"), "is not a tick count"),
+    (lambda a: a["geometry"]["containers"][0]["inner_dimensions"].update(length="１２"), "is not a tick count"),
+])
+def test_an_artifact_that_cannot_describe_the_cut_box_is_refused(damage, message):
+    request = machine_request()
+    result = pack_from_dict(request)
+    artifact = build_operational_artifact(request, result)
+    damage(artifact)
+    from packvium.revisions import stock_cut_boxes
+    derived = apply_events(request, [lock_in(result, "machine", 1, 1)])
+    with pytest.raises(PlanRevisionError, match=message) as refusal:
+        stock_cut_boxes(derived, artifact, 1)
+    assert refusal.value.code == "invalid_artifact"
+
+
+def test_a_machine_whose_tare_is_not_a_measure_cannot_be_stocked():
+    request = machine_request()
+    result = pack_from_dict(request)
+    artifact = build_operational_artifact(request, result)
+    derived = apply_events(request, [lock_in(result, "machine", 1, 1)])
+    derived["containers"][0]["tare_weight"] = "heavy"
+    from packvium.revisions import stock_cut_boxes
+    with pytest.raises(PlanRevisionError, match="tare_weight is not a measure") as refusal:
+        stock_cut_boxes(derived, artifact, 1)
+    assert refusal.value.code == "invalid_revision"
+
+
+def test_an_audit_reports_a_stocking_that_no_longer_applies():
+    request = machine_request()
+    result = pack_from_dict(request)
+    artifact = build_operational_artifact(request, result)
+    root = root_revision(request)
+    one = derive_revision(root, artifact, [lock_in(result, "machine", 1, 1)])
+    broken = copy.deepcopy(artifact)
+    broken["work_order"] = {}
+    codes = [issue.code for issue in verify_revision_chain([root, one], [None, broken])]
+    assert "request_mismatch" in codes

@@ -14,7 +14,10 @@ way under whatever is stacked on it.
 packed a hull as its bounding box would return a plan that validates and does not
 physically fit, so the value must be asked for.
 
-Both are written here through `pack_from_dict`, the request contract the four engines
+The last section is a container rather than an item: a bag whose sides fold out
+(`gusseted_bag`) holds a thicker load than a flat one of the same width.
+
+All of it is written here through `pack_from_dict`, the request contract the four engines
 share. That is deliberate: the shape fields are part of the JSON contract, so the same
 request runs unchanged against the Python, PHP, Rust and JavaScript engines.
 """
@@ -23,7 +26,7 @@ request runs unchanged against the Python, PHP, Rust and JavaScript engines.
 # package supports 3.9, so the annotation is deferred rather than evaluated.
 from __future__ import annotations
 
-from packvium import pack_from_dict
+from packvium import Rotation, pack_from_dict
 
 
 def summarise(label: str, request: dict) -> None:
@@ -149,3 +152,62 @@ load("brick 102 kg", 102)
 # exactly -- a hull on a route, a hull under a configured clearance, a compressible item
 # with `nesting_height`. A wrong answer that validates is worse than a refusal that does
 # not, which is the whole reason these are opt-in.
+
+
+# ------------------------------------------------------- 24 rotations for a hull
+#
+# The two wedges above are mirror images of each other, so the six rotations a box knows
+# -- each one a permutation of the axes -- can turn the lower wedge into the upper one.
+# Two *copies of the same wedge* are a different problem: the second copy must be turned
+# half a revolution about the vertical axis to meet the first along the diagonal, and that
+# is a signed rotation, `-L-W+H`, which no permutation of the axes reaches.
+#
+# A `convex_hull` item may list all 24 proper rotations of a cube. The six legacy codes keep
+# their names and stay the default list, so a request that names no signed code is answered
+# exactly as before; a signed code on anything but a hull is refused.
+
+def two_copies(rotations: list[str] | None) -> dict:
+    item = wedge("wedge", LOWER_WEDGE)
+    item["quantity"] = 2
+    if rotations is not None:
+        item["allowed_rotations"] = rotations
+    return {**MM, "items": [item], "containers": crate("100", "100", "100")}
+
+
+def orientations(request: dict) -> str:
+    result = pack_from_dict({**request, **SAFETY_FUSE})
+    return ", ".join(placement["orientation"]
+                     for container in result["containers"]
+                     for placement in container["placements"])
+
+
+EVERY_ROTATION = [rotation.value for rotation in Rotation.every()]
+
+print("\nconvex_hull -- two copies of one wedge")
+summarise("six rotations", two_copies(None))
+summarise("all 24 rotations", two_copies(EVERY_ROTATION))
+print(f"  {'orientations used':22s} {orientations(two_copies(EVERY_ROTATION))}")
+
+
+# ---------------------------------------------------------------- gusseted bags
+#
+# A flat bag (`deformable_boundary.kind: flat_bag`) is a pouch with no sides: whatever
+# goes in pushes its two faces apart, and the bag's width pays for that thickness. Its
+# rule is `b + c <= W` -- the load's width plus its thickness within the bag's flat width.
+# A gusseted bag folds extra material into its sides, `side_gusset_depth` of it, so the same
+# rule reads `b + c <= W + G`. Everything else about the bag is the flat bag's.
+#
+# The books are 100 mm wide and 20 mm thick, and the pouch is 150 mm wide. Flat, it holds
+# 50 mm of thickness, so two books; a 25 mm gusset lets it hold 75 mm, so three.
+
+def pouch(boundary: dict) -> dict:
+    return {**MM,
+            "items": [{"id": "book", "quantity": 4, "weight": "300 g", "allowed_rotations": ["LWH"],
+                       "dimensions": {"length": "200", "width": "100", "height": "20"}}],
+            "containers": [{"id": "pouch", "quantity": 1, "deformable_boundary": boundary,
+                            "inner_dimensions": {"length": "300", "width": "150", "height": "100"}}]}
+
+
+print("\ndeformable_boundary -- one pouch, flat and gusseted")
+summarise("flat_bag", pouch({"kind": "flat_bag"}))
+summarise("gusseted_bag, 25 mm", pouch({"kind": "gusseted_bag", "side_gusset_depth": "25"}))

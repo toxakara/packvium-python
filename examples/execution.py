@@ -148,8 +148,8 @@ print()
 print("  It does not follow that four engines packing the same *request* agree. Python")
 print("  and PHP are held to identical placements and do produce this exact form; Rust")
 print("  and JavaScript are held to a valid answer at or above the objective floor, and")
-print("  `examples/execution.mjs` prints 1280 bytes here rather than 1877 for that")
-print("  reason. Whose packing is better is a question the plan never answers.")
+print("  `examples/execution.mjs` prints another byte count here for that reason.")
+print("  Whose packing is better is a question the plan never answers.")
 print()
 
 
@@ -161,9 +161,11 @@ print()
 locks = locks_from_plan(plan, container_index=0, item_types=["printer"])
 lock = locks[0]
 print(f"  locked: {lock.item_type} {lock.orientation} at {lock.position_ticks}")
+print(f"  by id:  {lock.placement_id}")
 print("  The lock is read out of the plan's own placement reference. That is the only")
 print("  reason the two can be trusted to mean the same box: there is no second address")
-print("  format to drift.")
+print("  format to drift. It is checked by `placement_id` alone, so a re-solve that opens")
+print("  the same containers in another order still finds it.")
 print()
 
 resolved = resolve_with_locks(REQUEST, locks)

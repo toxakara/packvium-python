@@ -14,7 +14,7 @@ key is always `unpacked_count`: no objective will ever leave an item behind to s
 Ratios are parts per million.
 """
 
-from packvium import Container, Dimensions, Item, Packer, PackingConfig
+from packvium import Container, Dimensions, InvalidRequestError, Item, Packer, PackingConfig
 from packvium.models import RateTable, UnratedWeightError
 
 #: An example must not change answer merely because the host was busy. These solves need
@@ -101,6 +101,21 @@ try:
 except UnratedWeightError as refusal:
     print("landed_cost*     ", "refused:", refusal)
 
+# A price means nothing without its currency, so a rate card may say which one it is in,
+# and the request must then say the same: the result echoes it as `currency`. The engine
+# never converts and never ranks by it -- it refuses a card priced in another currency
+# rather than add euros to dollars.
+in_euros = Container.create(
+    "roomy", Dimensions.mm("400", "400", "400"), max_payload="20 kg",
+    rate_table=RateTable(weight_brackets_g=(6_000, 20_000), prices_minor=(900, 1_500), currency="EUR"),
+)
+quoted = Packer(by_money).pack(WIDGETS, [in_euros], currency="EUR")
+print("landed_cost EUR  ", quoted.score[1], quoted.currency)
+try:
+    Packer(by_money).pack(WIDGETS, [in_euros], currency="USD")
+except InvalidRequestError as refusal:
+    print("landed_cost USD  ", "refused:", refusal.reason, refusal.field)
+
 # ---------------------------------------------------------------------------------
 # `open_dimension_height` -- pack into the shortest stack. For a container with no lid,
 # or a pallet whose height you are trying to keep under a doorway.
@@ -109,8 +124,8 @@ print("open_dimension   ", solve(PackingConfig(objective="open_dimension_height"
 
 # ---------------------------------------------------------------------------------
 # `maximum_value` -- when not everything fits, leave the *cheap* things behind. Ranked by
-# value forgone, after unpacked count. Note the honest limitation: this orders by value,
-# it does not solve the knapsack problem to optimality.
+# value forgone, after unpacked count. The search orders by value; it does not solve the
+# knapsack problem, so the result says how far from the best it might be (below).
 # ---------------------------------------------------------------------------------
 # `quantity=1` is what makes this a choice at all: with an unlimited supply of boxes the
 # packer simply opens a second one and nothing is left behind.
@@ -123,3 +138,11 @@ result = Packer(PackingConfig(objective="maximum_value", time_limit_ms=SAFETY_FU
 kept = sorted(p.instance.item.id for c in result.containers for p in c.placements)
 left = sorted(u.instance.item.id for u in result.unpacked)
 print("maximum_value    ", "packed:", kept, "left behind:", left)
+
+# Every objective above except the two weight-priced ones states a lower bound on its score:
+# no packing that obeys the request can score below it. Here the bound equals the score, so
+# no packing could leave less value behind. The status stays `best_found` rather than
+# `optimal` only because two items were left out; a result short of its bound carries the
+# gap instead (`gap_key`, `absolute_gap`, `relative_gap`).
+print("maximum_value    ", result.optimality.code, "bound:", result.optimality.to_dict()["lower_bound"],
+      "score:", list(result.score))

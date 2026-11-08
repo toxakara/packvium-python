@@ -9,6 +9,11 @@ comparisons, so every check here is `O(1)` and needs no wider type than a coordi
 
 The extents only grow as boxes are added, so a verdict reached for a candidate never flips
 when more items follow, and any subset of an admitted set is admitted.
+
+A `gusseted_bag` (1.10) has side gussets of depth `G` folded into each long edge: the tube
+round the package's `y-z` section is `2(W + G)` long instead of `2W`, so the width sum becomes
+`b + c <= W + G`. The length sum is unchanged (no bottom gusset in 1.10), and `G = 0` is the
+flat bag. Every function here takes the gusset depth in ticks, `0` for a flat bag.
 """
 
 from __future__ import annotations
@@ -19,18 +24,19 @@ from .geometry import Dimensions
 from .units import Length
 
 FLAT_BAG = "flat_bag"
-DEFORMABLE_BOUNDARY_KINDS = (FLAT_BAG,)
+GUSSETED_BAG = "gusseted_bag"
+DEFORMABLE_BOUNDARY_KINDS = (FLAT_BAG, GUSSETED_BAG)
 
 Extent = tuple[int, int, int]
 
 
-def girth_admits(inner: Dimensions, a: int, b: int, c: int) -> bool:
+def girth_admits(inner: Dimensions, a: int, b: int, c: int, gusset: int = 0) -> bool:
     """Whether a package of extents `(a, b, c)` passes both girth inequalities.
 
     The rigid boundary (`a <= L`, `b <= W`, `c <= H`) is the caller's own check and stays
     where it already is; only the two sums are new.
     """
-    return a + c <= inner.length.ticks and b + c <= inner.width.ticks
+    return a + c <= inner.length.ticks and b + c <= inner.width.ticks + gusset
 
 
 def grown_extent(extent: Extent, x2: int, y2: int, z2: int) -> Extent:
@@ -46,10 +52,10 @@ def extent_of(boxes: Iterable[tuple[int, int, int]]) -> Extent:
     return extent
 
 
-def fits_alone(inner: Dimensions, dimensions: Dimensions) -> bool:
-    """Whether one box of these dimensions, alone at the origin, fits a flat bag."""
+def fits_alone(inner: Dimensions, dimensions: Dimensions, gusset: int = 0) -> bool:
+    """Whether one box of these dimensions, alone at the origin, fits a bag."""
     a, b, c = dimensions.length.ticks, dimensions.width.ticks, dimensions.height.ticks
-    return dimensions.fits_inside(inner) and girth_admits(inner, a, b, c)
+    return dimensions.fits_inside(inner) and girth_admits(inner, a, b, c, gusset)
 
 
 def as_dimensions(extent: Extent) -> Dimensions:

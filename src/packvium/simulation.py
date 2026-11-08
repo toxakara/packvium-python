@@ -26,6 +26,17 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .pareto import CandidateResult, ProfileReport, generate_report
 
+__all__ = [
+    "MismatchedOrderCorpusError",
+    "OrderEvaluator",
+    "OrderRunResult",
+    "ScenarioError",
+    "ScenarioResult",
+    "ScenarioVersionPin",
+    "compare_scenarios",
+    "run_scenario",
+]
+
 
 class ScenarioError(Exception):
     """Base class for every scenario-domain error raised by this module."""

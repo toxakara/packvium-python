@@ -5,14 +5,18 @@ from dataclasses import field
 from ._compat import dataclass
 from typing import Any, Iterable, Mapping
 
+from ._canonical_json import canonical_identifier
 from .centre_of_mass import centre_of_mass_offset_ppm
 from . import compression, hull
-from .flat_bag import DEFORMABLE_BOUNDARY_KINDS, as_dimensions, extent_of
+from .flat_bag import DEFORMABLE_BOUNDARY_KINDS, GUSSETED_BAG, as_dimensions, extent_of
+from .pallet_overhang import Deck, OverhangLimit
+from .pallet_overhang import achieved_dimensions as pallet_achieved, billed_dimensions as pallet_billed
 from .geometry import (ALL_DIRECTIONS, AxisAlignedBox, Dimensions, InvalidDirectionError,
                        Point, Rotation, ShapeType)
 from .lattice_summary import LatticeSummary
 from .made_to_measure import MadeToMeasure, as_triple
 from .nesting import used_volume as nesting_used_volume
+from .orientations import SIGNED_CODE_NEEDS_A_HULL
 from .units import Length, Weight
 from ._request_error import refused, refused_type
 
@@ -149,7 +153,10 @@ class Item:
             raise refused("not_allowed", f"ground_contact_rule must be one of {sorted(GROUND_CONTACT_RULES)}")
         self._validate_shape()
         _require_booleans(self, ("keep_upright", "stackable", "must_be_on_floor"))
-        rotations = tuple(r for r in self.allowed_rotations if not self.keep_upright or r in Rotation.upright())
+        requested = tuple(Rotation(r) for r in self.allowed_rotations)
+        if self.shape_type is not ShapeType.CONVEX_HULL and any(r.is_signed for r in requested):
+            raise refused("invalid_value", SIGNED_CODE_NEEDS_A_HULL)
+        rotations = tuple(r for r in requested if not self.keep_upright or r.is_upright)
         if not rotations: raise refused("invalid_value", "at least one rotation must be allowed")
         object.__setattr__(self, "allowed_rotations", rotations)
         object.__setattr__(self, "tags", frozenset(self.tags))
@@ -264,6 +271,9 @@ class RateTable:
     prices_minor: tuple[int, ...]
     minimum_charge_minor: int = 0
     fuel_surcharge_permille: int = 0
+    #: The ISO 4217 code the prices are in, or `None` for the request's own (1.10). Checked
+    #: where the table sits in a request, against the request's currency, by `Packer.pack`.
+    currency: str | None = None
 
     def __post_init__(self) -> None:
         if not self.weight_brackets_g:
@@ -363,10 +373,21 @@ class Container:
     # Cut to measure by an on-demand box machine whose largest box is `inner_dimensions`
     # (`made_to_measure.py`). A packed result carries the fabricated box instead.
     made_to_measure: MadeToMeasure | None = None
+    # How far a load may pass this deck's edges (`pallet_overhang.py`).
+    pallet_overhang_limit: OverhangLimit | None = None
+    # The deck inside a solving frame. Set only by `solving_frame`, which widens
+    # `inner_dimensions` to the frame and drops the limit, so a frame is never widened twice.
+    deck: Deck | None = None
+    # A `"gusseted_bag"`'s side gusset depth G: its width girth is W + G (1.10, `flat_bag.py`).
+    # Required for that kind and refused for every other container. Last, as above.
+    side_gusset_depth: Length | None = None
 
     def __post_init__(self) -> None:
         if not self.id: raise refused("invalid_value", "container id is required")
         if self.deformable_boundary is not None: self._require_bag_fields()
+        elif self.side_gusset_depth is not None:
+            raise refused("not_allowed", "side_gusset_depth requires deformable_boundary gusseted_bag")
+        if self.pallet_overhang_limit is not None: self._require_pallet_fields()
         if self.made_to_measure is not None: self.made_to_measure.admits(as_triple(self.inner_dimensions))
         if self.quantity is not None and self.quantity <= 0: raise refused("below_minimum", "container quantity must be positive")
         if self.cost_minor < 0: raise refused("below_minimum", "container cost cannot be negative")
@@ -387,7 +408,7 @@ class Container:
                 raise InvalidDirectionError(direction)
         object.__setattr__(self, "access_directions",
                            tuple(d for d in ALL_DIRECTIONS if d in set(self.access_directions)))
-        if self.outer_dimensions and not self.inner_dimensions.fits_inside(self.outer_dimensions): raise refused("invalid_value", "outer dimensions cannot be smaller than inner dimensions")
+        if self.outer_dimensions and not self.declared_inner.fits_inside(self.outer_dimensions): raise refused("invalid_value", "outer dimensions cannot be smaller than inner dimensions")
         boundary = AxisAlignedBox(Point(0, 0, 0), self.inner_dimensions)
         for obstacle in self.obstacles:
             if not all(boundary.contains(box) for box in obstacle.boxes):
@@ -402,14 +423,54 @@ class Container:
         contents. The JSON path names the same fields as request errors first."""
         if self.deformable_boundary not in DEFORMABLE_BOUNDARY_KINDS:
             raise refused("not_allowed", f"unknown deformable_boundary kind {self.deformable_boundary!r}")
+        self._require_gusset_rule()
         fields = [name for name, present in (
             ("obstacles", bool(self.obstacles)), ("axles", self.axles is not None),
             ("access_directions", bool(self.access_directions)),
             ("max_stack_density", self.max_stack_density is not None),
             ("outer_dimensions", self.outer_dimensions is not None),
-            ("void_fill_reserve_ratio", self.void_fill_reserve_ratio > 0)) if present]
+            ("void_fill_reserve_ratio", self.void_fill_reserve_ratio > 0),
+            ("pallet_overhang_limit", self.pallet_overhang_limit is not None)) if present]
         if fields:
             raise refused("not_allowed", f"{fields[0]} cannot be combined with deformable_boundary")
+
+    def _require_gusset_rule(self) -> None:
+        """A gusseted bag's side gusset is required, positive and no deeper than the bag is
+        wide: a deeper fold would have no flat sheet left to fold from. A flat bag takes
+        none. O(1)."""
+        gusseted = self.deformable_boundary == GUSSETED_BAG
+        if self.side_gusset_depth is None:
+            if gusseted: raise refused("missing_field", "a gusseted_bag requires side_gusset_depth")
+            return
+        if not gusseted:
+            raise refused("not_allowed", "side_gusset_depth requires deformable_boundary gusseted_bag")
+        depth = self.side_gusset_depth.ticks
+        if depth <= 0: raise refused("invalid_value", "side_gusset_depth must be positive")
+        if depth > self.inner_dimensions.width.ticks:
+            raise refused("invalid_value", "side_gusset_depth exceeds inner_dimensions width")
+
+    @property
+    def side_gusset_ticks(self) -> int:
+        """The gusset depth G in ticks; 0 for a flat bag and every rigid container."""
+        return 0 if self.side_gusset_depth is None else self.side_gusset_depth.ticks
+
+    def _require_pallet_fields(self) -> None:
+        """The fields a pallet with an overhang limit refuses: each reads the declared frame
+        or a wall the widened frame moves (docs/PALLET-AND-ROBOT-RULES.md ""). The JSON
+        path refuses the same combinations as `unsupported_feature` first."""
+        fields = [name for name, present in (
+            ("obstacles", bool(self.obstacles)), ("axles", self.axles is not None),
+            ("access_directions", bool(self.access_directions)),
+            ("void_fill_reserve_ratio", self.void_fill_reserve_ratio > 0),
+            ("made_to_measure", self.made_to_measure is not None)) if present]
+        if fields:
+            raise refused("not_allowed", f"{fields[0]} cannot be combined with pallet_overhang_limit")
+
+    @property
+    def declared_inner(self) -> Dimensions:
+        """The inner size the caller declared: a solving frame's deck, else `inner_dimensions`."""
+        if self.deck is None: return self.inner_dimensions
+        return Dimensions(Length(self.deck.length), Length(self.deck.width), self.inner_dimensions.height)
 
     @property
     def is_flat_bag(self) -> bool:
@@ -542,6 +603,17 @@ def _box_shape(box: AxisAlignedBox) -> "hull.HullShape":
                               box.dimensions.height.ticks)
 
 
+def placement_id(container_id: str, position: Point, item_type: str, orientation: str) -> str:
+    """A placement's cross-language id (1.10): the RFC 8785 canonical JSON text of
+    `[container id, x, y, z, item type, orientation]`, with the physical position in ticks as
+    integers. Two valid placements never share that tuple -- the same solid in the same place
+    would coincide -- and canonical JSON spells any id with no grammar of its own to escape.
+    A position is below its container's side, itself at most 2^53 - 1 ticks, so every integer
+    has a canonical spelling. A pure function of the placement, so a validator recomputes it.
+    O(length of the ids)."""
+    return canonical_identifier([container_id, position.x, position.y, position.z, item_type, orientation])
+
+
 @dataclass(frozen=True, slots=True)
 class PackedContainer:
     container: Container
@@ -600,14 +672,20 @@ class PackedContainer:
     def achieved_dimensions(self) -> Dimensions | None:
         """The largest envelope x2, y2 and z2 of its placements from its origin: a flat bag's
         conformed package, or a made-to-measure box's extent before it is rounded
-        onto the machine grid. None for any other container. O(p)."""
+        onto the machine grid; a pallet's deck grown by the overhang it used, at its
+        load's height. None for any other container. O(p)."""
+        if self.container.deck is not None:
+            return pallet_achieved(self.container.deck, (p.envelope_box for p in self.placements))
         if not (self.container.is_flat_bag or self.container.made_to_measure is not None): return None
         return as_dimensions(extent_of((box.x2, box.y2, box.z2)
                                        for box in (p.envelope_box for p in self.placements)))
 
     @property
     def billed_dimensions(self) -> Dimensions:
-        """What a carrier measures: a bag's achieved package, else the declared outer size."""
+        """What a carrier measures: a bag's achieved package, a pallet's footprint grown by its
+        overhang, else the declared outer size."""
+        if self.container.deck is not None:
+            return pallet_billed(self.container, self.container.deck, (p.envelope_box for p in self.placements))
         achieved = self.achieved_dimensions
         if achieved is not None and self.container.is_flat_bag: return achieved
         return self.container.outer_dimensions or self.container.inner_dimensions
@@ -681,6 +759,9 @@ class FixedPlacement:
     position: Point
     rotation: Rotation
     container_instance: int = 1
+    #: Optional restatement of the placement's id, as a result reports it; when given it must
+    #: equal `derived_placement_id` (1.10).
+    placement_id: str | None = None
     # Every rule on these fields is checked where the placement sits in a request, by
     # `Packer.pack` (`request_objects.check_objects`), with the JSON path's refusal and pointer.
 
@@ -688,12 +769,18 @@ class FixedPlacement:
     def packed_container_id(self) -> str:
         return f"{self.container_id}#{self.container_instance}"
 
+    @property
+    def derived_placement_id(self) -> str:
+        return placement_id(self.packed_container_id, self.position, self.item_id, self.rotation.value)
+
 
 @dataclass(frozen=True, slots=True)
 class PackingRequest:
     items: tuple[Item, ...]
     containers: tuple[Container, ...]
     fixed_placements: tuple[FixedPlacement, ...] = ()
+    #: Declared by the caller and echoed by the result; never priced, converted or ranked by.
+    currency: str | None = None
 
     def __post_init__(self) -> None:
         if not self.items: raise refused("invalid_value", "at least one item is required")

@@ -28,6 +28,17 @@ from .commerce.policy import (
 )
 from .simulation import MismatchedOrderCorpusError, ScenarioResult, compare_scenarios
 
+__all__ = [
+    "ApprovalRecord",
+    "ExpectedDelta",
+    "Recommendation",
+    "RecommendationError",
+    "approve",
+    "approve_catalog",
+    "approve_policy",
+    "propose_recommendation",
+]
+
 
 class RecommendationError(Exception):
     """Base class for every recommendation-domain error raised by this module."""

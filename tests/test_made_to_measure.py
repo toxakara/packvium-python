@@ -16,10 +16,11 @@ from packvium.made_to_measure import (MAX_EXACT_INTEGER, SQUARE_METRE_TICKS2, bo
                                       fabricate, icbrt_ceil, instance_edges, per_square_metre,
                                       solving_envelopes)
 from packvium import bounds
-from packvium.models import PackedContainer, PackingRequest, Placement
+from packvium.models import ItemInstance, PackedContainer, PackingRequest, Placement
 from packvium.solvers import (ContainerState, Deadline, ExtremePointSolver, SearchStats,
                               SingleContainerSolution, SolverOrchestrator, TimeLimitReached)
-from packvium.units import Length
+from packvium.result_validation import validate
+from packvium.units import Length, Weight
 from packvium.validation import IndependentSolutionValidator
 
 MM = Length.TICKS_PER_MM
@@ -296,7 +297,6 @@ def test_a_load_larger_than_the_machine_opens_a_second_compact_box():
 @pytest.mark.parametrize("fields, name", [
     ({"axles": [{"position": "0"}, {"position": "1510"}]}, "container.made_to_measure+axles"),
     ({"obstacles": [{"id": "post", "dimensions": mm(10, 10, 10)}]}, "container.made_to_measure+obstacles"),
-    ({"void_fill_reserve_ratio": 0.5}, "container.made_to_measure+void_fill_reserve_ratio"),
 ])
 def test_a_field_that_reads_the_declared_frame_is_refused(fields, name):
     with pytest.raises(UnsupportedFeatureError, match=name.replace("+", r"\+")):
@@ -394,3 +394,63 @@ def test_the_engine_validator_recuts_the_box_from_the_declared_machine():
     codes = [issue.code for issue in
              validator.validate(request_, (PackedContainer(stale, 1, (placement,)),)).issues]
     assert codes == ["made_to_measure_cost_mismatch"]
+
+
+# ------------------------------------------------------------------------------ void-fill reserve
+
+
+def _cut(result: dict) -> tuple[int, ...]:
+    sides = result["containers"][0]["inner_dimensions"]
+    return tuple(sides[side]["ticks"] // MM for side in ("length", "width", "height"))
+
+
+def test_a_reserve_the_tight_box_keeps_leaves_the_box_tight():
+    result = pack_from_dict(request(void_fill_reserve_ratio=0.1))
+    assert _cut(result) == (210, 210, 210)
+
+
+def test_a_reserve_the_tight_box_breaks_cuts_the_rung_the_trial_solved_in():
+    data = request(void_fill_reserve_ratio=0.5)
+    result = pack_from_dict(data)
+    assert result["status"] == "feasible"
+    assert _cut(result) == (260, 260, 260)
+    assert validate(data, result) == []
+
+
+def test_the_validator_admits_a_larger_box_only_when_the_tight_one_breaks_the_reserve():
+    loose = request(void_fill_reserve_ratio=0.5)
+    result = pack_from_dict(loose)
+    tight = request(void_fill_reserve_ratio=0.1)
+    assert "fabricated_dimensions_mismatch" in [issue.code for issue in validate(tight, result)]
+
+
+def test_a_cut_off_the_machine_grid_is_refused_even_under_a_reserve():
+    data = request(void_fill_reserve_ratio=0.5)
+    forged = copy.deepcopy(pack_from_dict(data))
+    forged["containers"][0]["inner_dimensions"]["length"]["ticks"] += MM
+    assert "fabricated_dimensions_mismatch" in [issue.code for issue in validate(data, forged)]
+
+
+def test_the_internal_validator_admits_a_reserve_cut_only_on_the_grid_and_with_a_reserve():
+    from packvium import validation
+    from packvium.made_to_measure import fabricate
+    declared = Container("machine", Dimensions.mm(1510, 1510, 1510), made_to_measure=machine(),
+                         void_fill_reserve_ratio=0.5)
+    cube = Item("cube", Dimensions.mm(100, 100, 100), Weight(1))
+    placement = Placement(ItemInstance(cube, 0), Point(0, 0, 0), Rotation.LWH, cube.dimensions,
+                          Point(0, 0, 0), cube.dimensions)
+    tight = fabricate(declared, ticks(100, 100, 100))
+    maximum = ticks(1510, 1510, 1510)
+    on_grid = PackedContainer(fabricate(declared, ticks(160, 160, 160)), 1, (placement,))
+    off_grid = PackedContainer(replace(declared, inner_dimensions=Dimensions.mm(161, 161, 161),
+                                       made_to_measure=None), 1, (placement,))
+    assert validation._reserve_cut(on_grid, tight, maximum)
+    assert not validation._reserve_cut(off_grid, tight, maximum)
+    assert not validation._reserve_cut(on_grid, replace(tight, void_fill_reserve_ratio=0.0), maximum)
+
+
+def test_a_reported_side_that_is_not_an_integer_is_no_reserve_cut():
+    data = request(void_fill_reserve_ratio=0.5)
+    forged = copy.deepcopy(pack_from_dict(data))
+    forged["containers"][0]["inner_dimensions"]["length"]["ticks"] = "4160000"
+    assert "fabricated_dimensions_mismatch" in [issue.code for issue in validate(data, forged)]

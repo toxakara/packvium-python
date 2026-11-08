@@ -4,6 +4,53 @@ What changed in `packvium` on PyPI, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0]
+
+New request fields, a bound under three more objectives, and the intelligence modules join the
+frozen API. One stricter refusal: a `units` key other than `length` (see *Changed*).
+
+### Added
+
+- **`container.pallet_overhang_limit`** (`OverhangLimit`): a load may pass the deck by the
+  stated length at each end and width at each side. Only the deck bears weight, and the packed
+  pallet reports `achieved_dimensions`.
+- **Gusseted bags:** `deformable_boundary.kind: "gusseted_bag"` with `side_gusset_depth`;
+  `Container` gains `side_gusset_depth` and `side_gusset_ticks`.
+- **24 rotations for a `convex_hull` item:** 18 signed codes such as `-L-W+H` beside the six;
+  `Rotation.every()`, `is_signed`, `is_upright`. `Rotation.all()` and `upright()` are unchanged.
+- **`placement_id` on every placement**, which `fixed_placements`, revision events,
+  `FixedPlacement` and `PlacementLock` may quote; `validate` checks it.
+- **`currency`** on the request and `rate_table`, echoed on the result; `PackingRequest`,
+  `Packer.pack` and `RateTable` take it.
+- **`optimality.lower_bound` under `maximum_value`, `open_dimension_height` and
+  `maximum_volume`**, checked by `validate`.
+- **`NestedPacker(level_beam_width=K)`** carries the K best carton sets up a level and lets the
+  outermost level's score choose; 1 (the default) is the greedy chain, answer for answer.
+- **A made-to-measure box may keep a `void_fill_reserve_ratio`.**
+- **`packvium.revisions.stock_cut_boxes`.**
+
+### Changed
+
+- **`units` refuses every key but `length`**: `invalid_request` / `not_allowed` at
+  `/units/<key>`. 1.9 read a bare weight as grams whatever `units.weight` said.
+- **`derive_revision` stocks a box already cut to measure** that holds a locked or verified
+  placement, as `<type>@<revision>#<instance>`; `verify_revision_chain` then needs that
+  revision's artifact and reports `artifact_required` without it.
+- **`packvium.simulation`, `recommendations`, `outcomes`, `holdout`, `pareto` and `locks` are
+  signature-frozen**, like the packing API.
+
+### Fixed
+
+- **An explicit rotation list emptied by `keep_upright` is refused at `allowed_rotations`**,
+  with the same named request error the independent validator checks.
+- **Stocking cut boxes indexes artifact lookups once** and reports malformed consumed
+  machine fields as structured `invalid_revision` errors.
+- **`resolve_with_locks` reported a held lock as `missing`** when the re-solve opened the same
+  containers in another order; a lock from `locks_from_plan` is now matched by `placement_id`.
+- **An artifact export refuses an integer past `2^53 - 1`** with `number_out_of_range`
+  rather than printing it.
+- **A compressible item no longer joins a rigid item's grid lattice.**
+
 ## [1.9.0]
 
 No API change, but admission is stricter: some requests 1.8 accepted are now refused (see the

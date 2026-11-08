@@ -171,28 +171,19 @@ class ContactGraph:
         children = list(self._children)
 
         # What the new box rests on: boxes whose top plane is its bottom plane.
-        own_supporters: list[ContactEdge] = []
-        for other_index, area in sorted(
-            (other_index, other.overlap_area_xy(box))
-            for other_index, other in self._near(self._by_top, self._top_indexes, box.origin.z, box)
-        ):
-            if area > 0:
-                own_supporters.append(ContactEdge(other_index, area))
-                children[other_index] = children[other_index] + (index,)
+        own_supporters = self.contacts_below(box)
+        for edge in own_supporters:
+            children[edge.index] = children[edge.index] + (index,)
 
         # What now rests on it: boxes whose bottom plane is its top plane. Their
         # supporter tuples gain the new index, which is larger than every index already
         # in them, so ascending order is preserved by appending.
         own_children: list[int] = []
-        for other_index, area in sorted(
-            (other_index, other.overlap_area_xy(box))
-            for other_index, other in self._near(self._by_bottom, self._bottom_indexes, box.z2, box)
-        ):
-            if area > 0:
-                own_children.append(other_index)
-                supporters[other_index] = supporters[other_index] + (ContactEdge(index, area),)
+        for edge in self.contacts_above(box):
+            own_children.append(edge.index)
+            supporters[edge.index] = supporters[edge.index] + (ContactEdge(index, edge.area),)
 
-        supporters.append(tuple(own_supporters))
+        supporters.append(own_supporters)
         children.append(tuple(own_children))
 
         # The by-plane buckets are carried forward rather than rederived: one box joins
@@ -231,14 +222,67 @@ class ContactGraph:
         graph._bottom_indexes = bottom_indexes
         return graph
 
-    def _near(self, buckets, cache, plane: int, box: AxisAlignedBox):
-        """Every box on `plane` that could overlap `box` in XY, deduped, via the hash."""
-        entries = buckets.get(plane)
+    def contacts_below(self, box: AxisAlignedBox) -> tuple[ContactEdge, ...]:
+        """Direct face supporters of `box` on `box.origin.z`, in ascending index order."""
+        entries = self._by_top.get(box.origin.z)
         if not entries:
             return ()
+        if len(entries) <= 32:
+            bx1, by1, bx2, by2 = box.origin.x, box.origin.y, box.x2, box.y2
+            out: list[ContactEdge] = []
+            for other_index, other in entries:
+                ox1, oy1 = other.origin.x, other.origin.y
+                ox2 = ox1 + other.dimensions.length.ticks
+                oy2 = oy1 + other.dimensions.width.ticks
+                dx = (bx2 if bx2 < ox2 else ox2) - (bx1 if bx1 > ox1 else ox1)
+                if dx <= 0:
+                    continue
+                dy = (by2 if by2 < oy2 else oy2) - (by1 if by1 > oy1 else oy1)
+                if dy > 0:
+                    out.append(ContactEdge(other_index, dx * dy))
+            return tuple(out)
+        matches = [
+            (other_index, area)
+            for other_index, other in self._near(self._by_top, self._top_indexes, box.origin.z, box)
+            if (area := other.overlap_area_xy(box)) > 0
+        ]
+        if len(matches) > 1:
+            matches.sort()
+        return tuple(ContactEdge(other_index, area) for other_index, area in matches)
+
+    def contacts_above(self, box: AxisAlignedBox) -> tuple[ContactEdge, ...]:
+        """Boxes resting directly on `box.z2`, in ascending index order."""
+        entries = self._by_bottom.get(box.z2)
+        if not entries:
+            return ()
+        if len(entries) <= 32:
+            bx1, by1, bx2, by2 = box.origin.x, box.origin.y, box.x2, box.y2
+            out: list[ContactEdge] = []
+            for other_index, other in entries:
+                ox1, oy1 = other.origin.x, other.origin.y
+                ox2 = ox1 + other.dimensions.length.ticks
+                oy2 = oy1 + other.dimensions.width.ticks
+                dx = (bx2 if bx2 < ox2 else ox2) - (bx1 if bx1 > ox1 else ox1)
+                if dx <= 0:
+                    continue
+                dy = (by2 if by2 < oy2 else oy2) - (by1 if by1 > oy1 else oy1)
+                if dy > 0:
+                    out.append(ContactEdge(other_index, dx * dy))
+            return tuple(out)
+        matches = [
+            (other_index, area)
+            for other_index, other in self._near(self._by_bottom, self._bottom_indexes, box.z2, box)
+            if (area := other.overlap_area_xy(box)) > 0
+        ]
+        if len(matches) > 1:
+            matches.sort()
+        return tuple(ContactEdge(other_index, area) for other_index, area in matches)
+
+    def _near(self, buckets, cache, plane: int, box: AxisAlignedBox):
+        """Every box on `plane` that could overlap `box` in XY, deduped, via the hash."""
         level = cache.get(plane)
         if level is None:
-            level = _LevelIndex(entries, self._cell)
+            level = _LevelIndex(buckets[plane], self._cell)
             cache[plane] = level
         return level.near(box)
 

@@ -11,9 +11,10 @@ from .compression import ratio_to_ppm
 from .geometry import AxisAlignedBox, Dimensions, Point, Rotation, ShapeType
 from .models import Axle, Container, FixedPlacement, Item, Obstacle, RateTable
 from .made_to_measure import MadeToMeasure
+from .pallet_overhang import OverhangLimit
 from ._canonical_json import json_integer
 from .extensions import ExtensionRegistry
-from .fixed_placements import require_fixed_placement_shapes
+from .fixed_placements import hull_item_types, require_fixed_placement_shapes
 from ._request_error import ObjectRefusal
 from .request_errors import InvalidRequestError, check_request
 from .packer import Packer
@@ -117,7 +118,7 @@ def _box(raw: dict, unit: str, measures: ParsedMeasures) -> AxisAlignedBox:
     )
 
 
-def _fixed_placements(raw: object, unit: str) -> list[FixedPlacement]:
+def _fixed_placements(raw: object, unit: str, items: object) -> list[FixedPlacement]:
     return [
         FixedPlacement(
             item_id=entry["item_type"],
@@ -125,8 +126,9 @@ def _fixed_placements(raw: object, unit: str) -> list[FixedPlacement]:
             position=Point(*_point_ticks(entry.get("position", {}), unit)),
             rotation=Rotation(entry["orientation"]),
             container_instance=json_integer(entry.get("container_instance", 1)),
+            placement_id=entry.get("placement_id"),
         )
-        for entry in require_fixed_placement_shapes(raw, unit)
+        for entry in require_fixed_placement_shapes(raw, unit, hull_item_types(items))
     ]
 
 
@@ -138,6 +140,7 @@ def _rate_table(raw: dict | None) -> RateTable | None:
         prices_minor=tuple(int(price) for price in raw["prices_minor"]),
         minimum_charge_minor=int(raw.get("minimum_charge_minor", 0)),
         fuel_surcharge_permille=int(raw.get("fuel_surcharge_permille", 0)),
+        currency=raw.get("currency"),
     )
 
 
@@ -164,7 +167,21 @@ def _container(raw: dict, unit: str, measures: Optional[ParsedMeasures] = None) 
         access_directions=tuple(str(d) for d in raw.get("access_directions", ())),
         deformable_boundary=None if raw.get("deformable_boundary") is None else raw["deformable_boundary"]["kind"],
         made_to_measure=_made_to_measure(raw.get("made_to_measure"), unit, measures),
+        pallet_overhang_limit=_pallet_overhang_limit(raw.get("pallet_overhang_limit"), unit, measures),
+        side_gusset_depth=_side_gusset_depth(raw.get("deformable_boundary"), unit, measures),
     )
+
+
+def _side_gusset_depth(raw: dict | None, unit: str, measures: ParsedMeasures) -> Length | None:
+    if raw is None or raw.get("side_gusset_depth") is None:
+        return None
+    return measures.read(Length, raw["side_gusset_depth"], unit)
+
+
+def _pallet_overhang_limit(raw: dict | None, unit: str, measures: ParsedMeasures) -> OverhangLimit | None:
+    if raw is None:
+        return None
+    return OverhangLimit(measures.read(Length, raw["length"], unit), measures.read(Length, raw["width"], unit))
 
 
 def _made_to_measure(raw: dict | None, unit: str, measures: ParsedMeasures) -> MadeToMeasure | None:
@@ -214,12 +231,10 @@ UNSUPPORTED_FIELDS: dict[str, tuple[str, ...]] = {
     # in, when Python gained both the solver behaviour and the independent validation
     # the staged rollout requires. PHP, Rust and the JavaScript fallback still carry them.
     "item": (),
-    # `pallet_overhang_limit` was reserved in the schema by at the 1.1.0 contract
-    # freeze and is refused everywhere until an engine implements it from a request: a field
-    # a caller can set and the solver ignores is worse than a refusal.
     # `access_directions` left this list in, which wired the reserved field through
-    # to `StopAccessibilityConstraint` in all four engines at once.
-    "container": ("pallet_overhang_limit",),
+    # to `StopAccessibilityConstraint` in all four engines at once, and
+    # `pallet_overhang_limit` in, which did the same for the pallet deck.
+    "container": (),
 }
 
 #: `item.shape_type` values this engine does not implement.
@@ -266,6 +281,7 @@ def reject_unsupported(
         if isinstance(entry, dict) and entry.get("shape_type") in shape_types:
             found.add(f"item.shape_type={entry['shape_type']}")
     found.update(made_to_measure_combinations(data))
+    found.update(pallet_overhang_combinations(data))
     if not found:
         return
     raise UnsupportedFeatureError(
@@ -276,7 +292,8 @@ def reject_unsupported(
 
 
 def made_to_measure_combinations(data: Mapping[str, Any]) -> set[str]:
-    """The made-to-measure combinations 1.6 refuses (D10, docs/MADE-TO-MEASURE-CONTAINERS.md).
+    """The made-to-measure combinations still refused (D10, docs/MADE-TO-MEASURE-CONTAINERS.md);
+    `void_fill_reserve_ratio` left the list in.
 
     Each reads a container dimension or position the fabricated box does not keep, so none
     has a defined meaning for a carton cut to measure. Checked on the raw request, before any
@@ -294,15 +311,45 @@ def made_to_measure_combinations(data: Mapping[str, Any]) -> set[str]:
         obstacles = entry.get("obstacles")
         if isinstance(obstacles, list) and obstacles:
             found.add("container.made_to_measure+obstacles")
-        reserve = entry.get("void_fill_reserve_ratio")
-        if isinstance(reserve, (int, float)) and not isinstance(reserve, bool) and reserve > 0:
-            found.add("container.made_to_measure+void_fill_reserve_ratio")
     fixed = data.get("fixed_placements")
     if measured and isinstance(fixed, list) and any(
             isinstance(entry, Mapping) and isinstance(entry.get("container_type"), str)
             and entry["container_type"] in measured
             for entry in fixed):
         found.add("fixed_placements+container.made_to_measure")
+    return found
+
+
+def pallet_overhang_combinations(data: Mapping[str, Any]) -> set[str]:
+    """The combinations a pallet with an overhang limit refuses.
+
+    Obstacles and axles are positioned in the declared frame the widened frame moves; doors
+    and route corridors would need a wall the overhang crosses; a reserve is a share of a
+    volume the limit leaves undefined; a made-to-measure box has no deck. A flat bag is
+    refused beside it as a request error instead, with every other wall-anchored field.
+    Checked on the raw request like every other unsupported feature. O(items + containers).
+    """
+    found: set[str] = set()
+    pallets = False
+    for entry in data.get("containers") or ():
+        if not isinstance(entry, Mapping) or entry.get("pallet_overhang_limit") is None:
+            continue
+        pallets = True
+        directions = entry.get("access_directions")
+        obstacles = entry.get("obstacles")
+        reserve = entry.get("void_fill_reserve_ratio")
+        for name, present in (
+                ("access_directions", isinstance(directions, list) and bool(directions)),
+                ("axles", entry.get("axles") is not None),
+                ("made_to_measure", entry.get("made_to_measure") is not None),
+                ("obstacles", isinstance(obstacles, list) and bool(obstacles)),
+                ("void_fill_reserve_ratio", isinstance(reserve, (int, float))
+                 and not isinstance(reserve, bool) and reserve > 0)):
+            if present:
+                found.add(f"container.pallet_overhang_limit+{name}")
+    if pallets and any(isinstance(item, Mapping) and item.get("stop_index") is not None
+                       for item in data.get("items") or ()):
+        found.add("container.pallet_overhang_limit+item.stop_index")
     return found
 
 
@@ -322,8 +369,9 @@ def pack_from_dict(data: dict, *,
         extensions = _extensions(data, extensions)
         items = [_item(i, unit, measures) for i in data["items"]]
         containers = [_container(c, unit, measures) for c in data["containers"]]
-        fixed = _fixed_placements(data.get("fixed_placements"), unit)
-    result = Packer(config, extensions)._pack_checked(tuple(items), tuple(containers), tuple(fixed))
+        fixed = _fixed_placements(data.get("fixed_placements"), unit, data["items"])
+    result = Packer(config, extensions)._pack_checked(tuple(items), tuple(containers), tuple(fixed),
+                                                      data.get("currency"))
     result = replace(result, catalog_versions_used=references)
     output = data.get("output", {})
     return result.to_dict(output.get("length_unit", output_length_unit(unit)), output.get("weight_unit", "g"))

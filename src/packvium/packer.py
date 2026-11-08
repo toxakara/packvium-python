@@ -9,6 +9,7 @@ from .extensions import (ExtensionRegistry, SolutionScorer, UnknownObjectiveErro
                          resolve_objective_scorer, unpriceable_container)
 from .fixed_placements import admit_fixed_placements
 from .models import Container, Item, PackingRequest, UnratedWeightError
+from .pallet_overhang import solving_frame
 from .request_objects import check_objects
 from .result import AlgorithmReport, PackingResult, PackingStatus, ResultFact
 from .result import aggregate_termination, derive_result_facts, unsupported_placements_warning
@@ -45,18 +46,22 @@ class Packer:
             return None
         return bounds.for_request(request.instances, request.containers, self.config.objective)
 
-    def pack(self, items, containers, fixed_placements=()) -> PackingResult:
+    def pack(self, items, containers, fixed_placements=(), currency: str | None = None) -> PackingResult:
         items, containers, fixed_placements = tuple(items), tuple(containers), tuple(fixed_placements)
         # The JSON path's rules, with the JSON path's reason and field: a request
         # built from objects is refused exactly where the same request as JSON would be.
-        check_objects(items, containers, self.config, fixed_placements)
-        return self._pack_checked(items, containers, fixed_placements)
+        check_objects(items, containers, self.config, fixed_placements, currency)
+        return self._pack_checked(items, containers, fixed_placements, currency)
 
-    def _pack_checked(self, items: tuple, containers: tuple, fixed_placements: tuple) -> PackingResult:
+    def _pack_checked(self, items: tuple, containers: tuple, fixed_placements: tuple,
+                      currency: str | None = None) -> PackingResult:
         """`pack` once the request's rules have passed. `pack_from_dict` calls it directly:
         `check_request` has walked that request already, and `check_objects` refuses only what
         those rules refuse, so a second walk could never fire there."""
-        request = PackingRequest(items, containers, fixed_placements)
+        # A pallet with an overhang limit is packed as its widened frame from here on, so no
+        # solver, bound or validator needs to know the limit exists.
+        request = PackingRequest(items, tuple(solving_frame(c) for c in containers), fixed_placements,
+                                 currency)
         # Both weight objectives price the same billed weight, so both need the divisor
         # up front -- a wrong guess would silently misprice every shipment. And rating
         # some containers while others carry no tariff would rank a priced packing
@@ -181,12 +186,13 @@ class Packer:
                 termination=termination,
                 optimality=optimality,
                 objective=self.config.objective,
+                currency=request.currency,
             ))
         if not ranked:
             return PackingResult(
                 PackingStatus.INFEASIBLE, (), (),
                 AlgorithmReport(self.config.profile.value, "none", deadline.elapsed_ms, self.config.seed),
-                (0,), objective=self.config.objective,
+                (0,), objective=self.config.objective, currency=request.currency,
             )
         ranked.sort(key=lambda r: (r.status is PackingStatus.INVALID_RESULT, r.score, r.algorithm.solver))
         valid_ranked = [result for result in ranked if result.status is not PackingStatus.INVALID_RESULT]
@@ -224,6 +230,7 @@ class Packer:
             best.termination,
             best.optimality,
             best.objective,
+            currency=request.currency,
         )
 
 

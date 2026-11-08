@@ -17,6 +17,7 @@ from packvium import (
     Dimensions,
     Item,
     Length,
+    OverhangLimit,
     Packer,
     PackingConfig,
     Rotation,
@@ -207,3 +208,32 @@ compare(
 
 # Every reason code above is a fact about the request, not a solver failure -- which is
 # why `explain_unpacked_item` can turn it into a sentence a customer is allowed to read.
+
+
+# ------------------------------------------------------------ a load past the deck
+#
+# A pallet is not a box: goods may stand a little past its deck edge, and logistics
+# practice allows a stated amount. `pallet_overhang_limit` says how much -- `length` at each
+# end and `width` at each side. The crate below is 50 mm longer and 50 mm wider than the
+# euro pallet's deck, so without a limit it fits nowhere; with 50 mm allowed it overhangs
+# 25 mm all round.
+#
+# Only the deck bears weight, so the crate's `support_ratio` is the share of its base on
+# the deck, and a `minimum_support_ratio` still applies to it. Coordinates are measured from
+# the corner of the overhang zone, so the deck starts at (50, 50) here, and the packed
+# pallet reports `achieved_dimensions` -- the deck grown by the overhang actually used --
+# beside its declared ones. A load the deck holds is never overhung.
+print("\npallet_overhang_limit")
+oversized = [Item.create("crate", Dimensions.mm("1250", "850", "400"), "10 kg")]
+for label, limit in (("no limit", None), ("50 mm each way", OverhangLimit(Length.mm("50"), Length.mm("50")))):
+    pallet = Container.create("euro", Dimensions.mm("1200", "800", "1000"), max_payload="1000 kg",
+                              pallet_overhang_limit=limit)
+    outcome = Packer(PackingConfig.balanced(time_limit_ms=SAFETY_FUSE_MS, minimum_support_ratio=0.75)).pack(
+        oversized, [pallet])
+    print(f"  {label + ':':16s} {len(outcome.containers)} pallet(s), {len(outcome.unpacked)} refused")
+    for packed in outcome.to_dict()["containers"]:
+        achieved = packed["achieved_dimensions"]
+        placement = packed["placements"][0]
+        print(f"      achieved {achieved['length']['value']} x {achieved['width']['value']} mm,"
+              f" crate at ({placement['position']['x']['value']}, {placement['position']['y']['value']}),"
+              f" support_ratio {placement['support_ratio']}")

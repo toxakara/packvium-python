@@ -19,7 +19,10 @@ from ._canonical_json import CanonicalJsonError, canonical_json, json_integer, j
 from ._compat import dataclass
 from .artifacts import FORMAT as ARTIFACT_FORMAT
 from .artifacts import SUITE_VERSION
-from .fixed_placements import require_point_shape
+from .fixed_placements import hull_item_types, require_point_shape
+from .made_to_measure import per_square_metre, surface_area
+from .request_errors import refuse_orientation
+from .units import Length, ParsedMeasures, Weight
 
 __all__ = [
     "FORMAT",
@@ -31,14 +34,13 @@ __all__ = [
     "derive_revision",
     "document_digest",
     "root_revision",
+    "stock_cut_boxes",
     "verify_revision_chain",
 ]
 
 FORMAT = "packvium-plan-revision/v1"
 
 EVENT_TYPES = ("item_missing", "container_substituted", "placement_locked", "placement_verified")
-
-ORIENTATIONS = ("LWH", "LHW", "WLH", "WHL", "HLW", "HWL")
 
 _EVENT_FIELDS = {
     "item_missing": ("item_type", "quantity"),
@@ -47,7 +49,8 @@ _EVENT_FIELDS = {
     "placement_verified": ("placement",),
 }
 
-_PLACEMENT_FIELDS = ("item_type", "container_type", "container_instance", "position", "orientation")
+_PLACEMENT_FIELDS = ("item_type", "container_type", "container_instance", "position", "orientation",
+                     "placement_id")
 
 
 class PlanRevisionError(ValueError):
@@ -108,13 +111,14 @@ def derive_revision(
     if isinstance(events, (str, bytes)) or not isinstance(events, Sequence) or not events:
         raise PlanRevisionError("invalid_event", "a revision records at least one event")
     first = _last_sequence(parent) + 1
-    recorded = [_event(event, first + offset) for offset, event in enumerate(events)]
-    request = apply_events(parent["request"], recorded)
+    hulls = _hull_types(parent["request"])
+    recorded = [_event(event, first + offset, hulls) for offset, event in enumerate(events)]
+    number = json_integer(parent["revision"]) + 1
+    request = stock_cut_boxes(apply_events(parent["request"], recorded), approved_artifact, number)
     approved = {
         "artifact": document_digest(approved_artifact),
         "replay": copy.deepcopy(dict(approved_artifact["provenance"]["replay"])),
     }
-    number = json_integer(parent["revision"]) + 1
     document = _document(number, document_digest(parent), approved, recorded, request)
     canonical_revision_json(document)
     return document
@@ -128,16 +132,184 @@ def apply_events(request: Mapping[str, Any], events: Sequence[Mapping[str, Any]]
     if isinstance(events, (str, bytes, Mapping)) or not isinstance(events, Sequence):
         raise PlanRevisionError("invalid_event", "events are a JSON array")
     derived = copy.deepcopy(dict(request))
+    hulls = _hull_types(request)
     placement_index = _PlacementIndex()
     apply = {**_APPLY, "placement_locked": placement_index.apply,
              "placement_verified": placement_index.apply}
     for event in events:
-        _require_shape(event)
+        _require_shape(event, hulls)
         if json_integer(event.get("sequence")) is None:
             raise PlanRevisionError(
                 "invalid_event", f"event sequence {json_spelling(event.get('sequence'))} is not an integer")
         apply[event["type"]](derived, event)
     return derived
+
+
+def stock_cut_boxes(request: Mapping[str, Any], approved_artifact: Mapping[str, Any],
+                    revision: int) -> Dict[str, Any]:
+    """`request` with every made-to-measure box that holds a fixed placement made a stock
+    container. The box was cut for the approved plan, so a replan cannot recut it:
+    instance `n` of made-to-measure type `T` -- the `n`-th container of type `T` in the
+    artifact, in result order -- becomes container `T@<revision>#<n>`, a copy of `T` without
+    `made_to_measure`, quantity 1, at the cut inner and outer size, price and tare, each in
+    ticks; it follows `T` in the container list. Its fixed placements move to its instance 1
+    and `T`'s own `quantity`, if stated, loses the boxes taken (`T` is dropped at zero). New
+    boxes are still cut to measure. Pure; O(C + F + A) for containers, fixed placements and
+    the artifact's containers.
+    """
+    derived = copy.deepcopy(dict(request))
+    fixed = derived.get("fixed_placements")
+    containers = derived.get("containers")
+    if not isinstance(fixed, list) or not isinstance(containers, list):
+        return derived
+    machines = {entry["id"]: entry for entry in containers
+                if isinstance(entry, Mapping) and isinstance(entry.get("id"), str)
+                and entry.get("made_to_measure") is not None}
+    stocked: Dict[str, List[Dict[str, Any]]] = {machine_id: [] for machine_id in machines}
+    named: Dict[str, Dict[str, Any]] = {}
+    cuts = None
+    for entry in fixed:
+        if not isinstance(entry, dict) or entry.get("container_type") not in machines:
+            continue
+        machine_id = entry["container_type"]
+        instance = json_integer(entry.get("container_instance", 1))
+        stock_id = f"{machine_id}@{revision}#{instance}"
+        if stock_id not in named:
+            if cuts is None:
+                cuts = _cut_boxes(approved_artifact)
+            named[stock_id] = _stock_box(derived, machines[machine_id], stock_id,
+                                         _cut_inner(cuts, machine_id, instance))
+            stocked[machine_id].append(named[stock_id])
+        entry["container_type"] = stock_id
+        entry["container_instance"] = 1
+        # A stated id named the cut box's instance of the machine, which this request no
+        # longer has; admission would refuse it as a mismatch.
+        entry.pop("placement_id", None)
+    if not named:
+        return derived
+    clash = min(set(named) & {c.get("id") for c in containers if isinstance(c, Mapping)}, default=None)
+    if clash is not None:
+        raise PlanRevisionError("event_conflict", f"a container is already named {json_spelling(clash)}")
+    rebuilt: List[Any] = []
+    for container in containers:
+        boxes = stocked.get(container.get("id")) if isinstance(container, Mapping) else None
+        if not boxes:
+            rebuilt.append(container)
+            continue
+        quantity = json_integer(container.get("quantity")) if container.get("quantity") is not None else None
+        if quantity is None or quantity > len(boxes):
+            if quantity is not None:
+                container["quantity"] = quantity - len(boxes)
+            rebuilt.append(container)
+        rebuilt.extend(boxes)
+    derived["containers"] = rebuilt
+    return derived
+
+
+def _cut_boxes(artifact: Mapping[str, Any]) -> Dict[str, List[Any]]:
+    """Index raw shapes in artifact order; unselected dimensions are never parsed. O(A)."""
+    work = artifact.get("work_order") if isinstance(artifact, Mapping) else None
+    geometry = artifact.get("geometry") if isinstance(artifact, Mapping) else None
+    orders = work.get("containers") if isinstance(work, Mapping) else None
+    shapes = geometry.get("containers") if isinstance(geometry, Mapping) else None
+    cuts: Dict[str, List[Any]] = {}
+    if isinstance(orders, list) and isinstance(shapes, list):
+        for order, shape in zip(orders, shapes):
+            machine_id = order.get("container_type") if isinstance(order, Mapping) else None
+            if isinstance(machine_id, str):
+                cuts.setdefault(machine_id, []).append(shape)
+    return cuts
+
+
+def _cut_inner(cuts: Dict[str, List[Any]], machine_id: str, instance: Optional[int]) -> List[int]:
+    """The selected box's ticks, read only when it is stocked. Expected O(1)."""
+    shapes = cuts.get(machine_id, ())
+    if instance is not None and 1 <= instance <= len(shapes):
+        return [_artifact_ticks(shapes[instance - 1], axis) for axis in ("length", "width", "height")]
+    raise PlanRevisionError("invalid_artifact",
+                            f"the approved plan holds no {machine_id} instance {json_spelling(instance)}")
+
+
+def _artifact_ticks(shape: Any, axis: str) -> int:
+    sides = shape.get("inner_dimensions") if isinstance(shape, Mapping) else None
+    value = sides.get(axis) if isinstance(sides, Mapping) else None
+    ticks = json_integer(int(value)) if isinstance(value, str) and value.isascii() and value.isdigit() else None
+    if ticks is None:
+        raise PlanRevisionError("invalid_artifact", f"a cut box's {axis} is not a tick count")
+    return ticks
+
+
+def _stock_box(request: Mapping[str, Any], machine: Mapping[str, Any], stock_id: str,
+               inner: List[int]) -> Dict[str, Any]:
+    """The stock container a cut box becomes, priced as `made_to_measure.fabricate` prices it."""
+    units = _stock_object(request.get("units"), "units", optional=True)
+    unit = units.get("length") if units.get("length") is not None else "mm"
+    if not isinstance(unit, str):
+        raise PlanRevisionError("invalid_revision", "a made-to-measure container's units.length is not a string")
+    measures = ParsedMeasures()
+    spec = _stock_object(machine["made_to_measure"], "made_to_measure")
+
+    def read(kind: type, value: Any, default_unit: Any, name: str) -> int:
+        try:
+            return measures.read(kind, value, default_unit).ticks
+        except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+            raise PlanRevisionError("invalid_revision",
+                                    f"a made-to-measure container's {name} is not a measure") from error
+
+    def length(value: Any) -> int:
+        return read(Length, value, unit, "outer_allowance")
+
+    def weight(value: Any, name: str) -> int:
+        return read(Weight, value, "g", name)
+
+    allowance = _stock_object(spec.get("outer_allowance"), "outer_allowance", optional=True)
+    outer = [inner[index] + (length(allowance[axis]) if allowance.get(axis) is not None else 0)
+             for index, axis in enumerate(("length", "width", "height"))]
+    area = surface_area(tuple(inner))
+    price = _stock_integer(spec.get("cost_per_square_metre_minor"), "cost_per_square_metre_minor")
+    tare_rate = (0 if spec.get("tare_per_square_metre") is None
+                 else weight(spec["tare_per_square_metre"], "tare_per_square_metre"))
+    declared_tare = 0 if machine.get("tare_weight") is None else weight(machine["tare_weight"], "tare_weight")
+    box = {key: copy.deepcopy(value) for key, value in machine.items() if key != "made_to_measure"}
+    box.update({
+        "id": stock_id,
+        "quantity": 1,
+        "inner_dimensions": _tick_box(inner),
+        "outer_dimensions": _tick_box(outer),
+        "cost_minor": _stock_integer(machine.get("cost_minor"), "cost_minor") + per_square_metre(price, area),
+        "tare_weight": {"value": str(declared_tare + per_square_metre(tare_rate, area)), "unit": "ticks"},
+    })
+    return box
+
+
+def _stock_object(value: Any, name: str, optional: bool = False) -> Mapping[str, Any]:
+    if value is None and optional:
+        return {}
+    if not isinstance(value, Mapping):
+        raise PlanRevisionError("invalid_revision", f"a made-to-measure container's {name} is not an object")
+    return value
+
+
+def _stock_integer(value: Any, name: str) -> int:
+    integer = json_integer(0 if value is None else value)
+    if integer is None:
+        raise PlanRevisionError("invalid_revision", f"a made-to-measure container's {name} is not an integer")
+    return integer
+
+
+def _tick_box(sides: List[int]) -> Dict[str, Dict[str, str]]:
+    return {axis: {"value": str(side), "unit": "ticks"} for axis, side in zip(("length", "width", "height"), sides)}
+
+
+def _holds_cut_boxes(request: Mapping[str, Any]) -> bool:
+    """Whether a fixed placement names a made-to-measure container type."""
+    containers = request.get("containers")
+    fixed = request.get("fixed_placements")
+    if not isinstance(containers, list) or not isinstance(fixed, list):
+        return False
+    machines = {entry.get("id") for entry in containers
+                if isinstance(entry, Mapping) and entry.get("made_to_measure") is not None}
+    return any(isinstance(entry, Mapping) and entry.get("container_type") in machines for entry in fixed)
 
 
 def verify_revision_chain(
@@ -170,9 +342,9 @@ def verify_revision_chain(
             issues.append(RevisionIssue("parent_mismatch", position,
                                         f"parent {_plain(recorded_parent)}, expected {_plain(expected_parent)}"))
         last_sequence = _check_sequences(revision, position, last_sequence, issues)
-        if parent is not None:
-            _check_request(revision, parent, position, issues)
         artifact = None if artifacts is None or position >= len(artifacts) else artifacts[position]
+        if parent is not None:
+            _check_request(revision, parent, artifact, position, issues)
         if artifact is not None and parent is not None:
             _check_artifact(revision, parent, artifact, position, issues)
     return issues
@@ -232,8 +404,8 @@ def _chain_start(revision: Mapping[str, Any]) -> int:
     return 0
 
 
-def _event(raw: Any, sequence: int) -> Dict[str, Any]:
-    _require_shape(raw)
+def _event(raw: Any, sequence: int, hulls: frozenset[str]) -> Dict[str, Any]:
+    _require_shape(raw, hulls)
     if json_integer(raw.get("sequence")) != sequence:
         raise PlanRevisionError(
             "invalid_event",
@@ -242,7 +414,12 @@ def _event(raw: Any, sequence: int) -> Dict[str, Any]:
     return copy.deepcopy(dict(raw))
 
 
-def _require_shape(raw: Any) -> None:
+def _hull_types(request: Mapping[str, Any]) -> frozenset[str]:
+    """The request's hull item types, which alone may be placed in a signed orientation (1.10)."""
+    return hull_item_types(request.get("items")) if isinstance(request, Mapping) else frozenset()
+
+
+def _require_shape(raw: Any, hulls: frozenset[str]) -> None:
     if not isinstance(raw, Mapping):
         raise PlanRevisionError("invalid_event", "an event is a JSON object")
     kind = raw.get("type")
@@ -255,17 +432,17 @@ def _require_shape(raw: Any) -> None:
     missing = [field for field in _EVENT_FIELDS[kind] if field not in raw]
     if missing:
         raise PlanRevisionError("invalid_event", f"{kind} needs {json_spelling(missing)}")
-    _VALIDATE[kind](raw)
+    _VALIDATE[kind](raw, hulls)
 
 
-def _validate_item_missing(event: Mapping[str, Any]) -> None:
+def _validate_item_missing(event: Mapping[str, Any], _hulls: frozenset[str]) -> None:
     _require_name(event["item_type"], "item_type")
     quantity = json_integer(event["quantity"])
     if quantity is None or quantity < 1:
         raise PlanRevisionError("invalid_event", "item_missing.quantity is a positive integer")
 
 
-def _validate_container_substituted(event: Mapping[str, Any]) -> None:
+def _validate_container_substituted(event: Mapping[str, Any], _hulls: frozenset[str]) -> None:
     _require_name(event["container_type"], "container_type")
     replacement = event["replacement"]
     if not isinstance(replacement, Mapping):
@@ -273,7 +450,7 @@ def _validate_container_substituted(event: Mapping[str, Any]) -> None:
     _require_name(replacement.get("id"), "replacement.id")
 
 
-def _validate_placement(event: Mapping[str, Any]) -> None:
+def _validate_placement(event: Mapping[str, Any], hulls: frozenset[str]) -> None:
     placement = event["placement"]
     if not isinstance(placement, Mapping):
         raise PlanRevisionError("invalid_event", "a placement is a fixed-placement object")
@@ -282,13 +459,18 @@ def _validate_placement(event: Mapping[str, Any]) -> None:
         raise PlanRevisionError("invalid_event", f"a placement does not carry {json_spelling(unknown)}")
     _require_name(placement.get("item_type"), "placement.item_type")
     _require_name(placement.get("container_type"), "placement.container_type")
-    if placement.get("orientation") not in ORIENTATIONS:
-        raise PlanRevisionError("invalid_event",
-                                f"placement.orientation must be one of {json_spelling(list(ORIENTATIONS))}")
+    refuse_orientation(placement.get("orientation"), placement.get("item_type") in hulls, "",
+                       lambda _reason, _field, detail: PlanRevisionError("invalid_event", detail),
+                       "placement.orientation")
     instance = json_integer(placement.get("container_instance", 1))
     if instance is None or instance < 1:
         raise PlanRevisionError("invalid_event", "placement.container_instance counts from 1")
     require_point_shape(placement.get("position", {}), "placement.position", "", _invalid_event)
+    # Only its type is the event's to judge: whether it names this placement needs the
+    # request's unit, and is the engine's admission rule when the revision is solved (1.10).
+    identifier = placement.get("placement_id")
+    if identifier is not None and not isinstance(identifier, str):
+        raise PlanRevisionError("invalid_event", "placement.placement_id is a string")
 
 
 def _invalid_event(message: str, _field: str) -> PlanRevisionError:
@@ -300,6 +482,7 @@ def _require_name(value: Any, field: str) -> None:
         raise PlanRevisionError("invalid_event", f"{field} is a non-empty string")
 
 
+#: Each event type's own rule, given the request's hull item types (only a placement reads them).
 _VALIDATE = {
     "item_missing": _validate_item_missing,
     "container_substituted": _validate_container_substituted,
@@ -367,11 +550,10 @@ class _PlacementIndex:
             self.fixed = _fixed_entries(request)
             request["fixed_placements"] = self.fixed
             try:
-                self.keys = {canonical_revision_json({"container_instance": 1, **entry})
-                             for entry in self.fixed}
+                self.keys = {canonical_revision_json(_identity(entry)) for entry in self.fixed}
             except PlanRevisionError:
                 self.indexable = False
-        placement = {"container_instance": 1, **copy.deepcopy(dict(event["placement"]))}
+        placement = _identity(copy.deepcopy(dict(event["placement"])))
         if self.indexable:
             try:
                 key = canonical_revision_json(placement)
@@ -385,9 +567,15 @@ class _PlacementIndex:
                 return
         # An uncanonicalizable value may occur in a direct apply_events call. Preserve the
         # old first-match/error order rather than making index construction an earlier error.
-        if any(_same({"container_instance": 1, **entry}, placement) for entry in self.fixed):
+        if any(_same(_identity(entry), placement) for entry in self.fixed):
             return
         self.fixed.append(dict(event["placement"]))
+
+
+def _identity(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    """What makes two fixed entries one box: everything but `placement_id`, which only restates
+    the container and position (1.10), with the default instance spelled out."""
+    return {"container_instance": 1, **{key: value for key, value in entry.items() if key != "placement_id"}}
 
 
 _APPLY = {
@@ -441,10 +629,18 @@ def _check_sequences(revision: Mapping[str, Any], position: int, last: int,
     return last
 
 
-def _check_request(revision: Mapping[str, Any], parent: Mapping[str, Any], position: int,
+def _check_request(revision: Mapping[str, Any], parent: Mapping[str, Any],
+                   artifact: Optional[Mapping[str, Any]], position: int,
                    issues: List[RevisionIssue]) -> None:
     try:
         derived = apply_events(parent["request"], revision["events"])
+        if _holds_cut_boxes(derived):
+            # The cut sizes live only in the approved artifact.
+            if artifact is None:
+                issues.append(RevisionIssue("artifact_required", position,
+                                            "fixed items in a made-to-measure box are checked against the approved artifact"))
+                return
+            derived = stock_cut_boxes(derived, artifact, json_integer(revision["revision"]))
     except PlanRevisionError as error:
         issues.append(RevisionIssue("request_mismatch", position, f"the events do not apply: {error}"))
         return

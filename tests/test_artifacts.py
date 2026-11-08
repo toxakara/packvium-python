@@ -315,6 +315,26 @@ def test_a_hand_edited_container_index_is_refused_rather_than_numbered(index):
     assert _code(export_work_order_html, artifact) == "invalid_value"
 
 
+@pytest.mark.parametrize("index", [2**53 - 1, 2**64 - 1])
+def test_a_container_number_javascript_cannot_hold_is_refused_rather_than_printed(index):
+    """The sheet shows the index plus one, so 2^53 - 1 is already one past the ceiling."""
+    artifact = _artifact()
+    artifact["work_order"]["containers"][0]["container_index"] = index
+    assert _code(export_work_order_html, artifact) == "number_out_of_range"
+
+
+def test_the_last_container_index_every_engine_numbers_is_printed():
+    artifact = _artifact()
+    artifact["work_order"]["containers"][0]["container_index"] = 2**53 - 2
+    assert "<h2>Container 9007199254740991: " in export_work_order_html(artifact)
+
+
+def test_any_printed_integer_javascript_cannot_hold_is_refused():
+    artifact = _artifact()
+    artifact["work_order"]["containers"][0]["lines"][0]["sequence"] = -(2**53)
+    assert _code(export_csv, artifact) == "number_out_of_range"
+
+
 def test_the_csv_has_a_header_one_row_per_step_in_order_and_one_per_unplaced_item():
     unpacked = [{"item_id": "jack#1", "item_type": "jack", "reason": "no_compatible_container_dimensions",
                  "details": [], "proof": {"level": "proven"}}]

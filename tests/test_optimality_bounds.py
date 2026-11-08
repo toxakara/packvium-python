@@ -122,11 +122,31 @@ def test_lowest_cost_gets_the_same_bound_in_its_own_order(monkeypatch):
 
 @pytest.mark.parametrize("objective", ["maximum_value", "maximum_volume",
                                        "open_dimension_height"])
-def test_an_objective_without_a_bound_gets_none(monkeypatch, objective):
-    """Their score positions rank other quantities, so a vector compared against them would
-    line up different things -- recording nothing is the honest answer."""
-    _, recorded, _ = _pack(monkeypatch, {"solver_profile": "exact_small", "objective": objective})
-    assert recorded == [None]
+def test_an_objective_with_its_own_key_gets_a_bound_never_above_the_packing(monkeypatch, objective):
+    """The five bounds plus the one key each ranks by, in its own score order."""
+    result, recorded, _ = _pack(monkeypatch, {"solver_profile": "exact_small", "objective": objective})
+    assert len(recorded) == 1 and recorded[0] is not None
+    assert tuple(int(c) for c in result["score"]) >= recorded[0]
+
+
+def test_the_height_key_abstains_where_no_volume_argument_holds():
+    """A nesting item breaks the disjoint-boxes step, so the height term is 0 while the
+    packing still stands some height: the statement is a gap at key 1 against 0."""
+    result = packvium.pack_from_dict({
+        "items": [{"id": "cup", "quantity": 3, "nesting_height": "1",
+                   "dimensions": {"length": "10", "width": "10", "height": "6"}}],
+        "containers": CONTAINERS, "configuration": {"objective": "open_dimension_height"}})
+    assert result["optimality"]["lower_bound"][:2] == [0, 0]
+
+
+@pytest.mark.parametrize("objective", ["shipping_cost", "lowest_landed_cost"])
+def test_an_objective_without_a_bound_gets_none(objective):
+    """Their second keys go through billed weight and caller-declared tariffs, for which no
+    bound is designed -- recording nothing is the honest answer."""
+    request = packvium.PackingRequest(
+        tuple(packvium.Item.create(f"i{n}", packvium.Dimensions.mm(10, 10, 10)) for n in range(2)),
+        (packvium.Container.create("box", packvium.Dimensions.mm(30, 30, 30)),))
+    assert bounds.for_request(request.instances, request.containers, objective) is None
 
 
 def test_a_custom_solution_scorer_gets_no_bound():
@@ -251,8 +271,9 @@ def test_a_statement_stops_at_the_first_missed_position():
 
 def test_an_uncovered_objective_states_nothing():
     """§ 1.5: absence is "no statement", never "attained"."""
-    result = packvium.pack_from_dict({"containers": CONTAINERS, "items": ITEMS,
-                                      "configuration": {"objective": "maximum_value"}})
+    result = packvium.pack_from_dict({"containers": CONTAINERS, "items": ITEMS, "configuration": {
+        "objective": "shipping_cost", "dimensional_weight_divisor": 5000,
+        "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg"}})
     assert set(result["optimality"]) == {"code"}
 
 

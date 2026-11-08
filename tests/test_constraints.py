@@ -297,6 +297,34 @@ def test_the_first_crushed_unit_is_reported_by_name():
     assert overloaded(units) == ("top_load_exceeded", "base")
 
 
+def _cushion_under(kilograms: int, footprint_ticks2: int | None) -> tuple[LoadUnit, LoadUnit]:
+    """A 100 mm compressible cube rated for 100 kPa, with `kilograms` resting on it."""
+    cube = Dimensions.mm(100, 100, 100)
+    cushion = LoadUnit(AxisAlignedBox(Point(0, 0, 0), cube), 0, None, None, "cushion",
+                       compression_ratio_ppm=250_000, max_compression_pressure_kpa=100,
+                       footprint_ticks2=footprint_ticks2)
+    load = LoadUnit(AxisAlignedBox(Point(0, 0, cube.height.ticks), cube),
+                    Weight.parse(f"{kilograms}kg").ticks, None, None, "load")
+    return cushion, load
+
+
+@pytest.mark.parametrize("kilograms,crushes", [(101, False), (102, True)])
+def test_a_load_unit_without_a_footprint_is_pressed_over_its_own_box(kilograms, crushes):
+    """A `LoadUnit` built by hand need not state the item's footprint; the load then spreads
+    over the box's base, 0.01 m² here, which puts the 100 kPa boundary between 101 and
+    102 kg -- the same boundary the full load-propagation path draws for this cushion."""
+    failure = constraints.crushed(_cushion_under(kilograms, None))
+    assert failure == (("crush_violation", "cushion") if crushes else None)
+
+
+def test_a_stated_footprint_takes_precedence_over_the_box():
+    """Half the footprint doubles the pressure, so a load the box's base would bear crushes
+    the item it actually rests on."""
+    full = Dimensions.mm(100, 100, 100).base_area
+    assert constraints.crushed(_cushion_under(101, full)) is None
+    assert constraints.crushed(_cushion_under(101, full // 2)) == ("crush_violation", "cushion")
+
+
 def test_a_limit_met_exactly_is_not_exceeded():
     units = (
         unit(0, 0, 0, 10, 10, 10, limit=100, label="base"),
@@ -1868,3 +1896,439 @@ def test_a_nesting_predecessor_is_listed_after_a_lower_indexed_face_supporter():
     support = direct_support_view(placements, candidate, resting.envelope_box)
 
     assert [entry.index for entry in support.supporters] == [0, 1]
+
+
+# --------------------- delta fast-path vs full-rebuild oracle & pathological cases
+
+
+def _oracle_top_load(context: ConstraintContext) -> constraints.ConstraintResult:
+    """Reference full-rebuild evaluation of `TopLoadConstraint` without delta shortcuts."""
+    candidate = context.envelope_box
+    item = context.item.item
+    unit = LoadUnit(
+        candidate,
+        context.item.weight.ticks,
+        None if item.max_top_load is None else item.max_top_load.ticks,
+        item.max_stacked_items,
+        context.item.id,
+        None if item.nesting_height is None else item.id,
+        None if item.nesting_height is None else item.nesting_height.ticks,
+        item.compression_ratio_ppm,
+        item.max_compression_pressure_kpa,
+        context.dimensions.length.ticks * context.dimensions.width.ticks,
+    )
+    units = constraints.load_units(context.placements, unit)
+    graph = LoadSupportGraph(units)
+    failure = constraints.non_stackable_failure(
+        context.placements, context.item, graph, len(units) - 1
+    )
+    if failure is not None:
+        return failure
+    density_limit = (
+        None
+        if context.container.max_stack_density is None
+        else context.container.max_stack_density.ticks
+    )
+    raw_failure = (
+        overloaded(units, graph)
+        or constraints.crushed(units, graph)
+        or stack_limit_exceeded(units, graph)
+        or stack_density_exceeded(units, density_limit, graph)
+    )
+    if raw_failure is not None:
+        return constraints.ConstraintResult.reject(*raw_failure)
+    return constraints.ConstraintResult.allow()
+
+
+def _oracle_route_order(context: ConstraintContext) -> constraints.ConstraintResult:
+    """Reference full-rebuild evaluation of `RouteOrderConstraint` without delta shortcuts."""
+    candidate = LoadUnit(
+        context.envelope_box,
+        context.item.weight.ticks,
+        None,
+        None,
+        context.item.id,
+        None if context.item.item.nesting_height is None else context.item.item.id,
+        None if context.item.item.nesting_height is None else context.item.item.nesting_height.ticks,
+    )
+    stops = [
+        RIDES_THE_WHOLE_ROUTE if p.instance.item.stop_index is None else float(p.instance.item.stop_index)
+        for p in context.placements
+    ]
+    item_stop = context.item.item.stop_index
+    stops.append(RIDES_THE_WHOLE_ROUTE if item_stop is None else float(item_stop))
+    units = constraints.load_units(context.placements, candidate)
+    graph = LoadSupportGraph(units)
+    failure = route_order_violated(units, stops, graph)
+    if failure is not None:
+        return constraints.ConstraintResult.reject(*failure)
+    return constraints.ConstraintResult.allow()
+
+
+def test_diamond_dag_single_tick_remainder_shift_matches_full_rebuild_oracle():
+    """In a 3-layer diamond DAG, adding 1 tick of weight at the apex can flip floor-division
+    remainders on intermediate bridges. The delta propagator must match the full-rebuild
+    `top_loads` oracle down to a single tick."""
+    b0 = Placement(
+        Item.create("b0", Dimensions(Length(6), Length(10), Length(10)), weight=Weight(100)).instances()[0],
+        Point(0, 0, 0), Rotation.LWH, Dimensions(Length(6), Length(10), Length(10)),
+        Point(0, 0, 0), Dimensions(Length(6), Length(10), Length(10)),
+    )
+    b1 = Placement(
+        Item.create("b1", Dimensions(Length(14), Length(10), Length(10)), weight=Weight(100)).instances()[0],
+        Point(6, 0, 0), Rotation.LWH, Dimensions(Length(14), Length(10), Length(10)),
+        Point(6, 0, 0), Dimensions(Length(14), Length(10), Length(10)),
+    )
+    # m0 bridges b0 (3x10=30) and b1 (7x10=70); m1 bridges b0 (3x10=30) and b1 (8x10=80).
+    m0 = Placement(
+        Item.create("m0", Dimensions(Length(10), Length(5), Length(10)), weight=Weight(17)).instances()[0],
+        Point(3, 0, 10), Rotation.LWH, Dimensions(Length(10), Length(5), Length(10)),
+        Point(3, 0, 10), Dimensions(Length(10), Length(5), Length(10)),
+    )
+    m1 = Placement(
+        Item.create("m1", Dimensions(Length(11), Length(5), Length(10)), weight=Weight(23)).instances()[0],
+        Point(3, 5, 10), Rotation.LWH, Dimensions(Length(11), Length(5), Length(10)),
+        Point(3, 5, 10), Dimensions(Length(11), Length(5), Length(10)),
+    )
+    for apex_weight in (0, 1, 2, 3, 7, 13, 97):
+        apex, = Item.create(
+            "apex", Dimensions(Length(8), Length(10), Length(10)), weight=Weight(apex_weight)
+        ).instances()
+        apex_box = AxisAlignedBox(Point(4, 0, 20), apex.dimensions)
+        full_units = constraints.load_units((b0, b1, m0, m1), LoadUnit(apex_box, apex_weight, None, None, apex.id))
+        exact_loads = top_loads(full_units)
+        for target_idx in range(4):
+            exact = exact_loads[target_idx]
+            for delta in (-1, 0, 1):
+                limit = exact + delta
+                if limit < 0:
+                    continue
+                rebuilt_placements = []
+                for idx, p in enumerate((b0, b1, m0, m1)):
+                    lim = Weight(limit) if idx == target_idx else None
+                    inst, = Item.create(
+                        p.instance.item.id, p.dimensions, weight=p.instance.weight, max_top_load=lim
+                    ).instances()
+                    rebuilt_placements.append(Placement(
+                        inst, p.position, p.rotation, p.dimensions, p.envelope_origin, p.envelope_dimensions
+                    ))
+                scene = ConstraintContext(
+                    BOX, tuple(rebuilt_placements), apex, Point(4, 0, 20),
+                    Rotation.LWH, apex.dimensions, apex.dimensions,
+                )
+                got = TopLoadConstraint().evaluate(scene)
+                expected = _oracle_top_load(scene)
+                assert got == expected, f"apex_weight={apex_weight} target={target_idx} delta={delta}"
+
+
+def test_diamond_dag_stacked_item_count_deduplicates_shared_candidate():
+    """An apex bridging two middle boxes that both rest on one floor base adds 1 item
+    above the base (total 3), not 2 (total 4)."""
+    for max_stacked, should_allow in ((3, True), (2, False)):
+        base, = Item.create("base", Dimensions.mm(20, 10, 10), max_stacked_items=max_stacked).instances()
+        left, = Item.create("left", Dimensions.mm(10, 10, 10)).instances()
+        right, = Item.create("right", Dimensions.mm(10, 10, 10)).instances()
+        apex, = Item.create("apex", Dimensions.mm(20, 10, 10)).instances()
+        placements = (
+            placed(base, x=0, y=0, z=0),
+            placed(left, x=0, y=0, z=_mm(10)),
+            placed(right, x=_mm(10), y=0, z=_mm(10)),
+        )
+        scene = context(apex, z=_mm(20), placements=placements)
+        got = TopLoadConstraint().evaluate(scene)
+        assert got.allowed is should_allow
+        assert got == _oracle_top_load(scene)
+
+
+def test_candidate_slid_underneath_existing_upper_box_checks_bearing_stacking_and_route():
+    """When a candidate is placed at z=0 directly beneath an already-placed box at z=10,
+    `above` is non-empty; every bearing, stacking-group, non-stackable, and route rule
+    must match the full-rebuild oracle."""
+    upper_heavy = placed(instance_of("upper", weight="10 kg", stacking_group="B", stop_index=2), z=_mm(10))
+    # 1. Candidate is non-stackable -> rejected
+    c_non_stackable = instance_of("c-ns", stackable=False)
+    scene_ns = context(c_non_stackable, z=0, placements=(upper_heavy,))
+    assert TopLoadConstraint().evaluate(scene_ns) == _oracle_top_load(scene_ns)
+    assert not TopLoadConstraint().evaluate(scene_ns).allowed
+    # 2. Candidate only accepts group A, upper is group B -> rejected
+    c_group = instance_of("c-grp", accepts_stacking_groups=("A",))
+    scene_grp = context(c_group, z=0, placements=(upper_heavy,))
+    assert TopLoadConstraint().evaluate(scene_grp) == _oracle_top_load(scene_grp)
+    assert TopLoadConstraint().evaluate(scene_grp).code == "stacking_group_incompatible"
+    # 3. Candidate has max_top_load="5 kg" under 10 kg upper -> rejected
+    c_weak = instance_of("c-weak", max_top_load="5 kg")
+    scene_weak = context(c_weak, z=0, placements=(upper_heavy,))
+    assert TopLoadConstraint().evaluate(scene_weak) == _oracle_top_load(scene_weak)
+    assert TopLoadConstraint().evaluate(scene_weak).code == "top_load_exceeded"
+    # 4. Candidate has stop_index=1 under stop_index=2 upper -> rejected by RouteOrderConstraint
+    c_early = instance_of("c-early", stop_index=1)
+    scene_route = context(c_early, z=0, placements=(upper_heavy,))
+    assert RouteOrderConstraint().evaluate(scene_route) == _oracle_route_order(scene_route)
+    assert not RouteOrderConstraint().evaluate(scene_route).allowed
+
+
+def test_weightless_candidate_on_zero_top_load_vs_one_stacked_items_and_non_stackable():
+    """Zero weight on max_top_load=0 is allowed (0 <= 0), whereas max_stacked_items=1
+    with one already stacked or stackable=False still rejects a weightless item."""
+    zero_top = placed(instance_of("zero-top", max_top_load="0 kg"), z=0)
+    feather = instance_of("feather", weight="0 kg")
+    one_tick, = Item.create("one-tick", Dimensions.mm(10, 10, 10), weight=Weight(1)).instances()
+
+    s_allow = context(feather, z=_mm(10), placements=(zero_top,))
+    assert TopLoadConstraint().evaluate(s_allow).allowed
+    assert TopLoadConstraint().evaluate(s_allow) == _oracle_top_load(s_allow)
+
+    s_reject = context(one_tick, z=_mm(10), placements=(zero_top,))
+    assert not TopLoadConstraint().evaluate(s_reject).allowed
+    assert TopLoadConstraint().evaluate(s_reject) == _oracle_top_load(s_reject)
+
+    one_stack = placed(instance_of("one-stack", max_stacked_items=1), z=0)
+    mid_feather = placed(instance_of("mid-feather", weight="0 kg"), z=_mm(10))
+    s_stack = context(feather, z=_mm(20), placements=(one_stack, mid_feather))
+    assert TopLoadConstraint().evaluate(s_stack).code == "stacked_item_limit_exceeded"
+    assert TopLoadConstraint().evaluate(s_stack) == _oracle_top_load(s_stack)
+
+
+def test_mutated_list_placements_in_constraint_context_never_returns_stale_verdict():
+    """Even if a caller passes a mutable list instead of a tuple to ConstraintContext and
+    mutates it in place between calls, PlacedSupportBase must not serve a stale verdict."""
+    base = placed(instance_of("base", max_top_load="10 kg", stop_index=1), z=0)
+    mid = placed(instance_of("mid", weight="8 kg", stop_index=1), z=_mm(10))
+    mutable_placements = [base]
+    top_constraint = TopLoadConstraint()
+    route_constraint = RouteOrderConstraint()
+
+    cand_load = instance_of("cand", weight="5 kg", stop_index=2)
+    ctx1 = ConstraintContext(
+        BOX, mutable_placements, cand_load, Point(0, 0, _mm(10)),
+        Rotation.LWH, cand_load.item.dimensions, cand_load.item.dimensions,
+    )
+    assert top_constraint.evaluate(ctx1).allowed
+    assert not route_constraint.evaluate(ctx1).allowed
+
+    # Mutate the list in place and place candidate at z=20 on top of `mid`: now total top load is 8+5=13 > 10.
+    mutable_placements.append(mid)
+    ctx2 = ConstraintContext(
+        BOX, mutable_placements, cand_load, Point(0, 0, _mm(20)),
+        Rotation.LWH, cand_load.item.dimensions, cand_load.item.dimensions,
+    )
+    assert not top_constraint.evaluate(ctx2).allowed
+    assert top_constraint.evaluate(ctx2).code == "top_load_exceeded"
+
+
+def test_contact_graph_plane_bucket_threshold_32_vs_33_and_knife_edge_contacts():
+    """Crossing the `<= 32` direct plane scan vs `> 32` spatial hash threshold must yield
+    identical contact edges and areas, while 0-area edge touches are excluded."""
+    from packvium.contact import ContactEdge, ContactGraph
+
+    for count in (0, 1, 31, 32, 33, 34, 65):
+        boxes = [
+            AxisAlignedBox(Point(i * 10, 0, 0), Dimensions(Length(10), Length(10), Length(10)))
+            for i in range(count)
+        ]
+        # Add a box at z=10 that touches box 0 only along x=0 (0 area) and overlaps all others by 1 tick in y.
+        query = AxisAlignedBox(Point(0, 9, 10), Dimensions(Length(max(10, count * 10)), Length(2), Length(10)))
+        graph = ContactGraph(boxes, cell_hint=max(10, count * 10))
+        below = graph.contacts_below(query)
+        expected = tuple(
+            ContactEdge(i, 10 * 1) for i in range(count)
+        )
+        assert below == expected
+        appended = graph.with_box(query)
+        rebuilt = ContactGraph([*boxes, query], cell_hint=max(10, count * 10))
+        assert [appended.supporters(i) for i in range(count + 1)] == [
+            rebuilt.supporters(i) for i in range(count + 1)
+        ]
+        assert [appended.children(i) for i in range(count + 1)] == [
+            rebuilt.children(i) for i in range(count + 1)
+        ]
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_randomized_multilayer_top_load_and_route_order_fast_path_matches_full_rebuild(seed):
+    """Randomized multi-layer scenes with bearing limits, stack limits, density, and route stops:
+    the incremental delta evaluator in `PlacedSupportBase` must agree with the full-rebuild
+    oracle on every candidate."""
+    rng = random.Random(91_000 + seed)
+    placements: list[Placement] = []
+    for i in range(12):
+        lx, ly, lz = rng.choice((10, 20)), rng.choice((10, 20)), 10
+        x = rng.choice((0, 10, 20, 30))
+        y = rng.choice((0, 10, 20, 30))
+        z = rng.choice((0, 10, 20))
+        max_top = f"{rng.randint(1, 30)} kg" if rng.random() < 0.5 else None
+        max_stacked = rng.randint(1, 4) if rng.random() < 0.4 else None
+        stop = rng.choice((None, 0, 1, 2, 3))
+        inst = instance_of(
+            f"p{i}", length=lx, width=ly, height=lz,
+            weight=f"{rng.randint(0, 10)} kg",
+            max_top_load=max_top,
+            max_stacked_items=max_stacked,
+            stop_index=stop,
+        )
+        placements.append(placed(inst, x=_mm(x), y=_mm(y), z=_mm(z)))
+
+    density = f"{rng.randint(50, 5000)} kg" if rng.random() < 0.5 else None
+    container = Container.create("c", Dimensions.mm(100, 100, 100), max_stack_density=density)
+    frozen = tuple(placements)
+    top_constraint = TopLoadConstraint()
+    route_constraint = RouteOrderConstraint()
+
+    for c_idx in range(10):
+        lx, ly = rng.choice((10, 20, 40)), rng.choice((10, 20, 40))
+        cx, cy, cz = rng.choice((0, 10, 20)), rng.choice((0, 10, 20)), rng.choice((0, 10, 20, 30))
+        cand = instance_of(
+            f"cand{c_idx}", length=lx, width=ly, height=10,
+            weight=f"{rng.randint(0, 12)} kg",
+            max_top_load=f"{rng.randint(1, 20)} kg" if rng.random() < 0.3 else None,
+            max_stacked_items=rng.randint(1, 3) if rng.random() < 0.3 else None,
+            stop_index=rng.choice((None, 0, 1, 2, 4)),
+        )
+        scene = ConstraintContext(
+            container, frozen, cand, Point(_mm(cx), _mm(cy), _mm(cz)),
+            Rotation.LWH, cand.item.dimensions, cand.item.dimensions,
+        )
+        assert top_constraint.evaluate(scene) == _oracle_top_load(scene)
+        assert route_constraint.evaluate(scene) == _oracle_route_order(scene)
+
+
+
+@pytest.mark.parametrize("seed", range(40))
+@pytest.mark.parametrize("routed", [True, False])
+def test_randomized_crush_density_and_stack_limits_on_columns_match_full_rebuild(seed, routed):
+    """Columns of crushable, stack-limited items under a floor density near their own loads,
+    probed by candidates on one column's top, across two equal columns and on the bare floor:
+    every shortcut that rejects (crush, stacked count, density at a supporter and at the
+    candidate) and the unrouted base that lets a route-less candidate through must agree
+    with the full-rebuild oracle."""
+    from packvium.geometry import ShapeType
+
+    rng = random.Random(92_000 + seed)
+    placements: list[Placement] = []
+    heights: list[int] = []
+    for column in range(8):
+        x, y = (column % 4) * 20, (column // 4) * 20
+        levels = rng.randint(1, 3)
+        heights.append(levels * 10)
+        for level in range(levels):
+            crushable = rng.random() < 0.5
+            inst = instance_of(
+                f"p{column}-{level}", length=20, width=20, height=10,
+                weight=f"{rng.randint(1, 20)} kg",
+                max_stacked_items=rng.randint(1, 3) if rng.random() < 0.5 else None,
+                stop_index=rng.choice((None, 0, 1, 2)) if routed else None,
+                **({"shape_type": ShapeType.COMPRESSIBLE, "compression_ratio_ppm": 0,
+                    "max_compression_pressure_kpa": rng.randint(200, 1500)} if crushable else {}),
+            )
+            placements.append(placed(inst, x=_mm(x), y=_mm(y), z=_mm(level * 10)))
+
+    density = f"{rng.choice((40_000, 120_000, 300_000, 900_000))} kg" if rng.random() < 0.8 else None
+    container = Container.create("c", Dimensions.mm(100, 100, 100), max_stack_density=density)
+    frozen = tuple(placements)
+    for c_idx in range(16):
+        column = rng.randrange(8)
+        x, y, z, length = (column % 4) * 20, (column // 4) * 20, heights[column], 20
+        shape = rng.random()
+        if shape < 0.3 and column % 4 < 3 and heights[column + 1] == heights[column]:
+            length = 40
+        elif shape < 0.45:
+            x, y, z = rng.choice((0, 40)), 60, 0
+        cand = instance_of(
+            f"cand{c_idx}", length=length, width=20, height=10,
+            weight=f"{rng.randint(0, 60)} kg",
+            stop_index=rng.choice((None, 0, 3)) if routed else None,
+        )
+        scene = ConstraintContext(
+            container, frozen, cand, Point(_mm(x), _mm(y), _mm(z)),
+            Rotation.LWH, cand.item.dimensions, cand.item.dimensions,
+        )
+        assert TopLoadConstraint().evaluate(scene) == _oracle_top_load(scene)
+        assert RouteOrderConstraint().evaluate(scene) == _oracle_route_order(scene)
+
+
+def _density_scene(placements, candidate, x, y, z, density=None) -> ConstraintContext:
+    container = Container.create("c", Dimensions.mm(100, 100, 100), max_stack_density=density)
+    return ConstraintContext(container, tuple(placements), candidate, Point(_mm(x), _mm(y), _mm(z)),
+                             Rotation.LWH, candidate.item.dimensions, candidate.item.dimensions)
+
+
+def _wide_floor(**kwargs) -> list[Placement]:
+    """A 40 x 20 floor box with a 20 x 20 box on its left half, its right half free."""
+    floor = instance_of("floor", length=40, width=20, weight="10 kg", **kwargs)
+    upper = instance_of("upper", length=20, width=20, weight="10 kg", stop_index=1)
+    return [placed(floor), placed(upper, z=_mm(10))]
+
+
+@pytest.mark.parametrize("name,placements,candidate,at,density,code", [
+    ("stack count at a floor supporter", _wide_floor(max_stacked_items=1),
+     instance_of("cand", length=20, width=20, weight="1 kg"), (20, 0, 10), None,
+     "stacked_item_limit_exceeded"),
+    ("density at a floor supporter", _wide_floor(),
+     instance_of("cand", length=20, width=20, weight="20 kg"), (20, 0, 10), "30000 kg",
+     "stack_density_exceeded"),
+    ("density at the candidate on a floor supporter", _wide_floor(),
+     instance_of("cand", length=10, width=10, weight="5 kg"), (20, 0, 10), "40000 kg",
+     "stack_density_exceeded"),
+    ("density at the candidate on a tier", [
+        placed(instance_of("floor", length=40, width=20, weight="1 kg")),
+        placed(instance_of("middle", length=40, width=20, weight="1 kg"), z=_mm(10)),
+    ], instance_of("cand", length=10, width=10, weight="5 kg"), (0, 0, 20), "20000 kg",
+     "stack_density_exceeded"),
+])
+def test_each_shortcut_rejection_matches_the_full_rebuild(name, placements, candidate, at, density, code):
+    """The rejections the randomized scenes cannot reach on their own: a floor supporter that
+    already carries a box, and a candidate whose own footprint breaks the density on it or on
+    a tier."""
+    scene = _density_scene(placements, candidate, *at, density=density)
+    verdict = TopLoadConstraint().evaluate(scene)
+    assert verdict == _oracle_top_load(scene)
+    assert verdict.code == code, name
+
+
+def test_a_base_that_already_breaks_route_order_is_judged_by_the_full_rebuild():
+    """A stop-0 box under a stop-1 box leaves the base out of order, so no shortcut may vouch
+    for it: the candidate is judged against the whole rebuilt route and refused like it."""
+    first = instance_of("first", length=20, width=20, weight="1 kg", stop_index=0)
+    later = instance_of("later", length=20, width=20, weight="1 kg", stop_index=1)
+    base = [placed(first), placed(later, z=_mm(10))]
+    scene = _density_scene(base, instance_of("cand", length=20, width=20, weight="1 kg", stop_index=2),
+                   40, 0, 0)
+    verdict = RouteOrderConstraint().evaluate(scene)
+    assert verdict == _oracle_route_order(scene)
+    assert verdict.code == "unloading_order_violation"
+
+
+def test_a_nesting_candidate_in_route_order_is_allowed_by_the_full_rebuild():
+    """A nesting candidate skips every shortcut; when the rebuilt route holds it is allowed."""
+    base = [placed(instance_of("first", length=20, width=20, weight="1 kg", stop_index=1))]
+    candidate = instance_of("cup", length=20, width=20, weight="1 kg", stop_index=0,
+                            nesting_height=Length.mm(4))
+    scene = _density_scene(base, candidate, 0, 0, 10)
+    verdict = RouteOrderConstraint().evaluate(scene)
+    assert verdict == _oracle_route_order(scene)
+    assert verdict.allowed
+
+
+@pytest.mark.parametrize("count", [33, 40])
+def test_contact_graph_hashed_planes_answer_one_match_and_contacts_above(count):
+    """Past 32 boxes on a plane the hashed lookup serves both directions: a query touching a
+    single box gets that one edge, and `contacts_above` finds the boxes resting on a query no
+    wider than the cell hint, in index order."""
+    from packvium.contact import ContactEdge, ContactGraph
+
+    floor = [
+        AxisAlignedBox(Point(i * 10, 0, 10), Dimensions(Length(10), Length(10), Length(10)))
+        for i in range(count)
+    ]
+    lids = [
+        AxisAlignedBox(Point(i * 10, 0, 20), Dimensions(Length(10), Length(10), Length(10)))
+        for i in range(count)
+    ]
+    graph = ContactGraph([*floor, *lids], cell_hint=20)
+    one = AxisAlignedBox(Point(52, 2, 20), Dimensions(Length(4), Length(4), Length(4)))
+    assert graph.contacts_below(one) == (ContactEdge(5, 16),)
+    beneath = AxisAlignedBox(Point(52, 2, 16), Dimensions(Length(4), Length(4), Length(4)))
+    assert graph.contacts_above(beneath) == (ContactEdge(count + 5, 16),)
+    pair = AxisAlignedBox(Point(100, 0, 0), Dimensions(Length(20), Length(10), Length(10)))
+    assert graph.contacts_above(pair) == (ContactEdge(10, 100), ContactEdge(11, 100))
+    assert graph.contacts_above(AxisAlignedBox(Point(0, 0, 90), Dimensions(Length(10), Length(10), Length(10)))) == ()

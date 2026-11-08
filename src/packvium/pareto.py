@@ -27,6 +27,16 @@ import math
 from ._compat import dataclass
 from typing import Mapping, Optional, Sequence
 
+__all__ = [
+    "CandidateResult",
+    "InconsistentAxesError",
+    "NonFiniteMetricError",
+    "ParetoReportError",
+    "ProfileReport",
+    "dominates",
+    "generate_report",
+]
+
 
 class ParetoReportError(Exception):
     """Base class for every error raised by this module."""

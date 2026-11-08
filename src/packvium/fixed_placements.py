@@ -15,15 +15,17 @@ with item accounting left out because the free items have not been placed yet.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Callable, List, Mapping
+from typing import AbstractSet, Any, Callable, FrozenSet, List, Mapping
 
-from ._canonical_json import json_integer, json_spelling
+from ._canonical_json import MAX_EXACT_MAGNITUDE, json_integer, json_spelling
 from ._compat import dataclass
-from .request_errors import InvalidRequestError, pointer
+from .orientations import vocabulary
+from .request_errors import InvalidRequestError, pointer, refuse_orientation
 from .constraints import direct_support_view, load_units, top_loads
 from .geometry import AxisAlignedBox, Point
 from .models import (Container, FixedPlacement, Item, ItemInstance, PackedContainer,
-                     PackingRequest, Placement)
+                     PackingRequest, Placement, placement_id)
+from .pallet_overhang import Deck, floor_support_ratio
 from .units import Length, Weight
 from .validation import IndependentSolutionValidator
 
@@ -41,35 +43,58 @@ class FixedPlacementError(InvalidRequestError):
         return f"{self.code}: {self.detail}"
 
 
-ORIENTATIONS = ("LWH", "LHW", "WLH", "WHL", "HLW", "HWL")
 _REQUIRED = ("item_type", "container_type", "orientation")
-_FIELDS = (*_REQUIRED, "container_instance", "position")
+_FIELDS = (*_REQUIRED, "container_instance", "position", "placement_id")
 _AXES = ("x", "y", "z")
 
 
-def require_fixed_placement_shapes(raw: Any, unit: str = "mm") -> List[Mapping[str, Any]]:
+def require_fixed_placement_shapes(raw: Any, unit: str = "mm",
+                                   hull_types: AbstractSet[str] = frozenset()) -> List[Mapping[str, Any]]:
     """The request's `fixed_placements` as JSON gave them, or a refusal naming the first entry
     that is not the schema's shape. Nothing is coerced: `"1"` and `true` are not instances, and a
-    list is not a position. An absent or null field is no fixed placements."""
+    list is not a position. An absent or null field is no fixed placements. `hull_types` names
+    the item types that are hulls, the only ones a signed orientation may fix (1.10)."""
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise _malformed("fixed_placements is a list", "/fixed_placements")
     for index, entry in enumerate(raw):
-        _require_entry_shape(entry, f"fixed_placements[{index}]", pointer("fixed_placements", index), unit)
+        _require_entry_shape(entry, f"fixed_placements[{index}]", pointer("fixed_placements", index), unit,
+                             hull_types)
     return raw
 
 
-def orientation_rule() -> str:
+def hull_item_types(items: Any) -> FrozenSet[str]:
+    """The ids of the requested item types that are `convex_hull`, read from JSON items as
+    written; anything that is not an item object names no hull. O(items)."""
+    if not isinstance(items, list):
+        return frozenset()
+    return frozenset(item["id"] for item in items if isinstance(item, Mapping)
+                     and item.get("shape_type") == "convex_hull" and isinstance(item.get("id"), str))
+
+
+def require_orientation(value: Any, hull: bool, where: str, field: str) -> None:
+    """A fixed orientation from its item's vocabulary (1.10): an unknown code is `malformed` with
+    the vocabulary listed -- six codes for a box, byte-identical to every release before -- and
+    a signed code fixing a non-hull is `invalid_value`. Whether the item allows it is
+    `admit_fixed_placements`' rule. O(1)."""
+    refuse_orientation(value, hull, field,
+                       lambda reason, at, detail: FixedPlacementError(
+                           detail, "malformed" if reason == "not_allowed" else reason, at),
+                       f"{where}.orientation")
+
+
+def orientation_rule(hull: bool = False) -> str:
     """The orientation rule as the request-error tables word a closed vocabulary."""
-    return f"must be one of {json_spelling(list(ORIENTATIONS))}"
+    return f"must be one of {json_spelling(list(vocabulary(hull)))}"
 
 
 def _malformed(detail: str, field: str) -> FixedPlacementError:
     return FixedPlacementError(detail, "malformed", field)
 
 
-def _require_entry_shape(entry: Any, where: str, field: str, unit: str) -> None:
+def _require_entry_shape(entry: Any, where: str, field: str, unit: str,
+                         hull_types: AbstractSet[str]) -> None:
     if not isinstance(entry, Mapping):
         raise _malformed(f"{where} is an object", field)
     unknown = sorted(set(entry) - set(_FIELDS))
@@ -81,8 +106,7 @@ def _require_entry_shape(entry: Any, where: str, field: str, unit: str) -> None:
     for name in ("item_type", "container_type"):
         if not isinstance(entry[name], str) or not entry[name]:
             raise _malformed(f"{where}.{name} is a non-empty string", f"{field}/{name}")
-    if entry["orientation"] not in ORIENTATIONS:
-        raise _malformed(f"{where}.orientation {orientation_rule()}", f"{field}/orientation")
+    require_orientation(entry["orientation"], entry["item_type"] in hull_types, where, f"{field}/orientation")
     instance = json_integer(entry.get("container_instance", 1))
     if instance is None or instance < 1:
         raise _malformed(f"{where}.container_instance counts from 1", f"{field}/container_instance")
@@ -91,6 +115,30 @@ def _require_entry_shape(entry: Any, where: str, field: str, unit: str) -> None:
     for axis in _AXES:
         if axis in position:
             _require_coordinate(position[axis], f"{where}.position.{axis}", f"{field}/position/{axis}", unit)
+    ticks = Point(*(Length.parse(position.get(axis, 0), unit).ticks for axis in _AXES))
+    require_placement_id(entry.get("placement_id"), f"{entry['container_type']}#{instance}", ticks,
+                         entry["item_type"], entry["orientation"], where, field)
+
+
+def require_placement_id(value: Any, container_id: str, position: Point, item_type: str,
+                         orientation: str, where: str, field: str) -> None:
+    """A fixed placement's optional `placement_id` (1.10) restates the id its result placement
+    will carry, the canonical JSON of `[<container_type>#<container_instance>, x, y, z,
+    <item_type>, <orientation>]` with the position in ticks; null is absent.
+    A non-string is `malformed`, like every other shape error here; a string naming another
+    placement is `invalid_value`, the reason a well-typed value outside its rule carries. O(1)."""
+    if value is None:
+        return
+    at = f"{field}/placement_id"
+    if not isinstance(value, str):
+        raise _malformed(f"{where}.placement_id is a string", at)
+    # A coordinate past 2^53 - 1 has no canonical spelling, and no container holds it: the
+    # admission check refuses such an entry as `outside_container`, so the id is not judged.
+    if max(position.x, position.y, position.z) > MAX_EXACT_MAGNITUDE:
+        return
+    expected = placement_id(container_id, position, item_type, orientation)
+    if value != expected:
+        raise FixedPlacementError(f"{where}.placement_id must be {json_spelling(expected)}", "invalid_value", at)
 
 
 def _require_coordinate(value: Any, where: str, field: str, unit: str) -> None:
@@ -149,7 +197,8 @@ def admit_fixed_placements(
     grouped = _group_by_container(request, instances, clearance)
     _require_contiguous_instances(grouped, containers, max_containers)
     packed = tuple(
-        PackedContainer(containers[container_id], sequence, _with_support_and_loads(placements))
+        PackedContainer(containers[container_id], sequence,
+                        _with_support_and_loads(placements, containers[container_id].deck))
         for (container_id, sequence), placements in grouped
     )
     _require_valid_alone(request, packed, minimum_support_ratio, clearance)
@@ -239,7 +288,7 @@ def _require_contiguous_instances(
         )
 
 
-def _with_support_and_loads(placements: list[Placement]) -> tuple[Placement, ...]:
+def _with_support_and_loads(placements: list[Placement], deck: Deck | None) -> tuple[Placement, ...]:
     """Each fixed item's support ratio from the fixed items under it, and its top load.
 
     Support is measured against every other fixed item in the container, not only the ones
@@ -251,7 +300,7 @@ def _with_support_and_loads(placements: list[Placement]) -> tuple[Placement, ...
         supported.append(Placement(
             placement.instance, placement.position, placement.rotation, placement.dimensions,
             placement.envelope_origin, placement.envelope_dimensions,
-            _support_ratio(others, placement), fixed=True,
+            _support_ratio(others, placement, deck), fixed=True,
         ))
     loads = top_loads(load_units(supported))
     return tuple(
@@ -261,10 +310,10 @@ def _with_support_and_loads(placements: list[Placement]) -> tuple[Placement, ...
     )
 
 
-def _support_ratio(others: list[Placement], placement: Placement) -> float:
-    if placement.envelope_origin.z == 0:
-        return 1.0
+def _support_ratio(others: list[Placement], placement: Placement, deck: Deck | None) -> float:
     box = AxisAlignedBox(placement.envelope_origin, placement.envelope_dimensions)
+    if placement.envelope_origin.z == 0:
+        return floor_support_ratio(deck, box)
     support = direct_support_view(others, placement.instance, box)
     return support.supporting_area / placement.envelope_dimensions.base_area
 

@@ -26,6 +26,8 @@ from . import hull, made_to_measure
 from .geometry import (AxisAlignedBox, Dimensions, Point, Rotation, ShapeType,
                        dimensional_weight)
 from .flat_bag import as_dimensions, fits_alone
+from .pallet_overhang import centring_offset, deck_alone, floor_support_ratio
+from .pallet_overhang import billed_dimensions as pallet_billed
 from .lattice_summary import LatticeSummary
 from .models import (Container, ItemInstance, PackedContainer, Placement, UnpackedItem,
                      carries_itself, hull_collision_is_exact, is_stack_sensitive)
@@ -415,23 +417,19 @@ class ContainerState:
         GridSolver constructs a proven non-overlapping lattice directly. Updating the
         general solver's occupied-box and projected-point indexes for that path turned
         an otherwise linear placement loop into quadratic work.
+
+        Only the lattice and the block loader place directly, and both admit rigid boxes
+        alone (`_lattice_profile` keys on the shape), so no direct placement is ever
+        compressed by the load above it and its volume is its own.
         """
         box = placement.envelope_box
-        compression_sensitive = (
-            self.compression_sensitive
-            or placement.instance.item.shape_type is ShapeType.COMPRESSIBLE
-        )
-        if compression_sensitive:
-            self.used_volume_ticks = _used_volume_with_current_loads((*self.placements, placement))
-        else:
-            self.used_volume_ticks += used_volume_delta(self.placements, placement)
+        self.used_volume_ticks += used_volume_delta(self.placements, placement)
         self.placements.append(placement)
         self._placed = None
         self.payload_ticks += placement.instance.weight.ticks
         item = placement.instance.item
         self.stack_sensitive = self.stack_sensitive or is_stack_sensitive(item)
         self.route_sensitive = self.route_sensitive or item.stop_index is not None
-        self.compression_sensitive = compression_sensitive
         self._extend_extent(box.x2, box.y2, box.z2)
 
     def _extend_extent(self, x2: int, y2: int, z2: int) -> None:
@@ -634,10 +632,18 @@ def _once_per_search(evaluate: Callable[[ConstraintContext], ConstraintResult]) 
     return cached
 
 
-def find_candidates(state: ContainerState, item: ItemInstance, config: PackingConfig, constraints: Sequence[PlacementConstraint], stats: SearchStats, deadline: Deadline, max_candidates: int | None = None, points: Sequence[Point] | None = None) -> list[Candidate]:
+def _prepare_candidate_search(
+    state: ContainerState,
+    item: ItemInstance,
+    config: PackingConfig,
+    constraints: Sequence[PlacementConstraint],
+) -> tuple[Any, ...] | None:
+    """Prepare the item-invariant rotation forms, bounds and constraint chain once per (state, item)."""
     container = state.container
-    if container.max_items is not None and len(state.placements) >= container.max_items: return []
-    if container.max_payload is not None and state.payload_ticks + item.weight.ticks > container.max_payload.ticks: return []
+    if container.max_items is not None and len(state.placements) >= container.max_items:
+        return None
+    if container.max_payload is not None and state.payload_ticks + item.weight.ticks > container.max_payload.ticks:
+        return None
     compression_sensitive = (
         state.compression_sensitive or item.item.shape_type is ShapeType.COMPRESSIBLE
     )
@@ -647,13 +653,16 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
         or compression_sensitive
     )
     if container.void_fill_reserve_ratio > 0 and not reserve_needs_candidate:
-        if state.used_volume_ticks + item.dimensions.volume > usable_volume(container): return []
+        if state.used_volume_ticks + item.dimensions.volume > usable_volume(container):
+            return None
     inner = container.inner_dimensions
     limit_x, limit_y, limit_z = inner.length.ticks, inner.width.ticks, inner.height.ticks
-    # A flat bag also needs a + c <= L and b + c <= W over the running extents grown by the
-    # candidate: O(1), and the extents only grow, so no admitted verdict flips.
+    # A bag also needs a + c <= L and b + c <= W + G over the running extents grown by the
+    # candidate (G is a gusseted bag's side gusset, 0 for a flat one): O(1), and
+    # the extents only grow, so no admitted verdict flips. W + G is summed once per call.
     bag = container.is_flat_bag
     bag_x, bag_y, bag_z = state.max_x, state.max_y, state.max_z
+    girth_y = limit_y + container.side_gusset_ticks
     clearance = config.clearance.ticks
     # Envelope and extents depend only on the rotation, so they are built once instead
     # of once per (point, rotation) pair.
@@ -704,17 +713,27 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
                       for constraint in chain)
     inert_support_checks = len(chain)
     tracing = trace.active()
-    if points is None:
-        if item.item.nesting_height is None:
-            ordered = state.ordered_points[:config.max_candidate_points]
-        else:
-            merged = {(point.x, point.y, point.z): point
-                      for point in (*state.ordered_points, *_nesting_points(state, item))}
-            ordered = sorted(merged.values(), key=lambda point: (point.z, point.y, point.x))[:config.max_candidate_points]
-        if container.axles is not None:
-            ordered = _append_unseen(ordered, _axle_balanced_points(state, item, forms, limit_x))
-    else:
-        ordered = list(points) if len(points) <= 1 else sorted(points, key=lambda p: (p.z, p.y, p.x))
+    return (
+        state, container, item, config, forms, placed, stack_sensitive, route_sensitive,
+        bounds, hull_shapes, index, nesting, placement_offset, reserve_check, usable,
+        compression_sensitive, active, inert_chain, inert_support_checks, tracing,
+        limit_x, limit_y, limit_z, bag, bag_x, bag_y, bag_z, girth_y, clearance,
+    )
+
+
+def _scan_candidate_points(
+    prepared: tuple[Any, ...],
+    ordered: Sequence[Point],
+    max_candidates: int | None,
+    stats: SearchStats,
+    deadline: Deadline,
+) -> list[Candidate]:
+    (
+        state, container, item, config, forms, placed, stack_sensitive, route_sensitive,
+        bounds, hull_shapes, index, nesting, placement_offset, reserve_check, usable,
+        compression_sensitive, active, inert_chain, inert_support_checks, tracing,
+        limit_x, limit_y, limit_z, bag, bag_x, bag_y, bag_z, girth_y, clearance,
+    ) = prepared
     candidates: list[Candidate] = []
     best: Candidate | None = None
     retained: list[tuple[tuple[int, ...], int, Candidate]] = []
@@ -754,7 +773,7 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
             # four times dearer per bag candidate (75 ns against 309 ns, CPython 3.11).
             if x2 > limit_x or y2 > limit_y or z2 > limit_z or (
                     bag and ((x2 if x2 > bag_x else bag_x) + (thickness := z2 if z2 > bag_z else bag_z) > limit_x
-                             or (y2 if y2 > bag_y else bag_y) + thickness > limit_y)):
+                             or (y2 if y2 > bag_y else bag_y) + thickness > girth_y)):
                 if tracing:
                     trace.emit({"type": "filter", "item_id": item.id, "point": {"x": x1, "y": y1, "z": z1}, "rotation": rotation.value, "reason": "boundary"})
                 continue
@@ -882,10 +901,31 @@ def find_candidates(state: ContainerState, item: ItemInstance, config: PackingCo
     return candidates
 
 
+def find_candidates(state: ContainerState, item: ItemInstance, config: PackingConfig, constraints: Sequence[PlacementConstraint], stats: SearchStats, deadline: Deadline, max_candidates: int | None = None, points: Sequence[Point] | None = None) -> list[Candidate]:
+    prepared = _prepare_candidate_search(state, item, config, constraints)
+    if prepared is None:
+        return []
+    forms = prepared[4]
+    limit_x = prepared[20]
+    container = state.container
+    if points is None:
+        if item.item.nesting_height is None:
+            ordered = state.ordered_points[:config.max_candidate_points]
+        else:
+            merged = {(point.x, point.y, point.z): point
+                      for point in (*state.ordered_points, *_nesting_points(state, item))}
+            ordered = sorted(merged.values(), key=lambda point: (point.z, point.y, point.x))[:config.max_candidate_points]
+        if container.axles is not None:
+            ordered = _append_unseen(ordered, _axle_balanced_points(state, item, forms, limit_x))
+    else:
+        ordered = list(points) if len(points) <= 1 else sorted(points, key=lambda p: (p.z, p.y, p.x))
+    return _scan_candidate_points(prepared, ordered, max_candidates, stats, deadline)
+
+
 def _support_ratio(state: ContainerState, item: ItemInstance, candidate: Candidate) -> float:
-    if candidate.point.z == 0: return 1.0
     box = AxisAlignedBox(candidate.point, candidate.envelope_dimensions)
-    support = direct_support_view(state.placements, item, box)
+    if candidate.point.z == 0: return floor_support_ratio(state.container.deck, box)
+    support = direct_support_view(state.frozen_placements, item, box)
     return support.supporting_area / candidate.envelope_dimensions.base_area
 
 
@@ -1346,6 +1386,10 @@ def _lattice_profile(item) -> tuple:
         # they share the stacking rule as well.
         item.stacking_group,
         item.accepts_stacking_groups,
+        # `pack_one` refuses a prototype that is not a rigid box, so the shape must be in the
+        # key too: otherwise a compressible type of the same size and weight joins a rigid
+        # prototype's lattice and is stacked with no crush check at all.
+        item.shape_type,
     )
 
 
@@ -1389,6 +1433,10 @@ class GridSolver:
         if container.is_flat_bag:
             # The lattice counts cells against the rigid frame alone; a bag's girth rule
             # couples the axes, which the per-candidate check applies exactly.
+            return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
+        if container.deck is not None:
+            # The lattice rests every floor cell on the whole floor; a pallet's frame bears
+            # weight only on its deck, which the per-candidate support check reads.
             return ExtremePointSolver().pack_one(container, sequence, items, config, stats, deadline)
         if container.max_stack_density is not None:
             # The single-layer heuristic below only ever reasons about one item
@@ -1528,25 +1576,6 @@ class Space:
     def box(self) -> AxisAlignedBox: return AxisAlignedBox(self.origin, self.dimensions)
 
 
-def _subtract(space: Space, box: AxisAlignedBox) -> list[Space]:
-    """The six maximal slabs of `space` that survive carving `box` out of it."""
-    source = space.box
-    if not source.intersects(box): return [space]
-    out: list[Space] = []
-
-    def push(x1: int, y1: int, z1: int, x2: int, y2: int, z2: int) -> None:
-        if x2 > x1 and y2 > y1 and z2 > z1:
-            out.append(Space(Point(x1, y1, z1), Dimensions(Length(x2 - x1), Length(y2 - y1), Length(z2 - z1))))
-
-    push(source.origin.x, source.origin.y, source.origin.z, min(source.x2, box.origin.x), source.y2, source.z2)
-    push(max(source.origin.x, box.x2), source.origin.y, source.origin.z, source.x2, source.y2, source.z2)
-    push(source.origin.x, source.origin.y, source.origin.z, source.x2, min(source.y2, box.origin.y), source.z2)
-    push(source.origin.x, max(source.origin.y, box.y2), source.origin.z, source.x2, source.y2, source.z2)
-    push(source.origin.x, source.origin.y, source.origin.z, source.x2, source.y2, min(source.z2, box.origin.z))
-    push(source.origin.x, source.origin.y, max(source.origin.z, box.z2), source.x2, source.y2, source.z2)
-    return out
-
-
 #: Adversarial item mixes can carve far more surviving maximal spaces than any real
 #: request needs -- growth is roughly linear in placement count once size variety
 #: defeats the dominance filter below, and every extra space multiplies the per-item
@@ -1554,6 +1583,27 @@ def _subtract(space: Space, box: AxisAlignedBox) -> list[Space]:
 #: surviving spaces, the smallest (least likely to fit a future item) are dropped
 #: first; well under any request this library's tests or fixtures exercise.
 MAX_MAXIMAL_SPACES = 256
+
+
+def _slabs(
+    s: tuple[int, int, int, int, int, int],
+    bx1: int, by1: int, bz1: int, bx2: int, by2: int, bz2: int,
+) -> list[tuple[tuple[int, int, int, int, int, int], Space | None]]:
+    x1, y1, z1, x2, y2, z2 = s
+    out: list[tuple[tuple[int, int, int, int, int, int], Space | None]] = []
+    if (nx2 := bx1 if bx1 < x2 else x2) > x1:
+        out.append(((x1, y1, z1, nx2, y2, z2), None))
+    if x2 > (nx1 := bx2 if bx2 > x1 else x1):
+        out.append(((nx1, y1, z1, x2, y2, z2), None))
+    if (ny2 := by1 if by1 < y2 else y2) > y1:
+        out.append(((x1, y1, z1, x2, ny2, z2), None))
+    if y2 > (ny1 := by2 if by2 > y1 else y1):
+        out.append(((x1, ny1, z1, x2, y2, z2), None))
+    if (nz2 := bz1 if bz1 < z2 else z2) > z1:
+        out.append(((x1, y1, z1, x2, y2, nz2), None))
+    if z2 > (nz1 := bz2 if bz2 > z1 else z1):
+        out.append(((x1, y1, nz1, x2, y2, z2), None))
+    return out
 
 
 def subtract_all(
@@ -1566,33 +1616,50 @@ def subtract_all(
     # carve can therefore neither contain nor be contained by another survivor, and a
     # new slab cannot contain it either (the slab's own parent could not), so only
     # new slabs need the dominance check below: O(new * s) instead of O(s^2).
-    current: list[tuple[Space, bool]] = [(space, False) for space in spaces]
+    #
+    # Slabs stay integer extents until they survive dominance filtering; a `Space`
+    # is constructed only for a new slab that is kept.
+    current: list[tuple[tuple[int, int, int, int, int, int], Space | None]] = [
+        ((space.origin.x, space.origin.y, space.origin.z,
+          space.origin.x + space.dimensions.length.ticks,
+          space.origin.y + space.dimensions.width.ticks,
+          space.origin.z + space.dimensions.height.ticks), space)
+        for space in spaces
+    ]
     for box in boxes:
         if stats is not None:
             stats.space_partitions += len(current)
-        carved: list[tuple[Space, bool]] = []
-        for space, is_new in current:
-            if space.box.intersects(box):
-                carved.extend((part, True) for part in _subtract(space, box))
+        bx1, by1, bz1, bx2, by2, bz2 = box.origin.x, box.origin.y, box.origin.z, box.x2, box.y2, box.z2
+        carved: list[tuple[tuple[int, int, int, int, int, int], Space | None]] = []
+        for entry in current:
+            e = entry[0]
+            if e[0] < bx2 and e[3] > bx1 and e[1] < by2 and e[4] > by1 and e[2] < bz2 and e[5] > bz1:
+                carved.extend(_slabs(e, bx1, by1, bz1, bx2, by2, bz2))
             else:
-                carved.append((space, is_new))
+                carved.append(entry)
         current = carved
-    unique: dict[tuple[int, ...], tuple[Space, bool]] = {}
-    for space, is_new in current:
-        unique[(space.origin.x, space.origin.y, space.origin.z, space.dimensions.length.ticks,
-                space.dimensions.width.ticks, space.dimensions.height.ticks)] = (space, is_new)
-    kept = sorted(unique.values(),
-                  key=lambda pair: (pair[0].origin.z, pair[0].origin.y, pair[0].origin.x,
-                                    -pair[0].dimensions.volume))
+    unique: dict[tuple[int, int, int, int, int, int], tuple[tuple[int, int, int, int, int, int], Space | None]] = {}
+    for entry in current:
+        unique[entry[0]] = entry
+    kept = sorted(
+        unique.values(),
+        key=lambda pair: (
+            pair[0][2], pair[0][1], pair[0][0],
+            -(pair[0][3] - pair[0][0]) * (pair[0][4] - pair[0][1]) * (pair[0][5] - pair[0][2]),
+        ),
+    )
     # Without this filter every placement multiplies the space list and the solver
     # degenerates into an exponential scan of overlapping duplicates.
-    extents = [(space.origin.x, space.origin.y, space.origin.z,
-                space.origin.x + space.dimensions.length.ticks,
-                space.origin.y + space.dimensions.width.ticks,
-                space.origin.z + space.dimensions.height.ticks)
-               for space, _ in kept]
-    result = [space for index, (space, is_new) in enumerate(kept)
-              if not (is_new and _is_contained(extents, index))]
+    extents = [pair[0] for pair in kept]
+    result: list[Space] = []
+    for index, (e, space) in enumerate(kept):
+        if space is not None:
+            result.append(space)
+        elif not _is_contained(extents, index):
+            result.append(Space(
+                Point(e[0], e[1], e[2]),
+                Dimensions(Length(e[3] - e[0]), Length(e[4] - e[1]), Length(e[5] - e[2])),
+            ))
     if len(result) > MAX_MAXIMAL_SPACES:
         result = sorted(result, key=lambda s: -s.dimensions.volume)[:MAX_MAXIMAL_SPACES]
         result.sort(key=lambda s: (s.origin.z, s.origin.y, s.origin.x))
@@ -1674,9 +1741,16 @@ class MaximalSpaceSolver:
 
     @staticmethod
     def _choose(state, spaces, item, config, constraints, stats, deadline) -> Candidate | None:
+        if not spaces:
+            return None
+        prepared = _prepare_candidate_search(state, item, config, constraints)
+        if prepared is None:
+            for _ in spaces:
+                deadline.check()
+            return None
         for space in spaces:
             deadline.check()
-            for candidate in find_candidates(state, item, config, constraints, stats, deadline, None, [space.origin]):
+            for candidate in _scan_candidate_points(prepared, (space.origin,), None, stats, deadline):
                 if candidate.envelope_dimensions.fits_inside(space.dimensions): return candidate
         return None
 
@@ -1818,7 +1892,7 @@ class HomogeneousBlockSolver:
     def _supports(self, container, items, config) -> bool:
         if (self.constraints or container.obstacles or container.preloaded
                 or container.axles is not None or config.minimum_support_ratio > 0
-                or container.is_flat_bag):
+                or container.is_flat_bag or container.deck is not None):
             return False
         if (
             container.tag_limits
@@ -2366,7 +2440,7 @@ def _fits_alone(container: Container, dimensions: Dimensions) -> bool:
     """Whether one box of these dimensions fits this container empty: the frame, and for a
     flat bag the girth rule too, so a bag too thin for an item proves it unplaceable."""
     if container.is_flat_bag:
-        return fits_alone(container.inner_dimensions, dimensions)
+        return fits_alone(container.inner_dimensions, dimensions, container.side_gusset_ticks)
     return dimensions.fits_inside(container.inner_dimensions)
 
 
@@ -2374,14 +2448,19 @@ def _billed_dimensional_weight(state: ContainerState, config: PackingConfig) -> 
     """The dimensional weight, in weight ticks, a carrier bills for this container as filled.
 
     A flat bag is billed on its running extents, the parcel a carrier measures; an empty bag
-    has no parcel yet and bills nothing by volume. A rigid container is billed on its
-    declared outer size, else its inner size. O(1).
+    has no parcel yet and bills nothing by volume. A pallet is billed at the footprint its load
+    reached. A rigid container is billed on its declared outer size, else its inner size. O(1)
+    but for a pallet, O(p).
     """
     container = state.container
     if container.is_flat_bag:
         if not state.placements:
             return 0
         dimensions = as_dimensions((state.max_x, state.max_y, state.max_z))
+    elif container.deck is not None:
+        # A pallet is billed at the footprint its load reached. O(p): the state
+        # tracks no lowest corner, and pallets are deck-first trials of few boxes each.
+        dimensions = pallet_billed(container, container.deck, (p.envelope_box for p in state.placements))
     else:
         dimensions = container.outer_dimensions or container.inner_dimensions
     return dimensional_weight(
@@ -2406,16 +2485,62 @@ def _used_volume_with_current_loads(placements: Sequence[Placement]) -> int:
     return nesting_used_volume(_with_top_loads(placements))
 
 
-def _fabricated(declared: Container, one: SingleContainerSolution) -> SingleContainerSolution:
+def _fabricated(declared: Container, one: SingleContainerSolution,
+                rung: "made_to_measure.Triple | None" = None) -> SingleContainerSolution:
     """A rung trial as the box cut for it: the achieved extent of its placements, envelope
-    far faces with clearance, rounded up onto the machine grid (D14). O(p)."""
+    far faces with clearance, rounded up onto the machine grid (D14); or, given `rung`, the
+    rung itself, which is already on the grid. O(p)."""
     state = one.state.copy()
     achieved = (0, 0, 0)
     for placement in state.placements:
         box = placement.envelope_box
         achieved = (max(achieved[0], box.x2), max(achieved[1], box.y2), max(achieved[2], box.z2))
-    state.container = made_to_measure.fabricate(declared, achieved)
+    state.container = made_to_measure.fabricate(declared, achieved if rung is None else rung)
     return replace(one, state=state, exhaustive=False, dominant_lattice=False)
+
+
+def _moved(frame: Container, one: SingleContainerSolution, dx: int, dy: int) -> SingleContainerSolution:
+    """A trial's whole load moved by `(dx, dy)` on the frame, rebuilt so the state's points and
+    index describe the frame. Relative geometry is unchanged, so only a floor placement's
+    support -- its overlap with the deck -- is measured again. O(p) adds."""
+    state = ContainerState(frame, one.state.sequence)
+    for placement in one.state.placements:
+        moved = replace(placement, position=_shifted(placement.position, dx, dy),
+                        envelope_origin=_shifted(placement.envelope_origin, dx, dy))
+        if moved.envelope_origin.z == 0:
+            moved = replace(moved, support_ratio=floor_support_ratio(frame.deck, moved.envelope_box))
+        state.add(moved)
+    return replace(one, state=state, dominant_lattice=False)
+
+
+def _seated(frame: Container, one: SingleContainerSolution, config: PackingConfig) -> SingleContainerSolution:
+    """A frame trial moved to the least overhang (`centring_offset`), kept where the solver
+    left it if the move would leave a floor placement short of support. O(p)."""
+    dx, dy = centring_offset(frame.deck, (placement.envelope_box for placement in one.state.placements))
+    if dx == 0 and dy == 0:
+        return one
+    seated = _moved(frame, one, dx, dy)
+    support = SupportConstraint(config.minimum_support_ratio)
+    for placement in seated.state.placements:
+        if placement.envelope_origin.z:
+            continue
+        context = ConstraintContext(frame, (), placement.instance, placement.envelope_origin, placement.rotation,
+                                    placement.dimensions, placement.envelope_dimensions)
+        if not support.evaluate(context).allowed:
+            return one
+    return seated
+
+
+def _shifted(point: Point, dx: int, dy: int) -> Point:
+    return Point(point.x + dx, point.y + dy, point.z)
+
+
+def _keeps_reserve(state: ContainerState) -> bool:
+    """Whether a fabricated box keeps its void-fill reserve. The reserve is a share of
+    the box that ships, so a box cut tight to its load can break a reserve the rung kept: the
+    trial then cuts the rung itself, on the grid by construction and solved under its reserve."""
+    container = state.container
+    return container.void_fill_reserve_ratio == 0 or state.used_volume_ticks <= usable_volume(container)
 
 
 class DefaultContainerSelector:
@@ -3367,9 +3492,37 @@ class SolverOrchestrator:
         A declared container is one solve. A made-to-measure one runs the rung chain and
         returns its trial already fabricated (docs/MADE-TO-MEASURE-CONTAINERS.md).
         """
-        if container.made_to_measure is None:
-            return solver.pack_one(container, sequence, items, config, stats, deadline), 1
-        return self._made_to_measure_trial(solver, container, sequence, items, config, stats, deadline)
+        if container.made_to_measure is not None:
+            return self._made_to_measure_trial(solver, container, sequence, items, config, stats, deadline)
+        if container.deck is not None and not container.preloaded:
+            return self._pallet_trial(solver, container, sequence, items, config, stats, deadline)
+        return solver.pack_one(container, sequence, items, config, stats, deadline), 1
+
+    def _pallet_trial(self, solver, container, sequence, items, config, stats, deadline):
+        """Pack the deck alone first and use the overhang only when it places more.
+
+        Every solver starts at its frame's origin, the corner of the overhang zone, so a
+        frame solve overhangs even a load the deck holds, and is billed for it. The deck
+        rung is the container as declared; its trial moves onto the frame unchanged. At most
+        two solves; a deck rung that did not place everything proves nothing about the
+        frame, so a trial that needed both is never exhaustive. A frame with fixed items
+        skips the rung, since they may already overhang.
+        """
+        rung_config = config if config.require_placement_coordinates else replace(
+            config, require_placement_coordinates=True)
+        deck = container.deck
+        on_deck = solver.pack_one(deck_alone(container), sequence, items, rung_config, stats, deadline)
+        if on_deck.state.placement_count == len(items) or on_deck.time_limit_reached or deadline.expired:
+            return _moved(container, on_deck, deck.x, deck.y), 1
+        try:
+            framed = solver.pack_one(container, sequence, items, rung_config, stats, deadline)
+        except TimeLimitReached:
+            return replace(_moved(container, on_deck, deck.x, deck.y), exhaustive=False,
+                           time_limit_reached=True), 1
+        if framed.state.placement_count > on_deck.state.placement_count:
+            return replace(_seated(container, framed, config), exhaustive=False), 2
+        return replace(_moved(container, on_deck, deck.x, deck.y), exhaustive=False,
+                       time_limit_reached=framed.time_limit_reached), 2
 
     def _made_to_measure_trial(self, solver, container, sequence, items, config, stats, deadline):
         """Try each solving envelope in ascending order and keep the first that places every
@@ -3401,6 +3554,8 @@ class SolverOrchestrator:
             last = one
             if one.state.placement_count:
                 trial = _fabricated(container, one)
+                if not _keeps_reserve(trial.state):
+                    trial = _fabricated(container, one, rung)
                 if one.state.placement_count == len(items):
                     return trial, trials
                 key = self._round_score(trial, items, config)

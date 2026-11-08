@@ -1728,3 +1728,50 @@ def test_late_type_neighbourhoods_weigh_one_start_together_in_the_time_slicing()
     assert frozen.share(2, 8).limit_ns == 250_000_000
     assert frozen.share(3, 3).limit_ns == 1_000_000_000
     assert frozen.slice(4).limit_ns == frozen.share(1, 4).limit_ns
+
+
+def test_subtract_all_pinhole_corner_swallow_and_swiss_cheese_cap():
+    """Pathological space carving:
+    - Miss preserves exact `Space` object identity;
+    - Full swallow leaves 0 spaces;
+    - 1-tick pinhole right through the center produces all 6 maximal slabs;
+    - Swiss-cheese grid of 60 pillars exceeding `MAX_MAXIMAL_SPACES=256` caps at 256,
+      orders by `(z, y, x)`, and leaves no dominated (contained) space."""
+    from packvium.solvers import MAX_MAXIMAL_SPACES, Space, subtract_all
+
+    whole = Space(Point(0, 0, 0), Dimensions(Length(100), Length(100), Length(100)))
+    # 1. Complete miss preserves identity
+    outside = AxisAlignedBox(Point(100, 0, 0), Dimensions(Length(10), Length(10), Length(10)))
+    untouched = subtract_all([whole], [outside])
+    assert len(untouched) == 1 and untouched[0] is whole
+
+    # 2. Complete swallow leaves nothing
+    swallow = AxisAlignedBox(Point(0, 0, 0), Dimensions(Length(100), Length(100), Length(100)))
+    assert subtract_all([whole], [swallow]) == []
+
+    # 3. 1-tick pinhole in the exact center produces 6 slabs
+    pinhole = AxisAlignedBox(Point(50, 50, 50), Dimensions(Length(1), Length(1), Length(1)))
+    six = subtract_all([whole], [pinhole])
+    assert len(six) == 6
+    for s in six:
+        assert not s.box.intersects(pinhole)
+
+    # 4. Swiss-cheese sequence of 65 diagonal 1-tick pillars forces > 256 surviving slabs
+    stats = SearchStats()
+    capped = [whole]
+    for i in range(65):
+        pillar = AxisAlignedBox(
+            Point((i * 13) % 97 + 1, (i * 29) % 97 + 1, (i * 43) % 97 + 1),
+            Dimensions(Length(1), Length(1), Length(1)),
+        )
+        capped = subtract_all(capped, [pillar], stats)
+        assert len(capped) <= MAX_MAXIMAL_SPACES
+    assert len(capped) == MAX_MAXIMAL_SPACES
+    assert stats.space_partitions > 0
+    assert capped == sorted(capped, key=lambda s: (s.origin.z, s.origin.y, s.origin.x))
+    for i, a in enumerate(capped):
+        ba = a.box
+        for j, b in enumerate(capped):
+            if i != j:
+                assert not b.box.contains(ba)
+

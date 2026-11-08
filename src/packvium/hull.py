@@ -48,6 +48,7 @@ from math import gcd
 from typing import Iterable, Sequence, Tuple
 
 from ._compat import dataclass
+from .orientations import AXIS_SIGNS, SOURCE_AXES
 
 #: A point in an item's local tick frame. Deliberately not `geometry.Point`, which forbids
 #: negative coordinates: a hull is authored around whatever origin its author chose, and is
@@ -299,8 +300,9 @@ class HullShape:
 
 
 #: How many rotated hulls stay resident. A request is bounded by its distinct hull items times
-#: the six orientations, so this holds far more than any single request; the bound is what
-#: stops a long-lived process packing many catalogues from accumulating shapes forever.
+#: the orientations they allow (at most 24), so this holds far more than any single request; the
+#: bound is what stops a long-lived process packing many catalogues from accumulating shapes
+#: forever.
 #:
 #: Measured full, the ceiling it buys: 3.8 MB at six vertices per hull, 5.2 MB at eight, 13.6
 #: MB at twenty. Eviction order depends on call order and nothing observable does -- the
@@ -378,43 +380,22 @@ def collide(left: HullShape, left_origin: Vertex, right: HullShape, right_origin
     return True
 
 
-#: Which local axis each container axis takes its extent from, per `Rotation`. Read off
-#: `Dimensions.rotated`, which is the definition every other part of the engine already
-#: follows: `LHW` means x spans the item's length, y its height, z its width.
-_SOURCE_AXES = {
-    "LWH": (0, 1, 2), "LHW": (0, 2, 1),
-    "WLH": (1, 0, 2), "WHL": (1, 2, 0),
-    "HLW": (2, 0, 1), "HWL": (2, 1, 0),
-}
-
-
-def _permutation_is_odd(axes: Tuple[int, int, int]) -> bool:
-    return sum(
-        1 for first in range(3) for second in range(first + 1, 3) if axes[first] > axes[second]
-    ) % 2 == 1
-
-
 def rotate(vertices: Sequence[Vertex], rotation) -> Tuple[Vertex, ...]:
-    """Reorient a hull the way `Dimensions.rotated` reorients its box.
+    """Reorient a hull by one of the 24 proper rotations (1.10).
 
-    Three of the six rotations are odd permutations of the coordinate axes. On a cuboid that
-    is invisible -- a mirrored box is the same box. On a hull it is not: a bare permutation
-    would hand back the item's mirror image, a shape the caller does not own. So the sign of
-    one axis is flipped whenever the permutation is odd, which makes every one of the six a
-    proper rotation with determinant +1 and never a reflection.
-
-    The scope limit that follows is worth stating rather than discovering: `allowed_rotations`
-    distinguishes six orientations because six is all a box has, and a hull has 24. These six
-    are pinned, deterministic and physically real; the other 18 are simply not expressible in
-    today's vocabulary, and widening it is a contract change rather than a fix here.
+    `v'[i] = s[i] * v[src[i]]` with the code's source axes and signs from `orientations`. A
+    bare permutation would hand back the item's mirror image for an odd permutation -- a
+    shape the caller does not own -- which is why the legacy odd codes negate x and every
+    signed code has determinant +1: no code is ever a reflection.
 
     Vertices come back translated so the rotated hull's own bounding box starts at the origin,
     which is the frame every placement position is expressed in.
     """
-    axes = _SOURCE_AXES[rotation.value if hasattr(rotation, "value") else rotation]
-    sign = -1 if _permutation_is_odd(axes) else 1
+    code = rotation.value if hasattr(rotation, "value") else rotation
+    axes = SOURCE_AXES[code]
+    signs = AXIS_SIGNS[code]
     turned = [
-        (sign * vertex[axes[0]], vertex[axes[1]], vertex[axes[2]]) for vertex in vertices
+        tuple(signs[axis] * vertex[axes[axis]] for axis in range(3)) for vertex in vertices
     ]
     lower, _ = bounding_extent(turned)
     return tuple(
